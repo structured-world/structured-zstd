@@ -479,22 +479,31 @@ impl LongLengths {
     /// The bit a long length's field lacks.
     const LONG: u32 = 1 << 16;
 
-    /// The sequence at `index` of the run, with lengths `ll` and `ml`: a test
-    /// per length that holds for at most one sequence of a block.
+    /// The sequence at `index` of the run, with lengths `ll` and `ml`: one
+    /// test for both lengths, which holds for at most one sequence of a block.
     #[inline(always)]
     fn sequence(&mut self, index: usize, ll: usize, ml: usize, off_base: u32) -> RawSequence {
         debug_assert!(ml >= FORMAT_MIN_MATCH);
         let ml_base = ml - FORMAT_MIN_MATCH;
-        if ll >= Self::LONG as usize {
-            self.literal_at = index;
-        }
-        if ml_base >= Self::LONG as usize {
-            self.match_at = index;
+        if (ll | ml_base) >= Self::LONG as usize {
+            self.mark(index, ll, ml_base);
         }
         RawSequence {
             off_base,
             ll: ll as u16,
             ml_base: ml_base as u16,
+        }
+    }
+
+    /// Records the sequence at `index` as the block's long one.
+    #[cold]
+    #[inline(never)]
+    fn mark(&mut self, index: usize, ll: usize, ml_base: usize) {
+        if ll >= Self::LONG as usize {
+            self.literal_at = index;
+        }
+        if ml_base >= Self::LONG as usize {
+            self.match_at = index;
         }
     }
 
