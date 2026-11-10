@@ -1237,7 +1237,9 @@ macro_rules! collect_optimal_candidates_initialized_body {
         debug_assert!(!$self.table.hash_table().is_empty());
         debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table().is_empty());
         debug_assert!(!$self.table.chain_table().is_empty());
-        let min_match_len = 3;
+        // Upstream zstd_opt.c `ZSTD_insertBtAndGetAllMatches`: `minMatch =
+        // (mls == 3) ? 3 : 4`, the floor every candidate has to beat.
+        let min_match_len = if use_hash3 { 3 } else { 4 };
         $out.clear();
         if $abs_pos < $self.table.skip_insert_until_abs {
             return;
