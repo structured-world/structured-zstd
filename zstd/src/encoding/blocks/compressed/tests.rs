@@ -1643,6 +1643,29 @@ fn only_a_valid_table_lowers_the_literal_floor_and_takes_one_stream() {
     assert!(!super::single_literal_stream(1024, true));
 }
 
+/// The sequence count is written in the form RFC 8878 3.1.1.3.1 gives its
+/// range: one byte below 128, two with the first byte at most 254 below
+/// 0x7F00, and 0xFF then the excess over 0x7F00 little-endian above. A count
+/// of 0x7F00..=0x7FFF written in two bytes led with 0xFF, which reads as the
+/// three-byte form, and the three-byte form was written high byte first.
+#[test]
+fn sequence_count_header_takes_the_form_of_its_range() {
+    let header = |count: usize| {
+        let mut out = Vec::new();
+        let mut writer = super::BitWriter::from(&mut out);
+        super::encode_seqnum(count, &mut writer);
+        writer.flush();
+        out
+    };
+    assert_eq!(header(127), [127]);
+    assert_eq!(header(128), [0x80, 0x80]);
+    assert_eq!(header(0x7EFF), [0xFE, 0xFF]);
+    assert_eq!(header(0x7F00), [0xFF, 0x00, 0x00]);
+    assert_eq!(header(0x7FFF), [0xFF, 0xFF, 0x00]);
+    assert_eq!(header(0x8001), [0xFF, 0x01, 0x01]);
+    assert_eq!(header(0xFFFF + 0x7F00), [0xFF, 0xFF, 0xFF]);
+}
+
 /// Each length's code and extra-bit width ride in the spare high bits of the
 /// length: they must read back whole, and the lengths, whose low bits the
 /// writer emits, must stay as they were, at the widest values a 128 KiB block

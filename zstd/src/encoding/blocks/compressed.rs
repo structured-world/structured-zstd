@@ -1651,10 +1651,11 @@ fn estimate_sequences_section_bytes(
     let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
     let of_table_desc_bytes = mode_table_description_bytes(&of_mode);
 
-    // nbSeq varint header (upstream zstd RFC 8878 §3.1.1.3.2.1): 1–3 bytes.
+    // The sequence-count header, 1-3 bytes as `encode_seqnum` writes it
+    // (RFC 8878 3.1.1.3.1).
     let nb_seq_header = match sequences.len() {
         0..=127 => 1,
-        128..=0x7FFF => 2,
+        128..=0x7EFF => 2,
         _ => 3,
     };
     let mode_byte = 1;
@@ -3155,23 +3156,24 @@ fn encode_sequences_scalar(
     encode_sequences_body!(sequences, writer, modes, defaults)
 }
 
+/// RFC 8878 3.1.1.3.1: a first byte below 128 is the count; 128..=254 leads
+/// a two-byte count `((byte0 - 128) << 8) + byte1`, so up to 0x7EFF; 255
+/// leads `byte1 + (byte2 << 8) + 0x7F00`, little-endian.
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     const UPPER_LIMIT: usize = 0xFFFF + 0x7F00;
     match seqnum {
         1..=127 => writer.write_bits(seqnum as u32, 8),
-        128..=0x7FFF => {
+        128..=0x7EFF => {
             let upper = ((seqnum >> 8) | 0x80) as u8;
             let lower = seqnum as u8;
             writer.write_bits(upper, 8);
             writer.write_bits(lower, 8);
         }
-        0x8000..=UPPER_LIMIT => {
-            let encode = seqnum - 0x7F00;
-            let upper = (encode >> 8) as u8;
-            let lower = encode as u8;
+        0x7F00..=UPPER_LIMIT => {
+            let excess = seqnum - 0x7F00;
             writer.write_bits(255u8, 8);
-            writer.write_bits(upper, 8);
-            writer.write_bits(lower, 8);
+            writer.write_bits(excess as u8, 8);
+            writer.write_bits((excess >> 8) as u8, 8);
         }
         _ => unreachable!(),
     }

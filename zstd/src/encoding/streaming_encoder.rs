@@ -403,7 +403,8 @@ impl CompressionContext<MatchGeneratorDriver> {
     /// on is matched as usual; without, it goes out uncompressed and
     /// [`Self::take_sequence_producer_failure`] reports it. With long-distance
     /// matching on, the long matches are taken outright and the producer
-    /// parses the literals between them.
+    /// parses the literals between them. Takes effect from the next frame: a
+    /// frame already started keeps the parser it started with.
     pub fn set_sequence_producer(
         &mut self,
         producer: Option<alloc::boxed::Box<dyn crate::encoding::sequences::SequenceProducer>>,
