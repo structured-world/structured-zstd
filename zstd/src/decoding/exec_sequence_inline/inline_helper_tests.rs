@@ -1,7 +1,14 @@
-use super::x86::{
-    copy16, overlap_copy8, overlap_match_shuffle, wildcopy_no_overlap,
-    wildcopy_overlap_8byte_stride,
-};
+use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
+
+/// The shuffle copy expanded in an SSSE3 scope, as the executor expands it.
+///
+/// # Safety
+/// The CPU has SSSE3, plus the macro's own contract.
+#[cfg(feature = "std")]
+#[target_feature(enable = "ssse3")]
+unsafe fn overlap_match_shuffle(dst: *mut u8, offset: usize, length: usize) {
+    unsafe { super::overlap_match_shuffle!(dst, offset, length) }
+}
 
 /// The shuffle copy of an overlapping match writes what a byte-by-byte copy
 /// writes, for every offset it serves and lengths around each chunk edge, and

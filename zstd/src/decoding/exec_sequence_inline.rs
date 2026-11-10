@@ -123,8 +123,7 @@ macro_rules! exec_sequence_avx2_inline_at {
     ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
-            copy16, overlap_copy8, overlap_match_shuffle, wildcopy_no_overlap,
-            wildcopy_overlap_8byte_stride,
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;
@@ -181,7 +180,11 @@ macro_rules! exec_sequence_avx2_inline_at {
                     // Sixteen bytes of written output before the match, which
                     // the shuffle reads its period from; only the first few
                     // bytes of a buffer lack them.
-                    overlap_match_shuffle(op_match, offset_v, match_length_v);
+                    $crate::decoding::exec_sequence_inline::overlap_match_shuffle!(
+                        op_match,
+                        offset_v,
+                        match_length_v
+                    );
                 } else {
                     let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
                     if match_length_v > 8 {
@@ -195,6 +198,50 @@ macro_rules! exec_sequence_avx2_inline_at {
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_inline_at;
+
+/// A match whose `offset` is below 16 overlaps its own output: its bytes
+/// repeat with period `offset`. One byte shuffle spreads that period over a
+/// vector and a second rotates it for each further chunk, so every step writes
+/// 16 bytes, where the eight-byte copies after upstream's `ZSTD_overlapCopy8`
+/// write eight. The period is read from the 16 bytes that END at `$dst`, all of
+/// them output already written, so no byte the match has not produced yet is
+/// read. May write up to 15 bytes past `$dst + $length`.
+///
+/// A macro, not a function: `pshufb` needs SSSE3, which only the enclosing
+/// `target_feature` function provides, and a standalone body would be compiled
+/// without it.
+///
+/// # Safety
+/// `1 <= offset < 16`, the 16 bytes before `dst` are initialized output (so
+/// `offset` of them are the match's source), `dst` is writable for `length`
+/// rounded up to 16, and the enclosing function enables SSSE3 or a superset.
+#[cfg(all(target_arch = "x86_64", any(feature = "kernel-avx2", test)))]
+macro_rules! overlap_match_shuffle {
+    ($dst:expr, $offset:expr, $length:expr) => {{
+        use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
+        use $crate::decoding::exec_sequence_inline::x86::{PERIOD, ROTATE};
+        let dst: *mut u8 = $dst;
+        let offset: usize = $offset;
+        let length: usize = $length;
+        debug_assert!((1..16).contains(&offset));
+        debug_assert!(length > 0);
+        let source = _mm_loadu_si128(dst.cast_const().sub(16) as *const __m128i);
+        let period_mask = _mm_loadu_si128(PERIOD[offset].as_ptr() as *const __m128i);
+        let rotate = _mm_loadu_si128(ROTATE[offset].as_ptr() as *const __m128i);
+        let mut period = _mm_shuffle_epi8(source, period_mask);
+        let mut off = 0usize;
+        loop {
+            _mm_storeu_si128(dst.add(off) as *mut __m128i, period);
+            off += 16;
+            if off >= length {
+                break;
+            }
+            period = _mm_shuffle_epi8(period, rotate);
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", any(feature = "kernel-avx2", test)))]
+pub(crate) use overlap_match_shuffle;
 
 /// AVX2-tier body for a sequence whose match lies wholly inside dictionary
 /// content, as selected by
@@ -288,8 +335,6 @@ pub(crate) use exec_sequence_avx2_dict_inline;
 // so the legacy chain handles non-x86_64 targets.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
-    #[cfg(any(feature = "kernel-avx2", test))]
-    use core::arch::x86_64::_mm_shuffle_epi8;
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
         _mm256_storeu_si256,
@@ -300,7 +345,7 @@ pub(crate) mod x86 {
     /// sixteen lanes. `static`, not `const`, so a debug build reads it in place
     /// instead of copying it onto the stack at every use.
     #[cfg(any(feature = "kernel-avx2", test))]
-    static PERIOD: [[u8; 16]; 16] = {
+    pub(crate) static PERIOD: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
         while offset < 16 {
@@ -317,7 +362,7 @@ pub(crate) mod x86 {
     /// `ROTATE[offset][lane] = (lane + 16) % offset`: turns one 16-byte chunk
     /// of a period-`offset` run into the next one.
     #[cfg(any(feature = "kernel-avx2", test))]
-    static ROTATE: [[u8; 16]; 16] = {
+    pub(crate) static ROTATE: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
         while offset < 16 {
@@ -330,42 +375,6 @@ pub(crate) mod x86 {
         }
         table
     };
-
-    /// A match whose `offset` is below 16 overlaps its own output: its bytes
-    /// repeat with period `offset`. One byte shuffle spreads that period over a
-    /// vector and a second rotates it for each further chunk, so every step
-    /// writes 16 bytes, where the eight-byte copies after upstream's
-    /// `ZSTD_overlapCopy8` write eight. The period is read from the 16 bytes
-    /// that END at `dst`, all of them output already written, so no byte the
-    /// match has not produced yet is read. May write up to 15 bytes past
-    /// `dst + length`.
-    ///
-    /// # Safety
-    /// `1 <= offset < 16`, the 16 bytes before `dst` are initialized output
-    /// (so `offset` of them are the match's source), `dst` is writable for
-    /// `length` rounded up to 16, and the caller is in an SSSE3
-    /// `target_feature` scope.
-    #[cfg(any(feature = "kernel-avx2", test))]
-    #[inline(always)]
-    pub(crate) unsafe fn overlap_match_shuffle(dst: *mut u8, offset: usize, length: usize) {
-        debug_assert!((1..16).contains(&offset));
-        debug_assert!(length > 0);
-        unsafe {
-            let source = _mm_loadu_si128(dst.cast_const().sub(16) as *const __m128i);
-            let period_mask = _mm_loadu_si128(PERIOD[offset].as_ptr() as *const __m128i);
-            let rotate = _mm_loadu_si128(ROTATE[offset].as_ptr() as *const __m128i);
-            let mut period = _mm_shuffle_epi8(source, period_mask);
-            let mut off = 0usize;
-            loop {
-                _mm_storeu_si128(dst.add(off) as *mut __m128i, period);
-                off += 16;
-                if off >= length {
-                    break;
-                }
-                period = _mm_shuffle_epi8(period, rotate);
-            }
-        }
-    }
 
     /// AVX2-tier `ZSTD_copy16`-equivalent: 32-byte ymm load/store. Used
     /// by the AVX2-scoped wildcopy variant below. Caller must be in
