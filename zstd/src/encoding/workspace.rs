@@ -120,6 +120,10 @@ pub struct Workspace {
     /// The open layout made the allocation zeroed, on fresh pages, so its
     /// regions hold zeros until their holders write them.
     zeroed: bool,
+    /// Zero tables [`Self::table_after`] wrote on fresh pages, which their
+    /// contents alone cannot tell from ones left demand-zero.
+    #[cfg(test)]
+    zero_tables_written: usize,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
@@ -193,6 +197,8 @@ impl Workspace {
             open: false,
             oversized_layouts: 0,
             zeroed: false,
+            #[cfg(test)]
+            zero_tables_written: 0,
         }
     }
 
@@ -407,6 +413,10 @@ impl Workspace {
                 // upstream does by clearing its tables
                 // (`ZSTD_cwksp_clean_tables`).
                 region.zero();
+                #[cfg(test)]
+                {
+                    self.zero_tables_written += 1;
+                }
             }
         }
         (region, kept)

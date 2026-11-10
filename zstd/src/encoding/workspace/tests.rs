@@ -180,14 +180,18 @@ fn a_frame_covering_a_table_writes_it_and_a_stream_does_not() {
         ws
     };
     let covering = INPUT_PER_TABLE_PAGE * pages;
-    assert!(layout(IngestPlan::Slice(covering)).frame_touches_every_page(bytes));
-    assert!(layout(IngestPlan::PledgedStream(covering)).frame_touches_every_page(bytes));
-    assert!(!layout(IngestPlan::Slice(covering - 1)).frame_touches_every_page(bytes));
-    assert!(!layout(IngestPlan::Stream).frame_touches_every_page(bytes));
-    // Either way the table reads as zeros.
-    let mut ws = layout(IngestPlan::Slice(covering));
-    let zeros = ws.table::<u32>(bytes / 4, 0);
-    assert!(zeros.as_slice().iter().all(|&v| v == 0));
+    // Carves the table and reports whether it was written, which its zeros
+    // alone cannot show.
+    let written = |ingest| {
+        let mut ws = layout(ingest);
+        let zeros = ws.table::<u32>(bytes / 4, 0);
+        assert!(zeros.as_slice().iter().all(|&v| v == 0));
+        ws.zero_tables_written == 1
+    };
+    assert!(written(IngestPlan::Slice(covering)));
+    assert!(written(IngestPlan::PledgedStream(covering)));
+    assert!(!written(IngestPlan::Slice(covering - 1)));
+    assert!(!written(IngestPlan::Stream));
 }
 
 // A region whose byte size fits but whose alignment padding does not is refused
