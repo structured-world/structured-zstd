@@ -1,7 +1,7 @@
 use super::*;
 
 /// A trailing part as large as the block it is sized for.
-fn one_byte_per_block_byte(block: usize) -> usize {
+fn one_byte_per_block_byte(block: usize, _sequence_floor: usize) -> usize {
     block
 }
 
@@ -70,7 +70,7 @@ fn a_new_table_starts_filled() {
     assert!(table.as_slice().iter().all(|&v| v == 0x1234));
 }
 
-fn buffers_up_to_fresh_pages(_block: usize) -> usize {
+fn buffers_up_to_fresh_pages(_block: usize, _sequence_floor: usize) -> usize {
     FRESH_PAGES_FROM
 }
 

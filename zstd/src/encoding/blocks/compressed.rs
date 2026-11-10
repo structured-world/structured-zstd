@@ -8,7 +8,7 @@ use crate::{
     encoding::block_header::BlockHeader,
     encoding::fastpath::EncodeTier,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
-    encoding::workspace::{RegionVec, Workspace, region_bytes},
+    encoding::workspace::{FORMAT_MIN_MATCH, RegionVec, Workspace, region_bytes},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{
         FSETable, build_seq_ctable_into, build_table_from_symbol_counts_into,
@@ -237,7 +237,8 @@ impl CompressedBlockScratch {
             return compressed;
         }
         let usize_sz = core::mem::size_of::<usize>();
-        let sequences = max_sequences(block_capacity);
+        // A bound for any frame, so the format's minimum match.
+        let sequences = max_sequences(block_capacity, FORMAT_MIN_MATCH);
         let partitions = (MAX_NB_BLOCK_SPLITS + 1).next_power_of_two() * usize_sz;
         // `lit` and `ml` are reserved exactly; the codes and their bit sums
         // grow by doubling, so they keep up to twice what a block needed.
@@ -262,18 +263,18 @@ impl CompressedBlockScratch {
     }
 
     /// Workspace bytes the buffers need for blocks of up to `block_capacity`
-    /// source bytes.
-    pub(crate) fn workspace_bytes(block_capacity: usize) -> usize {
-        let sequences = max_sequences(block_capacity);
+    /// source bytes whose sequences cover at least `sequence_floor` bytes each.
+    pub(crate) fn workspace_bytes(block_capacity: usize, sequence_floor: usize) -> usize {
+        let sequences = max_sequences(block_capacity, sequence_floor);
         region_bytes::<u8>(block_capacity)
             + region_bytes::<RawSequence>(sequences)
             + region_bytes::<u32>(sequences)
     }
 
     /// Takes the buffers from the open `workspace` layout, sized for blocks of
-    /// up to `block_capacity` source bytes.
+    /// up to `block_capacity` source bytes and the layout's sequence floor.
     pub(crate) fn bind(&mut self, workspace: &mut Workspace, block_capacity: usize) {
-        let sequences = max_sequences(block_capacity);
+        let sequences = max_sequences(block_capacity, workspace.sequence_floor());
         self.parts.literals = workspace.buffer(block_capacity);
         self.parts.sequences = workspace.buffer(sequences);
         self.sequence_codes = workspace.buffer(sequences);
@@ -288,15 +289,11 @@ impl CompressedBlockScratch {
     }
 }
 
-/// The shortest match a sequence can carry: RFC 8878 3.1.1.3.2.1.1 maps
-/// `Match_Length_Code` 0 to a length of 3.
-const FORMAT_MIN_MATCH: usize = 3;
-
-/// The most sequences a block of `block_len` source bytes can hold, since each
-/// covers at least [`FORMAT_MIN_MATCH`] of them (upstream `ZSTD_maxNbSeq`,
-/// zstd_compress.c:1697, with its divider of 3).
-fn max_sequences(block_len: usize) -> usize {
-    block_len / FORMAT_MIN_MATCH
+/// The most sequences a block of `block_len` source bytes can hold when each
+/// covers at least `sequence_floor` of them (upstream `ZSTD_maxNbSeq`,
+/// zstd_compress.c, dividing by 3 or 4 as the frame's minimum match allows).
+fn max_sequences(block_len: usize, sequence_floor: usize) -> usize {
+    block_len / sequence_floor
 }
 
 #[derive(Default)]
@@ -707,10 +704,16 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // The built-in matcher searches compiled for the frame's tier; a matcher
     // from outside the crate knows nothing of tiers. The branch folds per
     // matcher type.
+    let sequence_floor = state.workspace.sequence_floor();
     match state.matcher.builtin_driver() {
-        Some(driver) => {
-            builtin_block_sequences::<K>(driver, &mut tail, sequences, code_offsets, &mut hist)
-        }
+        Some(driver) => builtin_block_sequences::<K>(
+            driver,
+            &mut tail,
+            sequences,
+            code_offsets,
+            &mut hist,
+            sequence_floor,
+        ),
         None => state.matcher.start_matching(|seq| {
             record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist)
         }),
@@ -751,12 +754,13 @@ fn builtin_block_sequences<K: EncodeTier>(
     sequences: &mut RegionVec<RawSequence>,
     code_offsets: bool,
     hist: &mut [u32; 3],
+    sequence_floor: usize,
 ) {
     // `move`: the flag rides in the closure by value. Borrowed, every
     // sequence read it through the closure and the reference it holds, one
     // more load behind the sink's own.
     driver.start_matching_with::<K>(move |seq| {
-        record_builtin_sequence(seq, tail, sequences, code_offsets, hist)
+        record_builtin_sequence(seq, tail, sequences, code_offsets, hist, sequence_floor)
     });
 }
 
@@ -772,6 +776,7 @@ fn record_builtin_sequence(
     sequences: &mut RegionVec<RawSequence>,
     code_offsets: bool,
     hist: &mut [u32; 3],
+    sequence_floor: usize,
 ) {
     match seq {
         Sequence::Literals { len } => *tail += len,
@@ -782,14 +787,18 @@ fn record_builtin_sequence(
         } => {
             debug_assert_eq!(*tail, 0, "literals reported before a sequence");
             debug_assert!((literal_len | match_len | offset) <= u32::MAX as usize);
-            debug_assert!(match_len >= FORMAT_MIN_MATCH);
+            debug_assert!(
+                match_len >= sequence_floor,
+                "a {match_len}-byte match under a sequence floor of {sequence_floor}"
+            );
             let off_base = if code_offsets {
                 encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
             } else {
                 offset as u32
             };
-            // SAFETY: the buffer holds `max_sequences` of the largest block, and
-            // the built-in matcher's every sequence covers `FORMAT_MIN_MATCH`
+            // SAFETY: the buffer holds `max_sequences` of the largest block at
+            // the frame's sequence floor (`LevelParams::sequence_floor`), and
+            // every sequence of the built-in matcher covers at least that many
             // bytes of the block, so it cannot fill up.
             unsafe {
                 sequences.push_within_capacity(RawSequence {

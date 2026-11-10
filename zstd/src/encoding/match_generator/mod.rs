@@ -1475,6 +1475,9 @@ impl Matcher for MatchGeneratorDriver {
         // hash chain otherwise. The Row backend runs that switch itself
         // (`RowMatchGenerator::use_chain`), so both finders share ONE parse
         // (upstream's single `lazy_generic`) and the level stays on `RowHash`.
+        // Fixed before any table opens the layout: the block buffers behind the
+        // tables are sized from it.
+        workspace.set_sequence_floor(params.sequence_floor());
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;

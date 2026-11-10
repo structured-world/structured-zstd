@@ -4530,8 +4530,12 @@ fn uncompressed_frame_lays_out_no_compressed_block_scratch() {
         FrameCompressor::new(super::CompressionLevel::Uncompressed);
     let frame = compressor.compress_independent_frame(&data);
     assert!(!frame.is_empty());
-    let scratch =
-        crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(MAX_BLOCK_SIZE as usize);
+    // The smaller of the two scratch sizes, the one a four-byte sequence floor
+    // lays out.
+    let scratch = crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(
+        MAX_BLOCK_SIZE as usize,
+        4,
+    );
     assert!(
         compressor.state.workspace.capacity() < scratch,
         "a raw frame's workspace ({} bytes) holds the {scratch}-byte compressed-block scratch",

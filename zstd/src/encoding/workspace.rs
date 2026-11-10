@@ -104,7 +104,11 @@ pub struct Workspace {
     /// The block ceiling the context set before the window was known, and the
     /// bytes it carves after the match finder for a given block size.
     block_target: usize,
-    trailing_for: fn(usize) -> usize,
+    trailing_for: fn(usize, usize) -> usize,
+    /// The shortest match a sequence of the frame carries, which bounds how
+    /// many sequences a block holds: the format's 3 unless the frame's match
+    /// finder guarantees more before the layout opens.
+    sequence_floor: usize,
     /// How the frame's input reaches the match finder, set with the layout.
     ingest: IngestPlan,
     /// The block size the open layout's trailing part was sized for.
@@ -183,6 +187,7 @@ impl Workspace {
             retired: None,
             block_target: 0,
             trailing_for: no_trailing,
+            sequence_floor: FORMAT_MIN_MATCH,
             ingest: IngestPlan::Stream,
             block_capacity: 0,
             open: false,
@@ -227,14 +232,40 @@ impl Workspace {
     pub(crate) fn begin_layout(
         &mut self,
         block_target: usize,
-        trailing_for: fn(usize) -> usize,
+        trailing_for: fn(usize, usize) -> usize,
         ingest: IngestPlan,
     ) {
         self.release_retired();
         self.block_target = block_target;
         self.trailing_for = trailing_for;
+        self.sequence_floor = FORMAT_MIN_MATCH;
         self.ingest = ingest;
         self.open = false;
+    }
+
+    /// Raises the shortest match the frame's sequences carry, for a match
+    /// finder that guarantees more than the format's minimum. Only before the
+    /// layout opens, since the trailing part is sized from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layout is open, or `floor` is below the format's
+    /// minimum match.
+    pub(crate) fn set_sequence_floor(&mut self, floor: usize) {
+        assert!(
+            !self.open,
+            "the sequence floor is fixed before the layout opens"
+        );
+        assert!(
+            floor >= FORMAT_MIN_MATCH,
+            "no sequence is shorter than the format allows"
+        );
+        self.sequence_floor = floor;
+    }
+
+    /// The shortest match a sequence of the frame being laid out carries.
+    pub(crate) fn sequence_floor(&self) -> usize {
+        self.sequence_floor
     }
 
     /// Whether this layout has been opened.
@@ -279,7 +310,10 @@ impl Workspace {
         assert!(!self.open, "a workspace layout opens once per frame");
         self.block_capacity = self.block_for_window(window);
         let total = leading
-            .checked_add((self.trailing_for)(self.block_capacity))
+            .checked_add((self.trailing_for)(
+                self.block_capacity,
+                self.sequence_floor,
+            ))
             .expect("workspace size overflows usize");
         let reallocate = if total > self.capacity {
             true
@@ -578,9 +612,13 @@ impl Drop for Workspace {
 
 /// The trailing part of a layout with no block buffers behind the tables: a
 /// match finder laying out a workspace of its own, or one nobody began.
-pub(crate) fn no_trailing(_block: usize) -> usize {
+pub(crate) fn no_trailing(_block: usize, _sequence_floor: usize) -> usize {
     0
 }
+
+/// The shortest match the format allows (RFC 8878 3.1.1.3.2.1.1: a
+/// `Match_Length_Code` of 0 is a length of 3).
+pub(crate) const FORMAT_MIN_MATCH: usize = 3;
 
 /// A type whose alignment is [`ALIGN`], for the dangling pointer of an empty
 /// workspace.

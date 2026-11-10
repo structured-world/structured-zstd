@@ -730,7 +730,8 @@ fn retained_heap_size_counts_the_block_buffers() {
     );
     state.finish_layout(block);
     let after = state.retained_scratch_heap_size();
-    let needed = super::CompressedBlockScratch::workspace_bytes(block);
+    let needed =
+        super::CompressedBlockScratch::workspace_bytes(block, state.workspace.sequence_floor());
     assert!(
         after - before >= needed,
         "laying out {needed} bytes of block buffers grew the reported retained size by only {} bytes",
@@ -828,7 +829,7 @@ fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
     // The block target stands for the trailing part's size in bytes.
     ws.begin_layout(
         region_bytes::<u32>(count),
-        |bytes| bytes,
+        |bytes, _| bytes,
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(0, usize::MAX);
@@ -866,7 +867,7 @@ fn collected_fast_band_sequences_carry_the_fast_derivation() {
         let mut ws = Workspace::new();
         ws.begin_layout(
             region_bytes::<RawSequence>(reported.len()),
-            |bytes| bytes,
+            |bytes, _| bytes,
             crate::encoding::workspace::IngestPlan::Stream,
         );
         ws.open(0, usize::MAX);
@@ -1391,7 +1392,7 @@ fn literals_buffer(capacity: usize) -> (Workspace, RegionVec<u8>) {
     let mut ws = Workspace::new();
     ws.begin_layout(
         region_bytes::<u8>(capacity),
-        |bytes| bytes,
+        |bytes, _| bytes,
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(0, usize::MAX);

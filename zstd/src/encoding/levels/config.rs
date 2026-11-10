@@ -234,6 +234,21 @@ impl LevelParams {
         (hash_log + 3).max(chain_log + 1).min(31) as u32
     }
 
+    /// The shortest match any sequence the frame's search emits carries, which
+    /// bounds how many sequences a block can hold (upstream `ZSTD_maxNbSeq`,
+    /// zstd_compress.c, divides by 3 for `minMatch == 3` and by 4 otherwise).
+    /// Every search but the optimal parser confirms a match, repeat or not, on
+    /// four bytes. The optimal parser prices and takes three-byte matches at
+    /// any `minMatch`, where upstream's stops at four unless `minMatch` is 3,
+    /// so its frames keep the format's floor.
+    pub(crate) fn sequence_floor(&self) -> usize {
+        use crate::encoding::strategy::SearchMethod;
+        match self.search {
+            SearchMethod::BinaryTree => crate::encoding::workspace::FORMAT_MIN_MATCH,
+            _ => 4,
+        }
+    }
+
     /// The level's upstream `cParams.minMatch`: the shortest match its search
     /// accepts, and so the shortest piece of a long-distance match a block cut
     /// leaves worth keeping (`maybeSplitSequence`, `zstd_ldm.c:644`).
@@ -741,7 +756,12 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     let laid_out = tables
         .saturating_add(3 * ALIGN)
         .saturating_add(region_bytes::<u8>(history))
-        .saturating_add(crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(block))
+        .saturating_add(
+            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(
+                block,
+                params.sequence_floor(),
+            ),
+        )
         .saturating_add(ALIGN - 1);
     // The backends that slide their window by blocks keep one length per
     // block in it, in a deque that grows by doubling. Plain arithmetic here
