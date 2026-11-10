@@ -213,20 +213,6 @@ macro_rules! execute_one_body {
             let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
             *$lit_cur = high;
 
-            // A zero offset IS reachable on malformed input and is rejected
-            // here, not asserted. The argument for asserting it was that an
-            // offset entry's base value is `1 << ofCode` and the table build
-            // bounds the code, so a resolved offset is at least 1; fuzzing
-            // disproved it, on the lookahead arm, whose offsets come through
-            // `do_offset_history` rather than the fused resolve. Without the
-            // test a release build would take a zero as a match source of
-            // itself and decode corrupt input to garbage instead of an error,
-            // so the ~1.2 instructions per sequence it costs are the price of
-            // rejecting it.
-            if resolved_offset_v == 0 {
-                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
-            }
-
             // The literal-source slack both inline paths need (their `copy16`
             // reads 16 bytes whatever the length, and the wildcopy regime reads
             // the length rounded up to its stride) is guaranteed for the whole
@@ -256,7 +242,16 @@ macro_rules! execute_one_body {
                 $cur.live().checked_add(lits.len()).is_some(),
                 "live output plus the literal run must not wrap",
             );
-            let prefix_resident = offset <= $cur.live() + lits.len();
+            // A zero offset IS reachable on malformed input (fuzzing found it on
+            // the lookahead arm, through `do_offset_history`), and executing it
+            // would take the write position as its own match source. Measuring
+            // `offset - 1` modularly folds that refusal into this gate: zero
+            // wraps to the largest value and is never resident, so it leaves
+            // the hot path here and is named on the cold one below, while every
+            // other offset compares exactly as `offset <= live + lits`.
+            // Upstream does the same with `temp -= !temp`
+            // (zstd_decompress_block.c, ZSTD_decodeSequence).
+            let prefix_resident = offset.wrapping_sub(1) < $cur.live() + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
@@ -329,6 +324,10 @@ macro_rules! execute_one_body {
             // the cursor back first and this loop re-reads it afterwards.
             $cur.publish($buffer);
 
+            if resolved_offset_v == 0 {
+                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
+            }
+
             // Reaches past the output into the dictionary. When the whole match
             // sits inside reachable dictionary content the copy is one more
             // inline copy, the way upstream handles its extDict branch;
@@ -394,7 +393,7 @@ macro_rules! execute_one_body {
 /// # Safety
 /// Caller must have verified that the runtime CPU advertises BMI2 + AVX2.
 /// The dispatcher in `decode_and_execute_sequences` gates this on
-/// `detect_cpu_kernel() == Avx2`.
+/// `detect_cpu_kernel() == Avx2`. The section holds at least one sequence.
 #[target_feature(enable = "bmi2,avx2")]
 #[allow(clippy::too_many_lines)]
 // The block's inputs, each already a scalar or a borrow the caller holds.
@@ -583,51 +582,70 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         debug_assert!(max_update_bits <= 9 + 9 + 8);
-        br.refill();
-        for i in 0..num_sequences {
-            // The states advance for the NEXT sequence inside the decode, ahead
-            // of executing this one, as upstream advances them at the end of
-            // `ZSTD_decodeSequence` and only then calls `ZSTD_execSequence`. The
-            // execute reads no bits, so the bitstream order is unchanged, and
-            // the three FSE states plus the bit reader stop being live across
-            // the heavy match copy.
-            // SAFETY: init_sequence_stream validated the states and established
-            // the reader window. The initial and per-sequence checked refills
-            // restore bits_consumed < 8, and decode_resolved reserves enough
-            // bits for the state updates below.
-            let seq = unsafe {
-                super::seq_decoder_scalar::decode_resolved(
-                    &ll_dec,
-                    &ml_dec,
-                    &of_dec,
-                    &mut br,
-                    &mut shadow_hist,
-                )
-            };
-            let (seq_ll, seq_ml, resolved_offset) = (seq.ll, seq.ml, seq.of);
-            if i + 1 < num_sequences {
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
-                br.refill();
+        // SAFETY: init_sequence_stream established the reader window by
+        // reading the padding marker, and at most 64 bits are consumed between
+        // reloads (see `refill_sequence`).
+        unsafe { br.refill_sequence() };
+        // One sequence: decode it, advance the states unless it is the last,
+        // execute it. A failure leaves `$out` with the error recorded.
+        macro_rules! short_step {
+            ($advance:expr, $out:lifetime) => {{
+                // The states advance for the NEXT sequence inside the decode,
+                // ahead of executing this one, as upstream advances them at the
+                // end of `ZSTD_decodeSequence` and only then calls
+                // `ZSTD_execSequence`. The execute reads no bits, so the
+                // bitstream order is unchanged, and the three FSE states plus the
+                // bit reader stop being live across the heavy match copy.
+                // SAFETY: init_sequence_stream validated the states and
+                // established the reader window. The initial and per-sequence
+                // checked refills restore bits_consumed < 8, and decode_resolved
+                // reserves enough bits for the state updates below.
+                let seq = unsafe {
+                    super::seq_decoder_scalar::decode_resolved(
+                        &ll_dec,
+                        &ml_dec,
+                        &of_dec,
+                        &mut br,
+                        &mut shadow_hist,
+                    )
+                };
+                let (seq_ll, seq_ml, resolved_offset) = (seq.ll, seq.ml, seq.of);
+                if $advance {
+                    ll_dec.update_state_fast(&mut br);
+                    ml_dec.update_state_fast(&mut br);
+                    of_dec.update_state_fast(&mut br);
+                    // SAFETY: as before the loop; the window only moves toward
+                    // the start of the source.
+                    unsafe { br.refill_sequence() };
+                }
+                let r = execute_one_body!(
+                    &mut cur,
+                    buffer,
+                    dict,
+                    dict_content,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    seq_ll,
+                    seq_ml,
+                    resolved_offset
+                );
+                if let Err(e) = r {
+                    fallback_err = Some(e);
+                    break $out;
+                }
+                seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+            }};
+        }
+        // The last sequence leaves the states alone; running it after the loop
+        // keeps that question out of every other iteration. The block decoder
+        // calls in only for a section with sequences.
+        debug_assert!(num_sequences > 0, "sequence section without sequences");
+        'short: {
+            for _ in 1..num_sequences {
+                short_step!(true, 'short);
             }
-            let r = execute_one_body!(
-                &mut cur,
-                buffer,
-                dict,
-                dict_content,
-                literals_buffer,
-                &mut lit_cur,
-                literals_buffer_len,
-                seq_ll,
-                seq_ml,
-                resolved_offset
-            );
-            if let Err(e) = r {
-                fallback_err = Some(e);
-                break;
-            }
-            seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+            short_step!(false, 'short);
         }
         cur.publish(buffer);
         if let Some(e) = fallback_err {

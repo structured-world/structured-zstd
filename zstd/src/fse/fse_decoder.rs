@@ -710,12 +710,9 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         }
 
         // === Spread step ===
-        // Reuse the persistent scratch buffer; clear then resize to
-        // table_size. The resize is the ONLY zero-init in the entire
-        // build path now (previous impl also zero-init'd `decode`
-        // through `Vec::resize` with a default `Entry`, doubling the
-        // write traffic on the build path).
-        spread.clear();
+        // The two passes below write every one of the `table_size` slots (the
+        // probabilities sum to `table_size`, -1 counting as one), so the
+        // persistent scratch is only resized, never cleared first.
         spread.resize(table_size, 0);
 
         // Upstream zstd `ZSTD_buildFSETable_body`-shape per-symbol counter
@@ -730,8 +727,9 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // runtime `divl` (~24 cycles, ~24% of FSE-build samples on
         // z000033 L-5 fast — see perf annotate audit). Stack-only
         // (256-symbol alphabet bounded by `u8`); zero-init covers
-        // every slot.
-        let mut symbol_next = [0u32; 256];
+        // every slot. `u16` as upstream's `symbolNext`: a counter never
+        // passes `2 * table_size - 1`, and `table_size <= CAP <= 512`.
+        let mut symbol_next = [0u16; 256];
 
         // Pass 1: place -1 probability symbols at the top of the
         // table AND initialise `symbol_next` for them. Upstream zstd:
@@ -772,7 +770,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u32;
+                symbol_next[symbol] = prob as u16;
                 let n = prob as usize;
                 // 8 copies of the symbol byte; lay down 8 at a time (counts are
                 // mostly <= 8 on small table-logs, so the inner loop rarely runs).
@@ -789,11 +787,19 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             }
             let table_mask = table_size - 1;
             let step = (table_size >> 1) + (table_size >> 3) + 3;
+            let spread_live = &mut spread[..table_size];
             let mut position = 0usize;
             let mut s = 0usize;
             while s < table_size {
-                spread[position] = in_order[s];
-                spread[(position + step) & table_mask] = in_order[s + 1];
+                let paired = (position + step) & table_mask;
+                debug_assert!(position <= table_mask);
+                // SAFETY: both positions are masked by `table_mask = table_size
+                // - 1` (`position` starts at 0 and is re-masked every step), so
+                // each is below `table_size == spread_live.len()`.
+                unsafe {
+                    *spread_live.get_unchecked_mut(position) = in_order[s];
+                    *spread_live.get_unchecked_mut(paired) = in_order[s + 1];
+                }
                 position = (position + 2 * step) & table_mask;
                 s += 2;
             }
@@ -804,7 +810,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u32;
+                symbol_next[symbol] = prob as u16;
                 let symbol_u8 = symbol as u8;
                 for _ in 0..prob {
                     spread[position] = symbol_u8;
@@ -833,7 +839,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // so `nextState == 1`, `high_bit == 1`, `nbBits ==
         // accuracy_log`, `newState == 0` — exactly the -1 entry
         // shape.
-        let table_size_u32 = table_size as u32;
         // Write the `table_size` live entries directly into the inline,
         // value-initialised `decode` array (no `MaybeUninit` / `set_len`
         // dance needed — the array already holds `E::default()` in every
@@ -849,95 +854,62 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         );
         *decode_len = 0;
 
-        // Slice index instead of `spread.iter().take(table_size)`:
-        // if `spread.len() < table_size` (a future refactor breaking
-        // the upstream `spread.resize(table_size, 0)` invariant), the
-        // slice indexing panics here BEFORE the unsafe `set_len`
-        // below would claim uninitialised entries. `take()` would
-        // silently shorten the loop and leave `slots` half-written,
-        // which the post-loop `set_len(table_size)` would then expose
-        // as UB. Indexing surfaces the invariant violation as a
-        // bounds-check panic instead.
-        for (state_idx, &symbol) in spread[..table_size].iter().enumerate() {
-            let next_state = symbol_next[symbol as usize];
-            // `next_state >= 1` by construction: upstream
-            // `read_probabilities` / `build_from_probabilities`
-            // validate that `sum(prob, treating -1 as 1) ==
-            // table_size`, which guarantees Pass 1 + Pass 2 above
-            // fully cover spread[] (no zero defaults survive
-            // `spread.resize(table_size, 0)`) and every symbol that
-            // appears in spread[] has `symbol_next[s] > 0`.
-            // `highest_bit_set(x)` returns `floor(log2(x)) + 1`.
-            symbol_next[symbol as usize] = next_state + 1;
-            let high_bit = highest_bit_set(next_state);
-            // nbBits = accuracy_log - floor(log2(next_state))
-            //        = accuracy_log - (high_bit - 1)
-            //        = (accuracy_log + 1) - high_bit
-            // For -1 prob: next_state = 1, high_bit = 1, nbBits =
-            // accuracy_log.
-            // For positive prob N: next_state in N..2N-1; max
-            // next_state = 2N-1 ≤ 2*table_size - 1, max high_bit
-            // = accuracy_log + 1 (when N == table_size), nbBits = 0.
-            // So nbBits ∈ [0, accuracy_log], satisfying the
-            // unchecked-read invariant in `FSEDecoder::read_entry`.
-            let nb = (accuracy_log as u32 + 1).wrapping_sub(high_bit) as u8;
-            // FSE invariant gate: keep the explicit `nb > accuracy_log`
-            // guard for `build_from_probabilities` (public surface) so
-            // a crafted probability vector can't silently violate
-            // `new_state + (1 << nb) - 1 < table_size`. With the upstream zstd
-            // formula `nb` derives from `high_bit` which is itself
-            // bounded by the table-size invariant, but a malformed
-            // probability accumulating beyond `table_size` could push
-            // high_bit > accuracy_log + 1 and wrap `nb` to a large
-            // u8. Reject so the unchecked indexing contract holds.
-            if nb > accuracy_log {
-                // `decode.len()` is still 0 (set by `clear()` above) —
-                // no `set_len` ran, so no uninitialised entry is
-                // observable to the outer `build_decoding_table`'s
-                // `reset()` path. The partially-filled `slots` buffer
-                // is dropped here harmlessly (`MaybeUninit<E>` has no
-                // Drop).
-                return Err(FSETableError::TableInvariantViolation {
-                    prob: symbol_probabilities[symbol as usize],
-                    symbol,
-                    num_bits: nb,
+        // Sliced to `table_size` on both sides, so a `spread` shorter than the
+        // table (a broken resize above) panics here instead of leaving entries
+        // unwritten, and the per-state pass indexes neither slice.
+        let decode = &mut decode[..table_size];
+        let spread = &spread[..table_size];
+        // The sequence meta is chosen once per table, so each variant runs its
+        // own copy of the per-state pass instead of matching on it per state.
+        // The spread holds only symbols below `nb_symbols` (both passes write
+        // `0..nb_symbols`), and each sequence table is built with the meta of
+        // its own alphabet (`max_symbol + 1` codes, which bounds `nb_symbols`
+        // above), so the meta covers every symbol the pass meets.
+        match meta {
+            SeqMeta::None => fill_decode_entries(
+                decode,
+                spread,
+                &mut symbol_next,
+                accuracy_log,
+                |_, entry| entry,
+            ),
+            SeqMeta::Packed(packed) => {
+                // One bounds check per table; a meta shorter than the alphabet
+                // is a caller bug and panics here.
+                let packed = &packed[..nb_symbols];
+                fill_decode_entries(
+                    decode,
+                    spread,
+                    &mut symbol_next,
                     accuracy_log,
-                });
+                    |symbol, entry: E| {
+                        debug_assert!(usize::from(symbol) < packed.len());
+                        // SAFETY: `symbol < nb_symbols == packed.len()`. The
+                        // spread is resized, not cleared, so this rests on both
+                        // passes above writing every slot, which holds because
+                        // both entry points (`build_from_probabilities` and
+                        // `read_probabilities`) reject a probability sum other
+                        // than `table_size`. A bounds check here would cost a
+                        // branch per state for a case those checks exclude.
+                        let m = unsafe { *packed.get_unchecked(symbol as usize) };
+                        entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
+                    },
+                )
             }
-            // `next_state << nb` ranges [table_size, 2*table_size - (1 << nb)];
-            // subtracting `table_size` gives `new_state ∈ [0, table_size - 1]`
-            // which fits u16 for any `accuracy_log <= 16`
-            // (`ENTRY_MAX_ACCURACY_LOG`). The wire format caps
-            // `accuracy_log` at `FSE_MAX_TABLELOG = 9` for sequence
-            // tables, well below the u16 bound. Use normal
-            // subtraction (not wrapping_sub) so the
-            // implicit-overflow debug_assert catches any future
-            // formula bug instead of silently producing a
-            // malformed entry.
-            let new_state_u32 = (next_state << nb) - table_size_u32;
-            let entry = E::from_raw(new_state_u32 as u16, symbol, nb);
-            // Fused enrich: write the sequence meta in the same pass
-            // instead of re-walking the finished table. `from_raw`
-            // zero-inits the meta fields, so the no-meta arms match
-            // the post-pass results exactly.
-            decode[state_idx] = core::mem::MaybeUninit::new(match meta {
-                SeqMeta::None => entry,
-                SeqMeta::Packed(packed) => {
-                    let m = packed.get(symbol as usize).copied().unwrap_or(0);
-                    entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
-                }
-                SeqMeta::Offsets => {
-                    if symbol < 32 {
-                        entry.with_seq_meta(1u32 << symbol, symbol)
-                    } else {
-                        entry
-                    }
-                }
-            });
+            SeqMeta::Offsets => {
+                // Offset codes stop at 31 (the offset table's `max_symbol`).
+                assert!(nb_symbols <= 32, "offset table with {nb_symbols} codes");
+                fill_decode_entries(
+                    decode,
+                    spread,
+                    &mut symbol_next,
+                    accuracy_log,
+                    |symbol, entry: E| entry.with_seq_meta(1u32 << symbol, symbol),
+                )
+            }
         }
 
-        // Commit the live span. The loop wrote every `state_idx ∈
-        // [0, table_size)`; an Err above returns with `decode_len` still 0.
+        // Commit the live span: the pass wrote every state.
         *decode_len = table_size;
 
         Ok(())
@@ -1317,7 +1289,9 @@ const ACC_LOG_OFFSET: u8 = 5;
 const ENTRY_MAX_ACCURACY_LOG: u8 = 16;
 
 fn highest_bit_set(x: u32) -> u32 {
-    assert!(x > 0);
+    // Its one caller asks about `probability_sum - probability_counter + 1`,
+    // which the loop keeps at 2 or more.
+    debug_assert!(x > 0);
     u32::BITS - x.leading_zeros()
 }
 
@@ -1344,6 +1318,40 @@ fn mismatch_diagnostic(_probs: &[i32]) -> Vec<i32> {
 /// lay-down can over-write past the last symbol without bounds-checking each
 /// tail write.
 const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
+
+/// The per-state pass of a table build (upstream zstd `ZSTD_buildFSETable_body`):
+/// each state takes the next count of the symbol spread there, which gives its
+/// bit count and next state, and `with_meta` attaches the sequence meta.
+///
+/// Both table-build entry points have checked that the probabilities sum to
+/// the table size, so every spread symbol's counter starts at its probability
+/// (at least 1) and stays below `2 * table_size`; the bit count is then within
+/// the accuracy log by construction, asserted rather than tested per state.
+#[inline(always)]
+fn fill_decode_entries<E: FseEntry>(
+    decode: &mut [core::mem::MaybeUninit<E>],
+    spread: &[u8],
+    symbol_next: &mut [u16; 256],
+    accuracy_log: u8,
+    with_meta: impl Fn(u8, E) -> E,
+) {
+    let table_size = 1u32 << accuracy_log;
+    // nbBits = accuracy_log - floor(log2(next_state))
+    //        = leading_zeros(next_state) - (31 - accuracy_log).
+    let leading_zeros_at_no_bits = 31 - u32::from(accuracy_log);
+    for (slot, &symbol) in decode.iter_mut().zip(spread) {
+        let next_state = u32::from(symbol_next[symbol as usize]);
+        debug_assert!(next_state >= 1 && next_state < 2 * table_size);
+        symbol_next[symbol as usize] = (next_state + 1) as u16;
+        let nb = next_state.leading_zeros() - leading_zeros_at_no_bits;
+        debug_assert!(nb <= u32::from(accuracy_log));
+        // `next_state << nb` is in `[table_size, 2 * table_size)`, so the new
+        // state is below `table_size` and fits `u16`.
+        let new_state = (next_state << nb) - table_size;
+        let entry = E::from_raw(new_state as u16, symbol, nb as u8);
+        *slot = core::mem::MaybeUninit::new(with_meta(symbol, entry));
+    }
+}
 
 fn next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
