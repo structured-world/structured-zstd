@@ -243,13 +243,20 @@ pub(crate) fn read_frame_header_from_slice(
         bytes_read += 1;
     }
 
+    // Both variable fields are read with one fixed-width load per length, as
+    // upstream's switch does (zstd_decompress.c, ZSTD_getFrameHeader_advanced):
+    // a copy whose length is known only at run time compiles to a libc
+    // `memcpy` call per field, every frame.
     let dict_id_len = desc.dictionary_id_bytes()? as usize;
     if dict_id_len != 0 {
         let b = take(input, dict_id_len).ok_or_else(|| err::DictionaryIdReadError(eof()))?;
         bytes_read += dict_id_len as u8;
-        let mut buf4 = [0u8; 4];
-        buf4[..dict_id_len].copy_from_slice(b);
-        let dict_id = u32::from_le_bytes(buf4);
+        let dict_id = match b {
+            [b0] => u32::from(*b0),
+            [b0, b1] => u32::from(u16::from_le_bytes([*b0, *b1])),
+            [b0, b1, b2, b3] => u32::from_le_bytes([*b0, *b1, *b2, *b3]),
+            _ => unreachable!("Dictionary_ID_flag selects 0, 1, 2 or 4 bytes"),
+        };
         if dict_id != 0 {
             frame_header.dict_id = Some(dict_id);
         }
@@ -259,13 +266,16 @@ pub(crate) fn read_frame_header_from_slice(
     if fcs_len != 0 {
         let b = take(input, fcs_len).ok_or_else(|| err::FrameContentSizeReadError(eof()))?;
         bytes_read += fcs_len as u8;
-        let mut buf8 = [0u8; 8];
-        buf8[..fcs_len].copy_from_slice(b);
-        let mut fcs = u64::from_le_bytes(buf8);
-        if fcs_len == 2 {
-            fcs += 256;
-        }
-        frame_header.frame_content_size = fcs;
+        frame_header.frame_content_size = match b {
+            [b0] => u64::from(*b0),
+            // RFC 8878 3.1.1.1.4: the 2-byte field is offset by 256.
+            [b0, b1] => u64::from(u16::from_le_bytes([*b0, *b1])) + 256,
+            [b0, b1, b2, b3] => u64::from(u32::from_le_bytes([*b0, *b1, *b2, *b3])),
+            [b0, b1, b2, b3, b4, b5, b6, b7] => {
+                u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7])
+            }
+            _ => unreachable!("Frame_Content_Size_flag selects 0, 1, 2, 4 or 8 bytes"),
+        };
     }
 
     desc.check_reserved_bit()?;

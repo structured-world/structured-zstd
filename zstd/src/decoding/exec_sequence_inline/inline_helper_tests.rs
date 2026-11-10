@@ -1,4 +1,42 @@
-use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
+use super::x86::{
+    copy16, overlap_copy8, overlap_match_shuffle, wildcopy_no_overlap,
+    wildcopy_overlap_8byte_stride,
+};
+
+/// The shuffle copy of an overlapping match writes what a byte-by-byte copy
+/// writes, for every offset it serves and lengths around each chunk edge, and
+/// stays within its 15-byte overshoot.
+#[cfg(feature = "std")]
+#[test]
+fn overlap_match_shuffle_repeats_the_period_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("ssse3") {
+        return;
+    }
+    let prefix: alloc::vec::Vec<u8> = (0..32u8).map(|b| b.wrapping_mul(37) ^ 0x5a).collect();
+    for offset in 1..16usize {
+        for length in [1usize, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 100] {
+            let mut expected = prefix.clone();
+            for _ in 0..length {
+                expected.push(expected[expected.len() - offset]);
+            }
+            let mut out = prefix.clone();
+            out.resize(prefix.len() + length.next_multiple_of(16) + 16, 0xee);
+            // SAFETY: 32 written bytes precede the match, the buffer holds the
+            // length rounded up to 16, and the CPU has SSSE3 (checked above).
+            unsafe { overlap_match_shuffle(out.as_mut_ptr().add(prefix.len()), offset, length) };
+            assert_eq!(
+                out[..expected.len()],
+                expected[..],
+                "offset {offset} length {length}"
+            );
+            let written = prefix.len() + length.next_multiple_of(16);
+            assert!(
+                out[written..].iter().all(|&b| b == 0xee),
+                "offset {offset} length {length} wrote past its overshoot",
+            );
+        }
+    }
+}
 
 #[test]
 fn copy16_copies_exactly_16_bytes() {

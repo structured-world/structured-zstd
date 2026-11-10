@@ -144,7 +144,10 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         {
             debug_assert!(self.bits_consumed <= 64);
             let bytes_consumed = usize::from(self.bits_consumed) / 8;
-            if bytes_consumed == 0 {
+            // A zero advance reloads the same window, which is harmless, so x86
+            // takes it rather than branch on it, as upstream's
+            // `BIT_reloadDStream` does (bitstream.h).
+            if cfg!(target_arch = "aarch64") && bytes_consumed == 0 {
                 return;
             }
             if self.index >= 8 {
