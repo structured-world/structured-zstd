@@ -836,8 +836,6 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // Trailing literals, reported after the last sequence; the runs are read
     // back by position, so no sequence may follow them.
     let mut tail = 0usize;
-    let sequences = &mut parts.sequences;
-    let long = &mut parts.long;
     // The Fast band codes each offset as it is emitted, against the history the
     // block starts from. Upstream decides the offBase at the store
     // (`ZSTD_storeSeq` in `zstd_fast.c`); here the derivation is inlined at
@@ -860,20 +858,32 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // The built-in matcher searches compiled for the frame's tier; a matcher
     // from outside the crate knows nothing of tiers. The branch folds per
     // matcher type.
-    let sequence_floor = state.workspace.sequence_floor();
     match state.matcher.builtin_driver() {
-        Some(driver) => builtin_block_sequences::<K>(
-            driver,
-            &mut tail,
-            sequences,
-            long,
-            code_offsets,
-            &mut hist,
-            sequence_floor,
-        ),
-        None => state.matcher.start_matching(|seq| {
-            record_sequence(seq, &mut tail, sequences, long, code_offsets, &mut hist)
-        }),
+        Some(driver) => {
+            builtin_block_sequences::<K>(driver, &mut tail, parts, code_offsets, &mut hist);
+            // The unchecked push rests on every built-in sequence covering the
+            // frame's sequence floor; checked here, after the search, so the
+            // record inlined in the match loop carries nothing for it.
+            #[cfg(debug_assertions)]
+            {
+                let floor = state.workspace.sequence_floor();
+                for (i, seq) in parts.sequences.iter().enumerate() {
+                    let ml = parts.long.ml(i, seq) as usize;
+                    debug_assert!(
+                        ml >= floor,
+                        "a {ml}-byte match under a sequence floor of {floor}"
+                    );
+                }
+            }
+        }
+        None => {
+            let EncodedBlockParts {
+                sequences, long, ..
+            } = parts;
+            state.matcher.start_matching(|seq| {
+                record_sequence(seq, &mut tail, sequences, long, code_offsets, &mut hist)
+            })
+        }
     }
     if code_offsets {
         state.offset_hist = hist;
@@ -910,25 +920,17 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
 fn builtin_block_sequences<K: EncodeTier>(
     driver: &mut crate::encoding::match_generator::MatchGeneratorDriver,
     tail: &mut usize,
-    sequences: &mut RegionVec<RawSequence>,
-    long: &mut LongLengths,
+    parts: &mut EncodedBlockParts,
     code_offsets: bool,
     hist: &mut [u32; 3],
-    sequence_floor: usize,
 ) {
     // `move`: the flag rides in the closure by value. Borrowed, every
     // sequence read it through the closure and the reference it holds, one
-    // more load behind the sink's own.
+    // more load behind the sink's own. The buffer and the long-length marks
+    // ride behind the one `parts` pointer, so the match loop keeps no more
+    // values live than it did for the buffer alone.
     driver.start_matching_with::<K>(move |seq| {
-        record_builtin_sequence(
-            seq,
-            tail,
-            sequences,
-            long,
-            code_offsets,
-            hist,
-            sequence_floor,
-        )
+        record_builtin_sequence(seq, tail, parts, code_offsets, hist)
     });
 }
 
@@ -941,11 +943,9 @@ fn builtin_block_sequences<K: EncodeTier>(
 fn record_builtin_sequence(
     seq: Sequence,
     tail: &mut usize,
-    sequences: &mut RegionVec<RawSequence>,
-    long: &mut LongLengths,
+    parts: &mut EncodedBlockParts,
     code_offsets: bool,
     hist: &mut [u32; 3],
-    sequence_floor: usize,
 ) {
     match seq {
         Sequence::Literals { len } => *tail += len,
@@ -956,27 +956,19 @@ fn record_builtin_sequence(
         } => {
             debug_assert_eq!(*tail, 0, "literals reported before a sequence");
             debug_assert!((literal_len | match_len | offset) <= u32::MAX as usize);
-            debug_assert!(
-                match_len >= sequence_floor,
-                "a {match_len}-byte match under a sequence floor of {sequence_floor}"
-            );
             let off_base = if code_offsets {
                 encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
             } else {
                 offset as u32
             };
+            let index = parts.sequences.len();
+            let sequence = parts.long.sequence(index, literal_len, match_len, off_base);
             // SAFETY: the buffer holds `max_sequences` of the largest block at
             // the frame's sequence floor (`LevelParams::sequence_floor`), and
             // every sequence of the built-in matcher covers at least that many
-            // bytes of the block, so it cannot fill up.
-            unsafe {
-                sequences.push_within_capacity(long.sequence(
-                    sequences.len(),
-                    literal_len,
-                    match_len,
-                    off_base,
-                ))
-            };
+            // bytes of the block (checked after the search in debug builds), so
+            // it cannot fill up.
+            unsafe { parts.sequences.push_within_capacity(sequence) };
         }
     }
 }
