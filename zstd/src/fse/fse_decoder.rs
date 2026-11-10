@@ -883,7 +883,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                     &mut symbol_next,
                     accuracy_log,
                     |symbol, entry: E| {
-                        // SAFETY: `symbol < nb_symbols == packed.len()`, see above.
+                        debug_assert!(usize::from(symbol) < packed.len());
+                        // SAFETY: `symbol < nb_symbols == packed.len()`. The
+                        // spread is resized, not cleared, so this rests on both
+                        // passes above writing every slot, which holds because
+                        // both entry points (`build_from_probabilities` and
+                        // `read_probabilities`) reject a probability sum other
+                        // than `table_size`. A bounds check here would cost a
+                        // branch per state for a case those checks exclude.
                         let m = unsafe { *packed.get_unchecked(symbol as usize) };
                         entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
                     },
