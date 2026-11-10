@@ -1,5 +1,5 @@
 use super::{
-    FseTableMode, LastUsedTable, RawSequence, SEQUENCE_CODE_SLOTS, SequenceHistogram,
+    FseTableMode, LastUsedTable, LongLengths, RawSequence, SEQUENCE_CODE_SLOTS, SequenceHistogram,
     choose_table_from_counts, emit_single_sequence_block, encode_literal_length, encode_match_len,
     encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
     remember_last_used_tables,
@@ -437,7 +437,13 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 post_split_allowed: true,
             };
             let mut workspace = EstimatorWorkspace::default();
-            let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+            let est = estimate_block_parts_size(
+                &mut est_state,
+                &literals,
+                &[],
+                LongLengths::default(),
+                &mut workspace,
+            );
             let mut emitted: Vec<u8> = Vec::new();
             let mut codes_ws = Workspace::new();
             crate::encoding::fastpath::with_encode_tier!(
@@ -446,6 +452,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                     &mut emit_state,
                     &literals,
                     &mut [],
+                    LongLengths::default(),
                     &mut code_buffer(&mut codes_ws, 0),
                     &mut emitted,
                 )
@@ -523,7 +530,13 @@ fn the_preferred_repeat_costs_what_the_emitter_writes() {
             let mut est_state = make_state();
             let mut emit_state = make_state();
             let mut workspace = EstimatorWorkspace::default();
-            let est = estimate_block_parts_size(&mut est_state, literals, &[], &mut workspace);
+            let est = estimate_block_parts_size(
+                &mut est_state,
+                literals,
+                &[],
+                LongLengths::default(),
+                &mut workspace,
+            );
             let mut emitted: Vec<u8> = Vec::new();
             let mut codes_ws = Workspace::new();
             crate::encoding::fastpath::with_encode_tier!(
@@ -532,6 +545,7 @@ fn the_preferred_repeat_costs_what_the_emitter_writes() {
                     &mut emit_state,
                     literals,
                     &mut [],
+                    LongLengths::default(),
                     &mut code_buffer(&mut codes_ws, 0),
                     &mut emitted,
                 )
@@ -582,7 +596,13 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
     let mut est_state = make_state();
     let mut emit_state = make_state();
     let mut workspace = EstimatorWorkspace::default();
-    let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+    let est = estimate_block_parts_size(
+        &mut est_state,
+        &literals,
+        &[],
+        LongLengths::default(),
+        &mut workspace,
+    );
     let mut emitted: Vec<u8> = Vec::new();
     let mut codes_ws = Workspace::new();
     crate::encoding::fastpath::with_encode_tier!(
@@ -591,6 +611,7 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
             &mut emit_state,
             &literals,
             &mut [],
+            LongLengths::default(),
             &mut code_buffer(&mut codes_ws, 0),
             &mut emitted,
         )
@@ -654,7 +675,13 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut emit_state = make_state();
 
     let mut workspace = EstimatorWorkspace::default();
-    let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+    let est = estimate_block_parts_size(
+        &mut est_state,
+        &literals,
+        &[],
+        LongLengths::default(),
+        &mut workspace,
+    );
     let mut emitted: Vec<u8> = Vec::new();
     let mut codes_ws = Workspace::new();
     crate::encoding::fastpath::with_encode_tier!(
@@ -663,6 +690,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
             &mut emit_state,
             &literals,
             &mut [],
+            LongLengths::default(),
             &mut code_buffer(&mut codes_ws, 0),
             &mut emitted,
         )
@@ -874,16 +902,24 @@ fn collected_fast_band_sequences_carry_the_fast_derivation() {
         let mut sequences: RegionVec<RawSequence> = ws.buffer(reported.len());
         let mut tail = 0usize;
         let mut hist = [1u32, 4, 8];
+        let mut long = LongLengths::default();
         for &(literal_len, offset, match_len) in &reported {
             let seq = Sequence::Triple {
                 literal_len,
                 offset,
                 match_len,
             };
-            record_sequence(seq, &mut tail, &mut sequences, coded, &mut hist);
+            record_sequence(seq, &mut tail, &mut sequences, &mut long, coded, &mut hist);
         }
         let trailing = Sequence::Literals { len: 11 };
-        record_sequence(trailing, &mut tail, &mut sequences, coded, &mut hist);
+        record_sequence(
+            trailing,
+            &mut tail,
+            &mut sequences,
+            &mut long,
+            coded,
+            &mut hist,
+        );
         assert_eq!(tail, 11);
         let off_bases: Vec<u32> = sequences.iter().map(|seq| seq.off_base).collect();
         if coded {
@@ -894,7 +930,10 @@ fn collected_fast_band_sequences_carry_the_fast_derivation() {
             assert_eq!(off_bases, raw);
             assert_eq!(hist, [1, 4, 8]);
         }
-        let lengths: Vec<(u32, u32)> = sequences.iter().map(|seq| (seq.ll, seq.ml)).collect();
+        let lengths: Vec<(u32, u32)> = sequences
+            .iter()
+            .map(|seq| (long.ll(seq), long.ml(seq)))
+            .collect();
         let reported_lengths: Vec<(u32, u32)> = reported
             .iter()
             .map(|&(ll, _, ml)| (ll as u32, ml as u32))
@@ -928,12 +967,9 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
     // the degenerate single-symbol shapes, with repeats among the offsets so
     // the repeat-offset codes are exercised beside the explicit ones.
     let literals: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
-    let sequences: Vec<RawSequence> = (0..64u32)
-        .map(|i| RawSequence {
-            ll: i % 8,
-            ml: 4 + i % 13,
-            off_base: 1 + (i % 5) * 7,
-        })
+    let mut long = LongLengths::default();
+    let sequences: Vec<RawSequence> = (0..64usize)
+        .map(|i| long.sequence(i % 8, 4 + i % 13, 1 + (i as u32 % 5) * 7))
         .collect();
 
     // Not the Fast band: it never post-splits, so it is never estimated, and
@@ -969,7 +1005,8 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
         let mut emit_state = make_state();
 
         let mut workspace = EstimatorWorkspace::default();
-        let est = estimate_block_parts_size(&mut est_state, &literals, &sequences, &mut workspace);
+        let est =
+            estimate_block_parts_size(&mut est_state, &literals, &sequences, long, &mut workspace);
 
         let mut emitted: Vec<u8> = Vec::new();
         let mut to_emit = sequences.clone();
@@ -981,6 +1018,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
                 &mut emit_state,
                 &literals,
                 &mut to_emit,
+                long,
                 &mut codes,
                 &mut emitted,
             )
@@ -1040,11 +1078,8 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         post_split_allowed: true,
     };
     let source = [0xA5; 8];
-    let mut sequences = [RawSequence {
-        ll: 0,
-        ml: 5,
-        off_base: 20,
-    }];
+    let mut long = LongLengths::default();
+    let mut sequences = [long.sequence(0, 5, 20)];
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
 
@@ -1063,6 +1098,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
             source.len(),
             &[],
             &mut sequences,
+            long,
             &mut emit_buffers,
         )
     );
@@ -1386,6 +1422,28 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
     }
 }
 
+/// A sequence keeps its lengths in 16-bit fields and the one length of a block
+/// that does not fit in the block's `LongLengths`: every length reads back as
+/// written on both sides of the 16-bit boundary, the match length counting the
+/// 3 its field leaves out, and the format's longest block fits.
+#[test]
+fn sequence_lengths_read_back_across_the_16_bit_boundary() {
+    for (ll, ml) in [
+        (0usize, 3usize),
+        (65_534, 65_537),
+        (65_535, 65_538),
+        (65_536, 65_539),
+        (131_072, 131_072),
+    ] {
+        let mut long = LongLengths::default();
+        let seq = long.sequence(ll, ml, 7);
+        assert_eq!(long.ll(&seq), ll as u32, "literal length {ll}");
+        assert_eq!(long.ml(&seq), ml as u32, "match length {ml}");
+        assert_eq!(seq.off_base, 7);
+    }
+    assert_eq!(core::mem::size_of::<RawSequence>(), 8);
+}
+
 /// A literals buffer holding `capacity` bytes, laid out the way a frame lays
 /// out its own.
 fn literals_buffer(capacity: usize) -> (Workspace, RegionVec<u8>) {
@@ -1409,6 +1467,7 @@ fn literals_past_the_buffer_stop_instead_of_overflowing() {
     super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0xA5; 8],
         &[],
+        LongLengths::default(),
         8,
         &mut literals,
     );
@@ -1421,14 +1480,12 @@ fn literals_past_the_buffer_stop_instead_of_overflowing() {
 #[should_panic(expected = "sequences reach past the block they describe")]
 fn sequences_past_the_block_are_refused() {
     let (_ws, mut literals) = literals_buffer(64);
-    let sequences = [RawSequence {
-        ll: 4,
-        ml: 60,
-        off_base: 1,
-    }];
+    let mut long = LongLengths::default();
+    let sequences = [long.sequence(4, 60, 1)];
     super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0x5A; 32],
         &sequences,
+        long,
         0,
         &mut literals,
     );
@@ -1444,6 +1501,7 @@ fn a_tail_past_the_block_is_refused_before_the_copy() {
     super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0x5A; 64],
         &[],
+        LongLengths::default(),
         usize::MAX - 16,
         &mut literals,
     );
@@ -1502,14 +1560,8 @@ fn gathered_literals_are_the_runs_in_order() {
     let block: Vec<u8> = (0..block_len as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
         .collect();
-    let sequences: Vec<RawSequence> = lengths
-        .iter()
-        .map(|&ll| RawSequence {
-            ll: ll as u32,
-            ml: 5,
-            off_base: 1,
-        })
-        .collect();
+    let mut long = LongLengths::default();
+    let sequences: Vec<RawSequence> = lengths.iter().map(|&ll| long.sequence(ll, 5, 1)).collect();
     let mut expected = Vec::new();
     let mut pos = 0;
     for &ll in &lengths {
@@ -1521,7 +1573,13 @@ fn gathered_literals_are_the_runs_in_order() {
         let (_ws, mut literals) = literals_buffer(block_len);
         crate::encoding::fastpath::with_encode_tier!(
             kernel,
-            K => super::literal_runs::gather_literals::<K>(&block, &sequences, 13, &mut literals)
+            K => super::literal_runs::gather_literals::<K>(
+                &block,
+                &sequences,
+                long,
+                13,
+                &mut literals,
+            )
         );
         assert_eq!(&literals[..], &expected[..], "{kernel:?}");
     }
@@ -1534,37 +1592,44 @@ fn gathered_literals_are_the_runs_in_order() {
 /// sequences, so both loops run on every tier.
 #[test]
 fn every_tier_writes_the_block_the_scalar_tier_writes() {
-    use super::{CompressedBlockScratch, EntropyOnlyMatcher, encode_block_parts};
     // Skewed literals, so the section is Huffman-coded rather than raw.
     let literals: Vec<u8> = (0..24_000u32)
         .map(|i| b"eeeettaoinshrdlucmfwyp"[(i.wrapping_mul(2654435761) >> 27) as usize % 22])
         .collect();
     // Lengths and offsets across their extra-bit ranges, so the field widths
-    // the loop shifts by vary from one sequence to the next.
-    let mut sequences: Vec<RawSequence> = (0..4_000u32)
-        .map(|i| {
-            let mix = i.wrapping_mul(0x9E37_79B9);
-            RawSequence {
-                ll: (mix >> 7) % 70,
-                ml: 3 + (mix >> 13) % 300,
-                off_base: 1 + (mix >> 3) % 100_000,
-            }
-        })
-        .collect();
-    // Wide extras for both conditional flushes of the loop: 16 + 16 + 24 =
-    // 56 extra bits takes the one before the extras (31 or more) alone, and
-    // 16 + 16 + 30 = 62 takes the one before the offset (more than 56) too.
-    for (k, seq) in sequences.iter_mut().step_by(97).enumerate() {
-        // The first values with 16 extra bits: literal length 65536 and match
-        // length 65539 (`ml` counts the 3 the match-length code leaves out).
-        seq.ll = 65_536 + k as u32;
-        seq.ml = 65_539 + k as u32;
-        seq.off_base = if k % 2 == 0 {
-            (1u32 << 24) + k as u32
-        } else {
-            (1u32 << 30) + k as u32
-        };
+    // the loop shifts by vary from one sequence to the next. One sequence
+    // carries wide extras for each conditional flush of the loop: 16 + 16 + 24
+    // = 56 extra bits takes the one before the extras (31 or more) alone, and
+    // 16 + 16 + 30 = 62 takes the one before the offset (more than 56) too. The
+    // first values with 16 extra bits are literal length 65536 and match length
+    // 65539; a block holds one such sequence, so each width gets a block.
+    for wide_offset in [1u32 << 24, 1u32 << 30] {
+        let mut long = LongLengths::default();
+        let sequences: Vec<RawSequence> = (0..4_000u32)
+            .map(|i| {
+                if i == 97 {
+                    return long.sequence(65_536, 65_539, wide_offset);
+                }
+                let mix = i.wrapping_mul(0x9E37_79B9);
+                long.sequence(
+                    ((mix >> 7) % 70) as usize,
+                    (3 + (mix >> 13) % 300) as usize,
+                    1 + (mix >> 3) % 100_000,
+                )
+            })
+            .collect();
+        every_tier_writes_these_sequences_as_the_scalar_tier(&literals, &sequences, long);
     }
+}
+
+/// The body of [`every_tier_writes_the_block_the_scalar_tier_writes`] for one
+/// block of `sequences`.
+fn every_tier_writes_these_sequences_as_the_scalar_tier(
+    literals: &[u8],
+    sequences: &[RawSequence],
+    long: LongLengths,
+) {
+    use super::{CompressedBlockScratch, EntropyOnlyMatcher, encode_block_parts};
     let encode = |kernel| {
         let mut state = CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
@@ -1587,15 +1652,16 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
             post_split_allowed: true,
         };
         let mut emitted = Vec::new();
-        let mut to_emit = sequences.clone();
+        let mut to_emit = sequences.to_vec();
         let mut codes_ws = Workspace::new();
         let mut codes = code_buffer(&mut codes_ws, to_emit.len());
         crate::encoding::fastpath::with_encode_tier!(
             kernel,
             K => encode_block_parts::<_, K>(
                 &mut state,
-                &literals,
+                literals,
                 &mut to_emit,
+                long,
                 &mut codes,
                 &mut emitted,
             )
