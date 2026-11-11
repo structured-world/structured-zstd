@@ -5083,8 +5083,12 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
     );
 }
 
+/// The tail seed indexes the block's dense tail, the last starts the scan
+/// cannot reach, so the next block can match into them, and nothing before it:
+/// the gap a stepping scan skipped stays unindexed, as upstream leaves it.
+/// Seeding that gap cost 11% of a 100 KiB random frame's cycles at level 3.
 #[test]
-fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
+fn dfast_seed_remaining_hashable_starts_seeds_the_dense_tail_only() {
     let mut matcher = DfastMatchGenerator::new(1 << 20);
     let block = deterministic_high_entropy_bytes(0x13F0_9A6D_55CE_7B21, 64);
     matcher.commit_input(&block);
@@ -5092,57 +5096,33 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
 
     let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
-    let seed_start = current_len - DFAST_MIN_MATCH_LEN;
-    matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
+    matcher.seed_remaining_hashable_starts(current_abs_start, current_len);
 
-    let target_abs_pos = current_abs_start + current_len - 5;
-    let target_rel = target_abs_pos - matcher.history_abs_start;
-    let live = matcher.live_history();
-    assert!(
-        target_rel + 5 <= live.len(),
-        "fixture must leave the last short-hash start valid"
-    );
-    let short_hash = matcher.short_hash_index(&live[target_rel..]);
-    let target_slot = matcher.pack_slot(target_abs_pos);
+    let short_slot_of = |matcher: &DfastMatchGenerator, abs_pos: usize| {
+        let rel = abs_pos - matcher.history_abs_start;
+        let live = matcher.live_history();
+        assert!(
+            rel + 5 <= live.len(),
+            "fixture must leave the start short-hashable"
+        );
+        matcher.tables[matcher.long_len() + matcher.short_hash_index(&live[rel..])]
+    };
+    let last = current_abs_start + current_len - 5;
+    let last_slot = matcher.pack_slot(last);
     assert_ne!(
-        target_slot, DFAST_EMPTY_SLOT,
+        last_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.tables[matcher.long_len() + short_hash],
-        target_slot,
+        short_slot_of(&matcher, last),
+        last_slot,
         "tail seeding must include the last 5-byte-hashable start"
     );
-}
-
-#[test]
-fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
-    let mut matcher = DfastMatchGenerator::new(1 << 20);
-    let block = deterministic_high_entropy_bytes(0x7BB2_DA91_441E_C0EF, 64);
-    matcher.commit_input(&block);
-    matcher.ensure_hash_tables();
-
-    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
-    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
-    matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
-
-    let target_abs_pos = current_abs_start + current_len - 5;
-    let target_rel = target_abs_pos - matcher.history_abs_start;
-    let live = matcher.live_history();
-    assert!(
-        target_rel + 5 <= live.len(),
-        "fixture must leave the last short-hash start valid"
-    );
-    let short_hash = matcher.short_hash_index(&live[target_rel..]);
-    let target_slot = matcher.pack_slot(target_abs_pos);
+    let gap = current_abs_start + current_len - DfastMatchGenerator::BOUNDARY_DENSE_TAIL_LEN - 20;
     assert_ne!(
-        target_slot, DFAST_EMPTY_SLOT,
-        "pack_slot must never return the empty-slot sentinel for a real position"
-    );
-    assert_eq!(
-        matcher.tables[matcher.long_len() + short_hash],
-        target_slot,
-        "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
+        short_slot_of(&matcher, gap),
+        matcher.pack_slot(gap),
+        "tail seeding must leave the gap before the dense tail unindexed"
     );
 }
 
