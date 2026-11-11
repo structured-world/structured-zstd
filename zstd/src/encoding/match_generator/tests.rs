@@ -5118,7 +5118,8 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
 /// The tail seed indexes only the dense tail past where the scan stopped:
 /// neither the gap a stepping scan skipped before the tail, nor tail starts a
 /// match ending at the block's end already covered, as upstream's loops leave
-/// both. Seeding the gap cost 11% of a 100 KiB random frame's cycles at level 3.
+/// both. Seeding the gap cost 11% of a 100 KiB random frame's wall-clock time
+/// at level 3.
 #[test]
 fn dfast_seed_remaining_hashable_starts_skips_the_gap_and_covered_starts() {
     let short_slot_of = |matcher: &DfastMatchGenerator, abs_pos: usize| {
