@@ -143,13 +143,24 @@ impl OutCursor {
             base,
             op,
             cap,
-            // Saturating is the meaning here, not a masked bound: an output
-            // shorter than the overshoot leaves no room for an overshooting
-            // write at all, and an end of zero says exactly that, sending every
-            // sequence to the exact copier. This is a value computed once per
-            // block, not the per-sequence gate; the gate is the comparison
-            // against it.
-            cap_w: cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            // A sequence takes the overshooting copy when its own bytes end
+            // within the write limit and the overshoot within the backend's
+            // memory, as upstream bounds it. The limit carries the block
+            // maximum, which for a small single-segment frame is the frame's
+            // end; folding the overshoot into the limit itself sent the last
+            // sequence of every such frame, most of it, to the exact copier
+            // even when the caller's slice had room for the overshoot.
+            //
+            // Saturating is the meaning here, not a masked bound: memory shorter
+            // than the overshoot leaves no room for an overshooting write at all,
+            // and an end of zero says exactly that, sending every sequence to the
+            // exact copier. This is a value computed once per block, not the
+            // per-sequence gate; the gate is the comparison against it.
+            cap_w: cap.min(
+                backend
+                    .inline_overshoot_end()
+                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            ),
             live_base: core::num::Wrapping(op) - core::num::Wrapping(live),
         }
     }

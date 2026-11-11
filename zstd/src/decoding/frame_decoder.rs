@@ -3941,7 +3941,10 @@ impl FrameDecoder {
     ///
     /// This calls [`FrameDecoder::init`], and all bytes currently in the decoder will be lost.
     ///
-    /// Returns the number of bytes written to `output`.
+    /// Returns the number of bytes written to `output`. The bytes of `output` past that
+    /// length are left unspecified: the decoder may use them as scratch, as upstream zstd
+    /// does with the destination's capacity. Room past the data (32 bytes,
+    /// [`crate::WILDCOPY_OVERLENGTH`]) lets every sequence take the fast copy.
     pub fn decode_all(
         &mut self,
         input: &[u8],

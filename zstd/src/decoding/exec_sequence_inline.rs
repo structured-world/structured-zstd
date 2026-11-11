@@ -123,7 +123,8 @@ macro_rules! exec_sequence_avx2_inline_at {
     ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
-            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_paired,
+            wildcopy_overlap_8byte_stride,
         };
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;
@@ -170,12 +171,24 @@ macro_rules! exec_sequence_avx2_inline_at {
                 if lit_length_v > 16 {
                     wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
                 }
-                // Two ways, as upstream's `ZSTD_execSequence` splits at
-                // `WILDCOPY_VECLEN` only (zstd_decompress_block.c:1077): a
-                // separate 32-byte arm adds a data-dependent branch to every
-                // match.
+                // Split at `WILDCOPY_VECLEN`, as upstream's `ZSTD_execSequence`
+                // (zstd_decompress_block.c:1077), not at the 32-byte vector
+                // width: a 32-byte arm would add a data-dependent branch to
+                // every match. Only the length test below follows, and it
+                // passes on rare long matches, so it is predicted. The match
+                // copy may overshoot 31 bytes, which `cap_w` already reserves.
                 if offset_v >= 16 {
-                    wildcopy_no_overlap(op_match, match_src, match_length_v);
+                    if match_length_v >= 256 && match_length_v > offset_v {
+                        // A long copy that would read its own recent stores;
+                        // a short one reads too few to repay the pieces.
+                        $crate::decoding::exec_sequence_inline::x86::match_copy_doubling_avx2(
+                            op_match,
+                            offset_v,
+                            match_length_v,
+                        );
+                    } else {
+                        wildcopy_no_overlap_paired(op_match, match_src, match_length_v);
+                    }
                 } else {
                     // Sixteen bytes of written output before the match, which
                     // the shuffle reads its period from; only the first few
@@ -444,6 +457,77 @@ pub(crate) mod x86 {
         }
     }
 
+    /// A match longer than its offset, copied in pieces whose source lies
+    /// ever farther back: `offset` bytes from `offset` back, then `2 * offset`
+    /// bytes from `2 * offset` back, and so on. The output repeats with period
+    /// `offset`, so any multiple of it is a valid source distance once that
+    /// much is written. Read from a fixed short distance, every load takes
+    /// bytes the copy stored a few cycles before, still in the store buffer,
+    /// and one straddling two stores cannot be forwarded and waits for them;
+    /// doubling the distance moves the source out of that window after the
+    /// first piece, as libc memcpy over doubling pieces does. May overshoot up
+    /// to 31 bytes past `dst + length`.
+    ///
+    /// # Safety
+    /// Caller in `target_feature(avx2)` scope; `offset >= 1` bytes of output
+    /// are in place before `dst`; room for `length + 31` bytes at `dst`.
+    #[inline(always)]
+    pub(crate) unsafe fn match_copy_doubling_avx2(dst: *mut u8, offset: usize, length: usize) {
+        unsafe {
+            let mut written = 0usize;
+            let mut distance = offset;
+            while written < length {
+                let piece = distance.min(length - written);
+                let at = dst.add(written);
+                copy_back_avx2(at, at.sub(distance), piece);
+                written += piece;
+                // After this piece `written + offset` bytes of the period run
+                // are in place, which is the next distance; it stays below
+                // twice the match length, far from overflow.
+                distance *= 2;
+            }
+        }
+    }
+
+    /// `length` bytes from `src` to `dst` in libc memcpy's shape: past 128
+    /// bytes, 128 per pass with the stores on 32-byte boundaries and the last
+    /// 128 bytes written to end exactly at `dst + length`, so the pass count
+    /// stays short enough for the loop exit to be predicted and nothing is
+    /// written past the end. Up to 128 bytes go 32 at a time, writing up to 31
+    /// bytes past the end from source bytes that may be unwritten yet, which
+    /// the caller overwrites or leaves as overshoot.
+    ///
+    /// # Safety
+    /// Caller in `target_feature(avx2)` scope; `src + length <= dst` or the
+    /// regions are disjoint; room for `length + 31` bytes at `dst`.
+    #[inline(always)]
+    unsafe fn copy_back_avx2(dst: *mut u8, src: *const u8, length: usize) {
+        unsafe {
+            copy32_avx2(dst, src);
+            if length <= 128 {
+                let mut off = 32usize;
+                while off < length {
+                    copy32_avx2(dst.add(off), src.add(off));
+                    off += 32;
+                }
+                return;
+            }
+            let tail = length - 128;
+            let mut off = 32 - (dst.addr() & 31);
+            while off < tail {
+                copy32_avx2(dst.add(off), src.add(off));
+                copy32_avx2(dst.add(off + 32), src.add(off + 32));
+                copy32_avx2(dst.add(off + 64), src.add(off + 64));
+                copy32_avx2(dst.add(off + 96), src.add(off + 96));
+                off += 128;
+            }
+            copy32_avx2(dst.add(tail), src.add(tail));
+            copy32_avx2(dst.add(tail + 32), src.add(tail + 32));
+            copy32_avx2(dst.add(tail + 64), src.add(tail + 64));
+            copy32_avx2(dst.add(tail + 96), src.add(tail + 96));
+        }
+    }
+
     /// Upstream zstd's `ZSTD_copy16`: one unaligned 16-byte SIMD store.
     /// SSE2 is the x86_64 baseline (and on x86 we gate via the
     /// module's `cfg(target_arch)`), so the intrinsics are always
@@ -468,6 +552,40 @@ pub(crate) mod x86 {
             loop {
                 copy16(dst.add(off), src.add(off));
                 off += 16;
+                if off >= length {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Upstream zstd's `ZSTD_wildcopy(..., ZSTD_no_overlap)` in its full shape
+    /// (zstd_internal.h, `ZSTD_wildcopy`): one 16-byte copy for the common
+    /// short case, then two per pass, so a long copy tests its end once per 32
+    /// bytes rather than once per 16. May overshoot up to 31 bytes past
+    /// `dst + length`.
+    ///
+    /// # Safety
+    /// Room for `length + 31` bytes at `dst` and as many readable at `src`;
+    /// `src` lies at least 16 bytes before `dst` or does not overlap it, so
+    /// every load reads bytes already in place when it issues.
+    #[inline(always)]
+    pub(crate) unsafe fn wildcopy_no_overlap_paired(dst: *mut u8, src: *const u8, length: usize) {
+        debug_assert!(length > 0);
+        unsafe {
+            copy16(dst, src);
+            if length <= 16 {
+                return;
+            }
+            // The passes start at the next 16-byte boundary of `dst`, so no
+            // store of a long copy straddles a cache line. The bytes between
+            // that boundary and 16 are written twice with the same values:
+            // their source lies 16 or more bytes back, already in place.
+            let mut off = 16 - (dst.addr() & 15);
+            loop {
+                copy16(dst.add(off), src.add(off));
+                copy16(dst.add(off + 16), src.add(off + 16));
+                off += 32;
                 if off >= length {
                     break;
                 }

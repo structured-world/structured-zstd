@@ -1,4 +1,108 @@
-use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
+use super::x86::{
+    copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_paired,
+    wildcopy_overlap_8byte_stride,
+};
+
+/// The paired copy of a match writes what a byte-by-byte copy writes, for
+/// every offset from 16 (where the second copy of a pass reads what the first
+/// just wrote) past 32, lengths around each pass edge and every alignment of
+/// the write, and stays within its 31-byte overshoot.
+#[test]
+fn wildcopy_no_overlap_paired_repeats_matches_like_a_byte_copy() {
+    for skew in 0..16usize {
+        let prefix: alloc::vec::Vec<u8> = (0..(64 + skew) as u8)
+            .map(|b| b.wrapping_mul(37) ^ 0x5a)
+            .collect();
+        for offset in 16..=40usize {
+            for length in [
+                1usize, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 100, 380,
+            ] {
+                let mut expected = prefix.clone();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                let mut out = prefix.clone();
+                out.resize(prefix.len() + length + 31 + 16, 0xee);
+                let dst = prefix.len();
+                // SAFETY: the buffer holds the match plus its 31-byte
+                // overshoot, and the source starts `offset >= 16` bytes
+                // before the write.
+                unsafe {
+                    let base = out.as_mut_ptr();
+                    wildcopy_no_overlap_paired(base.add(dst), base.add(dst - offset), length);
+                }
+                assert_eq!(
+                    out[..expected.len()],
+                    expected[..],
+                    "skew {skew} offset {offset} length {length}"
+                );
+                assert!(
+                    out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                    "skew {skew} offset {offset} length {length} wrote past its overshoot",
+                );
+            }
+        }
+    }
+}
+
+/// The doubling match copy in an AVX2 scope, as the executor expands it.
+///
+/// # Safety
+/// The CPU has AVX2, plus the copy's own contract.
+#[cfg(feature = "std")]
+#[target_feature(enable = "avx2")]
+unsafe fn match_copy_doubling(dst: *mut u8, offset: usize, length: usize) {
+    unsafe { super::x86::match_copy_doubling_avx2(dst, offset, length) }
+}
+
+/// The doubling copy of a match longer than its offset writes what a
+/// byte-by-byte copy writes, for short and long offsets, lengths around each
+/// doubled piece and every alignment of the write, and stays within its
+/// 31-byte overshoot.
+#[cfg(feature = "std")]
+#[test]
+fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for skew in 0..32usize {
+        let prefix: alloc::vec::Vec<u8> = (0..(400 + skew) as u32)
+            .map(|b| (b as u8).wrapping_mul(37) ^ 0x5a)
+            .collect();
+        for offset in (16..=40usize).chain([63, 64, 100, 380]) {
+            for length in [
+                offset + 1,
+                2 * offset - 1,
+                2 * offset,
+                2 * offset + 1,
+                3 * offset,
+                4 * offset + 7,
+                7 * offset,
+                3700,
+            ] {
+                let mut expected = prefix.clone();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                let mut out = prefix.clone();
+                out.resize(prefix.len() + length + 31 + 16, 0xee);
+                let dst = prefix.len();
+                // SAFETY: `offset <= 400` bytes precede the match, the buffer
+                // holds it plus its 31-byte overshoot, and the CPU has AVX2.
+                unsafe { match_copy_doubling(out.as_mut_ptr().add(dst), offset, length) };
+                assert_eq!(
+                    out[..expected.len()],
+                    expected[..],
+                    "skew {skew} offset {offset} length {length}"
+                );
+                assert!(
+                    out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                    "skew {skew} offset {offset} length {length} wrote past its overshoot",
+                );
+            }
+        }
+    }
+}
 
 /// The shuffle copy expanded in an SSSE3 scope, as the executor expands it.
 ///

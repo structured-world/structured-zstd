@@ -383,6 +383,90 @@ fn exec_sequence_inline_short_offset_match_uses_overlap_copy() {
     // tables) but the output length must be right.
 }
 
+/// Byte-by-byte model of one sequence: the literals, then `match_length`
+/// bytes each copied from `offset` back.
+fn reference_sequence(history: &[u8], lits: &[u8], offset: usize, match_length: usize) -> Vec<u8> {
+    let mut out = history.to_vec();
+    out.extend_from_slice(lits);
+    for _ in 0..match_length {
+        out.push(out[out.len() - offset]);
+    }
+    out
+}
+
+/// Runs `exec` for every offset, literal and match length on three slices:
+/// one ending exactly at the sequence (no room for an overshoot, so the exact
+/// copy runs), one with room past a per-block ceiling armed at the sequence's
+/// end (the overshoot runs into that room, as upstream lets it run to the
+/// destination's capacity), and the same ceiling one byte short (the ceiling
+/// still refuses the sequence, room or not). The written bytes must equal the
+/// byte-by-byte model in the first two, and the third must return an error
+/// with the cursor unmoved.
+fn check_sequence_copies(
+    exec: impl Fn(
+        &mut UserSliceBackend<'_>,
+        *const u8,
+        usize,
+        usize,
+        usize,
+    ) -> Result<(), super::super::errors::ExecuteSequencesError>,
+) {
+    const HISTORY: usize = 64;
+    let history: Vec<u8> = (0..HISTORY).map(|i| (i * 37 + 11) as u8).collect();
+    let lits: Vec<u8> = (0..20 + 32).map(|i| 0x80 ^ (i * 13) as u8).collect();
+    for offset in 1..=40usize {
+        for lit_length in 0..=20usize {
+            for match_length in 1..=80usize {
+                let expected =
+                    reference_sequence(&history, &lits[..lit_length], offset, match_length);
+                let end = expected.len();
+                for room in [0usize, 32] {
+                    let mut buf = vec![0u8; end + room];
+                    buf[..HISTORY].copy_from_slice(&history);
+                    let mut b = UserSliceBackend::from_slice(&mut buf);
+                    b.tail = HISTORY;
+                    b.set_max_capacity(end);
+                    exec(&mut b, lits.as_ptr(), lit_length, offset, match_length).unwrap();
+                    assert_eq!(b.tail, end);
+                    assert_eq!(
+                        &buf[..end],
+                        &expected[..],
+                        "offset={offset} lit={lit_length} match={match_length} room={room}"
+                    );
+                }
+                let mut buf = vec![0u8; end + 32];
+                buf[..HISTORY].copy_from_slice(&history);
+                let mut b = UserSliceBackend::from_slice(&mut buf);
+                b.tail = HISTORY;
+                b.set_max_capacity(end - 1);
+                assert!(exec(&mut b, lits.as_ptr(), lit_length, offset, match_length).is_err());
+                assert_eq!(b.tail, HISTORY);
+            }
+        }
+    }
+}
+
+#[test]
+fn exec_sequence_inline_writes_the_sequence_exactly_up_to_the_block_ceiling() {
+    // SAFETY: `lits` carries 32 bytes of read room past the longest literal
+    // run, and every offset reaches back into the seeded history.
+    check_sequence_copies(|b, lits, lit_length, offset, match_length| unsafe {
+        b.exec_sequence_inline(lits, lit_length, offset, match_length)
+    });
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[test]
+fn exec_sequence_inline_avx2_writes_the_sequence_exactly_up_to_the_block_ceiling() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    // SAFETY: as above; AVX2 was detected at runtime.
+    check_sequence_copies(|b, lits, lit_length, offset, match_length| unsafe {
+        b.exec_sequence_inline_avx2(lits, lit_length, offset, match_length)
+    });
+}
+
 /// `exec_sequence_inline_avx2` correctness across the
 /// match-copy offset cases. Issue #279 round 4 regression:
 /// the AVX2 32-byte ymm wildcopy threshold MUST be `offset >= 32`

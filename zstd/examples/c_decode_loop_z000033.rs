@@ -44,14 +44,17 @@ fn main() {
 
     let dctx = unsafe { zstd_sys::ZSTD_createDCtx() };
     assert!(!dctx.is_null(), "createDCtx failed");
-    let mut out = vec![0u8; n];
+    // The same room past the data the benchmark gives both decoders and ours
+    // gets in `decode_loop_z000033`: with it libzstd's last sequence of a
+    // frame takes its fast path, as in the benchmark.
+    let mut out = vec![0u8; n + structured_zstd::WILDCOPY_OVERLENGTH];
     let mut total: u64 = 0;
     for _ in 0..iters {
         let w = unsafe {
             zstd_sys::ZSTD_decompressDCtx(
                 dctx,
                 out.as_mut_ptr() as *mut core::ffi::c_void,
-                n,
+                out.len(),
                 compressed.as_ptr() as *const core::ffi::c_void,
                 csize,
             )

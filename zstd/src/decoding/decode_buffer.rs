@@ -206,9 +206,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// cold growth path instead of growing the ring to gigabytes (a
     /// decompression-bomb OOM) before the post-block validity check runs.
     /// Called once per block by the sequence decoder, before the sequence
-    /// loop. The growable backends (`RingBuffer`, `FlatBuf`) enforce it in
-    /// `try_reserve`; fixed-capacity backends (`UserSliceBackend`) are already
-    /// bounded and take the trait's no-op default.
+    /// loop. Every backend enforces it in `try_reserve`; `UserSliceBackend`
+    /// also bounds its sequence writes by it, while letting a wildcopy's
+    /// overshoot run to the slice's end.
     #[inline]
     pub(crate) fn set_block_output_ceiling(&mut self, max_block_output: usize) {
         // Plain add (not saturating): `len()` is the bytes decoded so far and
