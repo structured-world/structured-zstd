@@ -1170,6 +1170,11 @@ jobs:
           # published gh-pages snapshot keeps full coverage for the
           # dashboard + tagged baselines (#164).
           EVENT_NAME: ${{ github.event_name }}
+        # `runtime_setup` installs what a shard needs to RUN the prebuilt
+        # binary, nothing for building it: the i686 binary needs only the
+        # 32-bit loader and libgcc_s (libc6-i386, lib32gcc-s1), which the
+        # runner image already carries, so its shards fetch nothing and a
+        # package-mirror outage cannot fail them.
         run: |
           cat > targets.json <<'EOF'
           [
@@ -1184,7 +1189,7 @@ jobs:
               "id": "i686-gnu",
               "target_triple": "i686-unknown-linux-gnu",
               "build_setup": "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386",
-              "runtime_setup": "sudo apt-get update && sudo apt-get install -y libc6-dev-i386",
+              "runtime_setup": "",
               "timeout_minutes": 120
             },
             {
