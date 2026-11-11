@@ -431,31 +431,32 @@ impl BtMatcher {
     /// `encode_offset_with_reps` minus the rep-history update — used in
     /// the optimal parser's per-candidate price probe where the rep
     /// window hasn't been committed yet.
+    ///
+    /// Selects rather than branches: it runs for every candidate the search
+    /// returns, and whether an offset repeats one of three histories is data
+    /// the predictor cannot learn, so a compare chain mispredicted on a large
+    /// share of candidates. The three repeat values are picked by `lit_len`
+    /// (RFC 8878 3.1.2.5: with no literals the codes shift to `rep[1]`,
+    /// `rep[2]`, `rep[0] - 1`), then folded last to first so the first match
+    /// wins, as the chain did.
     #[inline(always)]
     pub(crate) fn encode_offset_base_with_reps(
         actual_offset: u32,
         lit_len: usize,
         reps: [u32; 3],
     ) -> u32 {
-        if lit_len > 0 {
-            if actual_offset == reps[0] {
-                1
-            } else if actual_offset == reps[1] {
-                2
-            } else if actual_offset == reps[2] {
-                3
-            } else {
-                actual_offset.saturating_add(3)
-            }
-        } else if actual_offset == reps[1] {
-            1
-        } else if actual_offset == reps[2] {
-            2
-        } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
-            3
-        } else {
-            actual_offset.saturating_add(3)
-        }
+        use core::hint::select_unpredictable;
+        let ll0 = lit_len == 0;
+        // `rep[0] - 1` is a repeat code only when it is a real offset; 0
+        // never equals a match offset, which is at least 1.
+        let rep0_minus_one = select_unpredictable(reps[0] > 1, reps[0].wrapping_sub(1), 0);
+        let first = select_unpredictable(ll0, reps[1], reps[0]);
+        let second = select_unpredictable(ll0, reps[2], reps[1]);
+        let third = select_unpredictable(ll0, rep0_minus_one, reps[2]);
+        let code = actual_offset.saturating_add(3);
+        let code = select_unpredictable(actual_offset == third, 3, code);
+        let code = select_unpredictable(actual_offset == second, 2, code);
+        select_unpredictable(actual_offset == first, 1, code)
     }
 
     /// Upstream zstd parity: `ZSTD_updateStats` for one sequence the parser
