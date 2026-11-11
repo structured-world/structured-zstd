@@ -1967,19 +1967,22 @@ impl DfastMatchGenerator {
         pos
     }
 
-    /// Index the block's dense tail, the last starts the scan cannot reach,
-    /// so the next block can match into them.
+    /// Index the starts of the block's dense tail that the scan did not pass,
+    /// `pos` being where it stopped, so the next block can match into them.
     pub(crate) fn seed_remaining_hashable_starts(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
+        pos: usize,
     ) {
-        // The tail only, never the gap the scan's step skipped before it
-        // stopped: upstream's loops index neither, and on incompressible input
-        // that gap is the step, hundreds of bytes by a block's end. Seeding it
-        // cost 11% of the cycles of a 100 KiB random frame at level 3 for 43
-        // bytes over 3.1 MB of corpus at levels 3-4.
-        let mut seed_pos = current_len.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        let boundary_tail_start = current_len.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        // Never the gap the scan's step skipped before it stopped, nor what a
+        // match ending in the tail covered: upstream's loops index neither,
+        // and on incompressible input that gap is the step, hundreds of bytes
+        // by a block's end. Seeding it cost 11% of the cycles of a 100 KiB
+        // random frame at level 3 for 43 bytes over 3.1 MB of corpus at
+        // levels 3-4.
+        let mut seed_pos = pos.min(current_len).max(boundary_tail_start);
         // Every start with a whole short key; past it nothing is hashable.
         while seed_pos + self.mls <= current_len {
             self.insert_position(current_abs_start + seed_pos);
@@ -2861,9 +2864,16 @@ macro_rules! start_matching_fast_loop_body {
             // load bound — using it here read up to 3 bytes past
             // `history.len()` on tiny blocks (CI fuzz `interop` crash,
             // 7-byte input).
-            // On a tiny block this fires on the first pass; the post-loop
-            // tail seed then indexes the block's dense tail, its own
-            // whole-key guard keeping every insert in bounds.
+            // NOTE: when this guard fires on the very first outer-iter
+            // (tiny block, `$current_len < 9`), we `break 'outer` BEFORE
+            // `tail_seed_anchor` is even declared. The post-loop
+            // `seed_remaining_hashable_starts(.., pos)` then runs with
+            // `pos` at its initial value (1 on first frame, or the
+            // post-match cursor from a previous outer iter); that's the
+            // correct tail seed for tiny blocks — `seed_pos = pos.min(
+            // $current_len).min(boundary_tail_start)` plus the
+            // `seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= $current_len`
+            // guard inside the seeder keeps every insert in-bounds.
             if pos + HASH_READ_SIZE > $current_len {
                 break 'outer;
             }
@@ -2994,7 +3004,7 @@ macro_rules! start_matching_fast_loop_body {
                 // `curr`, zstd_double_fast.c:184), NOT on the (rep1 `+1` / catch-up
                 // adjusted) match start.
                 Committed(MatchCandidate, u8),
-                Tail,
+                Tail(usize),
             }
 
             let inner_exit: InnerExit = 'inner: loop {
@@ -3470,7 +3480,11 @@ macro_rules! start_matching_fast_loop_body {
                 // leaving a remainder inside the build-to-build drift measured
                 // on this host. Kept for the op-reduction, not on a speed claim.
                 if ip1 > scan_limit {
-                    break 'inner InnerExit::Tail;
+                    // First position the fast loop did NOT pack into the
+                    // hash tables. `seed_remaining_hashable_starts` will
+                    // pick up from `ip0` instead of restarting at the
+                    // outer-entry `pos`.
+                    break 'inner InnerExit::Tail(ip0);
                 }
             };
 
@@ -3617,14 +3631,18 @@ macro_rules! start_matching_fast_loop_body {
                     }
                     }
                 }
-                InnerExit::Tail => {
-                    // Out of safe scan room without committing.
+                InnerExit::Tail(seed) => {
+                    // Inner loop ran out of safe scan room without
+                    // committing. Hand the tail seeder the first
+                    // un-scanned position so it does not redundantly
+                    // re-pack everything the fast loop already wrote.
+                    pos = seed;
                     break 'outer;
                 }
             }
         }
 
-        $self.seed_remaining_hashable_starts($current_abs_start, $current_len);
+        $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
         $self.emit_trailing_literals($current_abs_start, literals_start, $handle_sequence);
     }};
 }
@@ -3981,7 +3999,7 @@ macro_rules! start_matching_dict_loop_body {
                         if dfast_branch!(10, cand4 != v4) {
                             ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
                             if dfast_branch!(24, ip > scan_limit) {
-                                break 'inner DfastInnerExit::Tail;
+                                break 'inner DfastInnerExit::Tail(ip);
                             }
                             continue 'inner;
                         }
@@ -4014,7 +4032,7 @@ macro_rules! start_matching_dict_loop_body {
                         if dfast_branch!(14, found == usize::MAX) {
                             ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
                             if dfast_branch!(24, ip > scan_limit) {
-                                break 'inner DfastInnerExit::Tail;
+                                break 'inner DfastInnerExit::Tail(ip);
                             }
                             continue 'inner;
                         }
@@ -4137,7 +4155,7 @@ macro_rules! start_matching_dict_loop_body {
                     // A below-floor short hit with no upgrade: keep scanning.
                     ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
                     if dfast_branch!(24, ip > scan_limit) {
-                        break 'inner DfastInnerExit::Tail;
+                        break 'inner DfastInnerExit::Tail(ip);
                     }
                 };
 
@@ -4270,23 +4288,27 @@ macro_rules! start_matching_dict_loop_body {
                             }
                         }
                     }
-                    DfastInnerExit::Tail => break 'outer,
+                    DfastInnerExit::Tail(seed) => {
+                        pos = seed;
+                        break 'outer;
+                    }
                 }
             }
             $self.offset_hist = reps;
         }
 
-        $self.seed_remaining_hashable_starts($current_abs_start, $current_len);
+        $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
         $self.emit_trailing_literals($current_abs_start, literals_start, $handle_sequence);
     }};
 }
 
 /// How the dictionary scan loop left its inner loop: with a match to emit
 /// (candidate, a path tag the `DFTRACE` gate prints, and the SCAN position the
-/// complementary insertion anchors on), or out of scan room.
+/// complementary insertion anchors on), or out of scan room at the first
+/// position it did not pack into the tables.
 enum DfastInnerExit {
     Committed(MatchCandidate, u8, usize),
-    Tail,
+    Tail(usize),
 }
 
 /// [`extend_backwards_shared`] over a window held in two buffers: the
