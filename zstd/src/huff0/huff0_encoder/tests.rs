@@ -152,10 +152,10 @@ fn build_limited_weights_always_power_of_two() {
     fuzz_limited_weights_power_of_two(4_000);
 }
 
-/// Deep randomized sweep over the height limiter. Excluded from the default
-/// run (it is ~30 s); invoke explicitly with `cargo nextest run --run-ignored`.
+/// Deep randomized sweep over the height limiter. Excluded from the debug
+/// run; CI runs it in the release-profile job (`--run-ignored only`).
 #[test]
-#[ignore = "stress: 300k-case height-limiter fuzz, run with --run-ignored"]
+#[ignore = "stress: 300k-case height-limiter fuzz, run in release with --run-ignored only"]
 fn build_limited_weights_power_of_two_stress() {
     fuzz_limited_weights_power_of_two(300_000);
 }

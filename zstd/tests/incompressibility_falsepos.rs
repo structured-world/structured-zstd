@@ -26,7 +26,7 @@ fn report(name: &str, data: &[u8], level: i32) -> (usize, usize) {
 /// If we emit a raw block on something C can compress, the ratio gap
 /// here will be large and positive (we output much more than C).
 #[test]
-#[ignore = "manual probe — run with --ignored"]
+#[ignore = "four 1 MiB inputs at level 22: run in release with --run-ignored only"]
 fn marginal_compressibility_at_level22() {
     println!("== Level 22 marginal-compressibility ratio probe ==");
 

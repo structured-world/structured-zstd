@@ -154,20 +154,20 @@ path = "../zstd/tests/block_splitter_parity.rs"
 required-features = ["bench-internals"]
 
 [[test]]
-name = "corpus_level22_gap"
-path = "../zstd/tests/corpus_level22_gap.rs"
-
-[[test]]
 name = "cross_validation"
 path = "../zstd/tests/cross_validation.rs"
 
 [[test]]
-name = "he_level22_ratio"
-path = "../zstd/tests/he_level22_ratio.rs"
-
-[[test]]
 name = "incompressibility_falsepos"
 path = "../zstd/tests/incompressibility_falsepos.rs"
+
+[[example]]
+name = "corpus_level22_gap"
+path = "../zstd/examples/corpus_level22_gap.rs"
+
+[[example]]
+name = "he_level22_ratio"
+path = "../zstd/examples/he_level22_ratio.rs"
 
 [[example]]
 name = "slide_oversized_table"

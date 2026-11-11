@@ -1,12 +1,17 @@
+//! Level-22 ratio probe on z000033: our frame against libzstd's, with the
+//! block-type breakdown of each, to tell a gap in block split decisions from
+//! one in per-block entropy.
+//!
+//! Run: cargo run --release -p ffi-bench --example corpus_level22_gap
+
 use std::fs;
 use std::path::Path;
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 
-mod common;
+#[path = "support/block_breakdown.rs"]
+mod block_breakdown;
 
-#[test]
-#[ignore = "manual probe — run with --ignored"]
-fn corpus_z000033_level22_ratio_breakdown() {
+fn main() {
     // Built from the sibling `ffi-bench` crate, so resolve the fixture next to
     // the manifest first, then under the sibling `zstd` crate.
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -29,18 +34,10 @@ fn corpus_z000033_level22_ratio_breakdown() {
         c.len()
     );
 
-    // Count block types in each output so we can tell if the gap is
-    // structural (different block split decisions) or content
-    // (per-block entropy differences within identical splits).
-    common::dump_block_breakdown("Rust", &rust);
-    common::dump_block_breakdown("C   ", &c);
+    block_breakdown::dump_block_breakdown("Rust", &rust);
+    block_breakdown::dump_block_breakdown("C   ", &c);
 
-    // Sanity: outputs must roundtrip.
+    // Sanity: our output must roundtrip through libzstd.
     let rt = zstd::bulk::decompress(&rust, data.len() + 64).unwrap();
-    assert_eq!(
-        rt.len(),
-        data.len(),
-        "rust output decompresses to wrong size"
-    );
     assert_eq!(rt, data, "rust output decompresses to different bytes");
 }

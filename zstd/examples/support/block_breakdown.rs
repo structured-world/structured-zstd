@@ -1,8 +1,7 @@
-//! Shared test utilities for integration probes.
+//! Block-type tally of a zstd frame, shared by the level-22 ratio probes.
 
 /// Block-type counts produced by [`parse_zstd_block_breakdown`].
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct BlockBreakdown {
     pub raw: usize,
     pub rle: usize,
@@ -12,12 +11,11 @@ pub struct BlockBreakdown {
 
 /// Walk a complete zstd frame and tally block-type counts. The loop
 /// terminates on (a) the in-block `last_block` sentinel, or (b)
-/// running out of frame bytes — there is no fixed iteration cap, so
+/// running out of frame bytes; there is no fixed iteration cap, so
 /// large frames are not truncated.
 ///
 /// Returns `None` if the input does not start with the zstd magic
 /// or is too short for a frame header.
-#[allow(dead_code)]
 pub fn parse_zstd_block_breakdown(frame: &[u8]) -> Option<BlockBreakdown> {
     if frame.len() < 6 || &frame[..4] != b"\x28\xb5\x2f\xfd" {
         return None;
@@ -46,7 +44,7 @@ pub fn parse_zstd_block_breakdown(frame: &[u8]) -> Option<BlockBreakdown> {
         _ => 8,
     };
     let header_len = 5 + window_descriptor_len + dict_id_len + fcs_len;
-    // Guard against truncated frame headers — without this check the
+    // Guard against truncated frame headers: without this check the
     // function would happily return `Some(BlockBreakdown::default())`
     // for a 4-byte-magic-only input, which contradicts the docstring.
     if frame.len() < header_len {
@@ -79,10 +77,7 @@ pub fn parse_zstd_block_breakdown(frame: &[u8]) -> Option<BlockBreakdown> {
     Some(out)
 }
 
-/// Convenience wrapper for diagnostic test prints — formats the
-/// breakdown into the legacy diagnostic line shape used by the
-/// level22 probes.
-#[allow(dead_code)]
+/// Prints the breakdown of `frame` on one line under `label`.
 pub fn dump_block_breakdown(label: &str, frame: &[u8]) {
     match parse_zstd_block_breakdown(frame) {
         Some(bb) => println!(

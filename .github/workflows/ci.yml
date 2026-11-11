@@ -446,6 +446,35 @@ jobs:
           CARGO_PROFILE_RELEASE_PANIC: abort
         run: cargo run --release -p ffi-bench --example stack_budget -- 32
 
+  release-checks:
+    # The `#[ignore]`d tests: checks too slow for the debug suite (the deep
+    # height-limiter sweep, level 22 on 1 MiB inputs against the reference),
+    # run with the release profile the crate ships. Runs and skips like
+    # `test`, so `ci-result` can require it.
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        if: needs.changes.outputs.code == 'true'
+      - uses: ./.github/actions/mold
+        if: needs.changes.outputs.code == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
+      - uses: taiki-e/install-action@nextest
+        if: needs.changes.outputs.code == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          prefix-key: release-checks
+      - name: Ignored tests (codec)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run --profile ci --cargo-profile release -p structured-zstd --features hash,std,dict-builder --run-ignored only
+      - name: Ignored tests (against the reference)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run --profile ci --cargo-profile release -p ffi-bench --features bench-internals,dict-builder --run-ignored only
+
   conformance:
     # Upstream zstd's own command-line suites (tests/playTests.sh and
     # tests/cli-tests from the pinned release) against the release CLI. The
@@ -1094,7 +1123,7 @@ jobs:
     # expected outcome. The bench jobs are left out: they never run on pull
     # requests.
     name: CI result
-    needs: [changes, lint, c-abi, test, conformance, reverse-deps, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
+    needs: [changes, lint, c-abi, test, release-checks, conformance, reverse-deps, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
