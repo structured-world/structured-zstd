@@ -1979,9 +1979,9 @@ impl DfastMatchGenerator {
         // Never the gap the scan's step skipped before it stopped, nor what a
         // match ending in the tail covered: upstream's loops index neither,
         // and on incompressible input that gap is the step, hundreds of bytes
-        // by a block's end. Seeding it cost 11% of the cycles of a 100 KiB
-        // random frame at level 3 for 43 bytes over 3.1 MB of corpus at
-        // levels 3-4.
+        // by a block's end. Seeding it cost 11% of the wall-clock time of a
+        // 100 KiB random frame at level 3 (1.18x -> 1.05x of libzstd in the
+        // same run) for 43 bytes over 3.1 MB of corpus at levels 3-4.
         let mut seed_pos = pos.min(current_len).max(boundary_tail_start);
         // Every start with a whole short key; past it nothing is hashable.
         while seed_pos + self.mls <= current_len {
