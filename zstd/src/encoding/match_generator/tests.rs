@@ -5115,34 +5115,55 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     );
 }
 
+/// The tail seed indexes only the dense tail past where the scan stopped:
+/// neither the gap a stepping scan skipped before the tail, nor tail starts a
+/// match ending at the block's end already covered, as upstream's loops leave
+/// both. Seeding the gap cost 11% of a 100 KiB random frame's wall-clock time
+/// at level 3.
 #[test]
-fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
-    let mut matcher = DfastMatchGenerator::new(1 << 20);
-    let block = deterministic_high_entropy_bytes(0x7BB2_DA91_441E_C0EF, 64);
-    matcher.commit_input(&block);
-    matcher.ensure_hash_tables();
+fn dfast_seed_remaining_hashable_starts_skips_the_gap_and_covered_starts() {
+    let short_slot_of = |matcher: &DfastMatchGenerator, abs_pos: usize| {
+        let rel = abs_pos - matcher.history_abs_start;
+        let live = matcher.live_history();
+        assert!(
+            rel + 5 <= live.len(),
+            "fixture must leave the start short-hashable"
+        );
+        matcher.tables[matcher.long_len() + matcher.short_hash_index(&live[rel..])]
+    };
+    let fresh = || {
+        let mut matcher = DfastMatchGenerator::new(1 << 20);
+        let block = deterministic_high_entropy_bytes(0x7BB2_DA91_441E_C0EF, 64);
+        matcher.commit_input(&block);
+        matcher.ensure_hash_tables();
+        let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
+        let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
+        (matcher, current_abs_start, current_len)
+    };
 
-    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
-    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
-    matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
-
-    let target_abs_pos = current_abs_start + current_len - 5;
-    let target_rel = target_abs_pos - matcher.history_abs_start;
-    let live = matcher.live_history();
-    assert!(
-        target_rel + 5 <= live.len(),
-        "fixture must leave the last short-hash start valid"
-    );
-    let short_hash = matcher.short_hash_index(&live[target_rel..]);
-    let target_slot = matcher.pack_slot(target_abs_pos);
-    assert_ne!(
-        target_slot, DFAST_EMPTY_SLOT,
-        "pack_slot must never return the empty-slot sentinel for a real position"
-    );
+    // The scan stopped well before the tail: the tail is seeded, the gap is not.
+    let (mut matcher, start, len) = fresh();
+    matcher.seed_remaining_hashable_starts(start, len, 10);
+    let last = start + len - 5;
     assert_eq!(
-        matcher.tables[matcher.long_len() + short_hash],
-        target_slot,
-        "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
+        short_slot_of(&matcher, last),
+        matcher.pack_slot(last),
+        "the tail past an early stop is seeded"
+    );
+    let gap = start + len - DfastMatchGenerator::BOUNDARY_DENSE_TAIL_LEN - 20;
+    assert_ne!(
+        short_slot_of(&matcher, gap),
+        matcher.pack_slot(gap),
+        "the gap before the dense tail stays unindexed"
+    );
+
+    // A match ran to the block's end: nothing is left to seed.
+    let (mut matcher, start, len) = fresh();
+    matcher.seed_remaining_hashable_starts(start, len, len);
+    assert_ne!(
+        short_slot_of(&matcher, last),
+        matcher.pack_slot(last),
+        "starts a match covered are not seeded"
     );
 }
 

@@ -1967,6 +1967,8 @@ impl DfastMatchGenerator {
         pos
     }
 
+    /// Index the starts of the block's dense tail that the scan did not pass,
+    /// `pos` being where it stopped, so the next block can match into them.
     pub(crate) fn seed_remaining_hashable_starts(
         &mut self,
         current_abs_start: usize,
@@ -1974,7 +1976,13 @@ impl DfastMatchGenerator {
         pos: usize,
     ) {
         let boundary_tail_start = current_len.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
-        let mut seed_pos = pos.min(current_len).min(boundary_tail_start);
+        // Never the gap the scan's step skipped before it stopped, nor what a
+        // match ending in the tail covered: upstream's loops index neither,
+        // and on incompressible input that gap is the step, hundreds of bytes
+        // by a block's end. Seeding it cost 11% of the wall-clock time of a
+        // 100 KiB random frame at level 3 (1.18x -> 1.05x of libzstd in the
+        // same run) for 43 bytes over 3.1 MB of corpus at levels 3-4.
+        let mut seed_pos = pos.min(current_len).max(boundary_tail_start);
         // Every start with a whole short key; past it nothing is hashable.
         while seed_pos + self.mls <= current_len {
             self.insert_position(current_abs_start + seed_pos);

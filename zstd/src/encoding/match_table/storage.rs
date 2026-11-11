@@ -153,8 +153,9 @@ pub(crate) const HC_CHAIN_LOG: usize = 19;
 pub(crate) const HC3_HASH_LOG: usize = 17;
 
 /// The binary tree's coordinates: the biases that map a stored index to its
-/// absolute position (`abs_bias`), its history index (`idx_bias`) and its pair
-/// slot (`bt_bias`, then `& bt_mask`, doubled). They follow from the position
+/// absolute position (`abs_bias`) and its history index (`idx_bias`), and the
+/// mask that maps it to its pair slot (`stored & bt_mask`, doubled; see
+/// [`MatchTable::bt_pair_index_for_stored`]). They follow from the position
 /// base, the index shift, the history start and the chain log, none of which
 /// moves while an armed block is parsed, so the parser takes them once per
 /// block, as upstream resolves `base` and `btMask` once per call.
@@ -162,7 +163,6 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 pub(crate) struct BtCoords {
     pub(crate) abs_bias: usize,
     pub(crate) idx_bias: usize,
-    pub(crate) bt_bias: usize,
     pub(crate) bt_mask: usize,
 }
 
@@ -1237,7 +1237,6 @@ impl MatchTable {
         BtCoords {
             abs_bias,
             idx_bias: abs_bias.wrapping_sub(self.history_abs_start),
-            bt_bias: self.position_base.wrapping_sub(1),
             bt_mask: self.bt_mask(),
         }
     }
@@ -1272,26 +1271,20 @@ impl MatchTable {
         unsafe { core::slice::from_raw_parts(self.block_live.0, self.block_live.1) }
     }
 
-    /// Convert an absolute position into a BT pair index in
-    /// `chain_table`. Each node occupies two consecutive slots
-    /// (smaller, larger) so the result is doubled. Upstream zstd parity:
-    /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
+    /// The pair index in `chain_table` of the node whose stored index is
+    /// `stored`: its low `bt_log` bits, doubled because each node holds two
+    /// slots (smaller, larger). Upstream zstd: `2 * (matchIndex & btMask)` in
+    /// `ZSTD_insertBt1` and `ZSTD_insertBtAndGetAllMatches`.
+    ///
+    /// The slot is keyed by the stored index alone, so it moves whenever
+    /// `position_base` or `index_shift` does. That is sound because neither
+    /// moves while the tree holds a live node: every change either clears the
+    /// tables, replaces them together with the coordinates, or (the btultra2
+    /// seed pass, the floor-advancing reset) leaves every stored node below
+    /// the new window floor, where no walk reads it.
     #[inline(always)]
-    pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        // Hot per-iteration BT walker entry. `abs_pos` is a
-        // frame-lifetime absolute stream cursor (capped by
-        // `check_stream_abs_headroom`); `index_shift` is the offset the
-        // btultra2 seed pass leaves behind, which a reused compressor carries
-        // into later frames until a rebase clears it. The result is immediately masked down to the BT ring width
-        // by `& bt_mask()`, so what matters here is only the modulo-
-        // ring identity `(a + b) mod m == ((a mod 2^bits) + (b mod
-        // 2^bits)) mod m` for `m | 2^bits`: `wrapping_add` preserves
-        // that identity even on the rare i686 streams where the raw
-        // `usize` sum overflows. Using `wrapping_add` instead of `+`
-        // (or `saturating_add`) also keeps the release-mode overflow
-        // branch and the debug-mode overflow panic off this hot path.
-        let bt_pos = abs_pos.wrapping_add(self.index_shift);
-        2 * (bt_pos & self.bt_mask())
+    pub(crate) fn bt_pair_index_for_stored(&self, stored: usize) -> usize {
+        2 * (stored & self.bt_mask())
     }
 
     /// Decode a stored hash / chain table entry back into its absolute

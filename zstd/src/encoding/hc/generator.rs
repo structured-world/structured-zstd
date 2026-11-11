@@ -103,13 +103,13 @@ macro_rules! bt_insert_range_body {
         // The walk carries one coordinate, the stored index, as the collect body
         // does and as upstream carries `matchIndex`: the window bound becomes one
         // unsigned range test on it (HC_EMPTY, 0, decodes below the window and
-        // ends the walk), and the absolute position, the history index and the
-        // pair slot are each one add of a bias taken here, instead of reloading
-        // `position_base` / `index_shift` / `history_abs_start` through the
-        // table on every node. See the collect body for the derivation.
+        // ends the walk), the absolute position and the history index are each
+        // one add of a bias taken here, instead of reloading `position_base` /
+        // `index_shift` / `history_abs_start` through the table on every node,
+        // and the pair slot is the index itself, masked. See the collect body
+        // for the derivation.
         let abs_bias = coords.abs_bias;
         let idx_bias = coords.idx_bias;
-        let bt_bias = coords.bt_bias;
         // The window floor in stored space, fixed for the run: a node is in the
         // window when its stored index is at or above it, one compare (upstream
         // `matchIndex >= windowLow`). It is at least 1, so the empty slot 0
@@ -218,10 +218,9 @@ macro_rules! bt_insert_range_body {
                 // floor points at `closed_side`, so the final stores need no test
                 // (upstream `dummy32`).
                 let mut closed_side: u32 = 0;
-                // SAFETY: `2*((stored + bt_bias) & bt_mask) + 1 < chain_table.len()`
-                // (`stored + bt_bias == abs_pos + index_shift`, the pair index of
-                // `MatchTable::bt_pair_index_for_abs`).
-                let pair = unsafe { chain_ptr.add(2 * (stored.wrapping_add(bt_bias) & bt_mask)) };
+                // SAFETY: `2*(stored & bt_mask) + 1 < chain_table.len()`, the pair
+                // index of `MatchTable::bt_pair_index_for_stored`.
+                let pair = unsafe { chain_ptr.add(2 * (stored & bt_mask)) };
                 let mut smaller_slot: *mut u32 = pair;
                 let mut larger_slot: *mut u32 = unsafe { pair.add(1) };
                 // SAFETY: `hash` is masked to `hash_log` bits and the table is
@@ -244,8 +243,7 @@ macro_rules! bt_insert_range_body {
                     // SAFETY: the pair index is below `chain_table.len() - 1`;
                     // `chain_ptr` is the hoisted live base, not reallocated during
                     // the walk.
-                    let next_pair =
-                        unsafe { chain_ptr.add(2 * (node_stored.wrapping_add(bt_bias) & bt_mask)) };
+                    let next_pair = unsafe { chain_ptr.add(2 * (node_stored & bt_mask)) };
                     let seed_len = common_length_smaller.min(common_length_larger);
                     // Each side's common length is a match the walk did not stop
                     // at, so it is below the tail limit.
@@ -908,12 +906,11 @@ macro_rules! bt_insert_and_collect_matches_body {
         // A node is reached through its stored index alone, as upstream walks
         // one `matchIndex` (`match = base + matchIndex`, slot
         // `2*(matchIndex & btMask)`): its bytes sit at `cand_base + stored`
-        // and its pair at `(stored + bt_bias) & bt_mask`, and nothing decodes
-        // it to an absolute position unless it joins the ladder.
+        // and its pair at `stored & bt_mask`, and nothing decodes it to an
+        // absolute position unless it joins the ladder.
         // `cand_base` may lie outside the history; only the candidate it is
         // offset to is ever read, and the window gate proves that one inside.
         debug_assert!(win_low_stored >= 1);
-        let bt_bias = coords.bt_bias;
         // SAFETY: `idx + 8 <= concat.len()`, which the search's entry checks.
         let cur_ptr = unsafe { cbase.add(idx) };
         let cand_base = cbase.wrapping_add(coords.idx_bias);
@@ -926,10 +923,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
-        // `bt_pair_index_for_abs(abs_pos)`: `stored + bt_bias` is
-        // `abs_pos + index_shift`.
-        let pair_idx = 2 * ((stored as usize).wrapping_add(bt_bias) & bt_mask);
-        debug_assert_eq!(pair_idx, $table.bt_pair_index_for_abs($abs_pos));
+        let pair_idx = 2 * (stored as usize & bt_mask);
+        debug_assert_eq!(pair_idx, $table.bt_pair_index_for_stored(stored as usize));
         // The two open sides of the tree, as pointers into the pair table
         // (upstream `smallerPtr` / `largerPtr`). A side the walk closes at the
         // tree floor is pointed at `closed_side` instead, so the final store
@@ -968,22 +963,10 @@ macro_rules! bt_insert_and_collect_matches_body {
                 node_stored <= bt_low_stored,
                 node_stored.wrapping_add(coords.abs_bias) <= bt_low,
             );
-            // `2*(candidate_abs + index_shift & bt_mask)` with `index_shift`
-            // folded away: `candidate_abs + index_shift == stored + bt_bias`.
             // SAFETY: the pair index is below `chain_table.len() - 1`;
             // `chain_ptr` is the hoisted live base, not reallocated during the
             // walk.
-            let next_pair = unsafe { chain_ptr.add(2 * (node_stored.wrapping_add(bt_bias) & bt_mask)) };
-            // Both children are read ahead of the compare, where upstream reads
-            // only the side it descends, so the next node's load can overlap
-            // the compare. Reading only the chosen side after it measured about
-            // 1% slower on z000033 10 KiB at level 19 with output unchanged,
-            // against a flat level 3 control; that is below what two builds
-            // resolve, so neither order is shown faster and the walk keeps its
-            // existing one.
-            // SAFETY: as for `next_pair`.
-            let next_smaller = unsafe { *next_pair };
-            let next_larger = unsafe { *next_pair.add(1) };
+            let next_pair = unsafe { chain_ptr.add(2 * (node_stored & bt_mask)) };
             let seed_len = common_length_smaller.min(common_length_larger);
             // Every side's common length is a match the walk did not stop at,
             // so it is below the tail limit and the compare below has bytes
@@ -1034,12 +1017,15 @@ macro_rules! bt_insert_and_collect_matches_body {
                 }
             }
 
-            if match_len >= tail_limit {
-                break;
-            }
+            // The walk enters with `best_len < tail_limit` (a repeat or hash3
+            // match reaching the block end skips the walk), and a new best that
+            // reaches it breaks above, so a match that is not a new best is
+            // shorter than `best_len` and below the limit. Upstream tests the
+            // block end only on a new best (`ip+matchLength == iLimit`).
+            debug_assert!(match_len < tail_limit);
 
             // SAFETY: the first differing bytes after a `match_len`-long
-            // prefix; `match_len < tail_limit` (break above) keeps both in
+            // prefix; `match_len < tail_limit` (asserted above) keeps both in
             // range.
             if unsafe { *cand_ptr.add(match_len) < *cur_ptr.add(match_len) } {
                 // SAFETY: an open side points at a pair slot (initial pair or
@@ -1050,9 +1036,11 @@ macro_rules! bt_insert_and_collect_matches_body {
                     smaller_slot = &raw mut closed_side;
                     break;
                 }
+                // Only the side descended is read, after the compare, as
+                // upstream does (`matchIndex = nextPtr[1]`).
                 // SAFETY: as for `next_pair`.
                 smaller_slot = unsafe { next_pair.add(1) };
-                match_stored = next_larger;
+                match_stored = unsafe { *smaller_slot };
             } else {
                 // SAFETY: as above for `larger_slot`.
                 unsafe { *larger_slot = match_stored };
@@ -1062,7 +1050,8 @@ macro_rules! bt_insert_and_collect_matches_body {
                     break;
                 }
                 larger_slot = next_pair;
-                match_stored = next_smaller;
+                // SAFETY: as for `next_pair`.
+                match_stored = unsafe { *larger_slot };
             }
         }
 
