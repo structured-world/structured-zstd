@@ -29,8 +29,8 @@ head -c 4096 "$W/lines.txt" > "$W/log4k.bin"
 
 build() {
   # $1 tree, $2 arm tag
+  # Generic x86-64, as CI and the crate ship.
   (cd "$1" && CARGO_TARGET_DIR="$1/target-ca" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3" \
     cargo build -q --profile bench -p ffi-bench --example decode_loop_z000033 \
     --target x86_64-unknown-linux-gnu)
   cp "$1/target-ca/x86_64-unknown-linux-gnu/release/examples/decode_loop_z000033" "$W/ours-$2"

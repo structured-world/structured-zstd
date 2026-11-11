@@ -39,9 +39,9 @@ build() {
   # $1 tree, $2 arm tag
   for libc in musl gnu; do
     tgt=x86_64-unknown-linux-$libc
+    # Generic x86-64, as CI and the crate ship: the kernel tier is picked at
+    # run time, and a target-cpu build changes the code around it.
     (cd "$1" && CARGO_TARGET_DIR="$1/target-mt" CC_x86_64_unknown_linux_musl=musl-gcc \
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-cpu=x86-64-v3" \
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3" \
       cargo build -q --profile bench -p ffi-bench \
       --example decode_loop_z000033 --example c_decode_loop_z000033 --target "$tgt")
     cp "$1/target-mt/$tgt/release/examples/decode_loop_z000033" "$W/ours-$2-$libc"
