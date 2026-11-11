@@ -967,16 +967,6 @@ macro_rules! bt_insert_and_collect_matches_body {
             // `chain_ptr` is the hoisted live base, not reallocated during the
             // walk.
             let next_pair = unsafe { chain_ptr.add(2 * (node_stored & bt_mask)) };
-            // Both children are read ahead of the compare, where upstream reads
-            // only the side it descends, so the next node's load can overlap
-            // the compare. Reading only the chosen side after it measured about
-            // 1% slower on z000033 10 KiB at level 19 with output unchanged,
-            // against a flat level 3 control; that is below what two builds
-            // resolve, so neither order is shown faster and the walk keeps its
-            // existing one.
-            // SAFETY: as for `next_pair`.
-            let next_smaller = unsafe { *next_pair };
-            let next_larger = unsafe { *next_pair.add(1) };
             let seed_len = common_length_smaller.min(common_length_larger);
             // Every side's common length is a match the walk did not stop at,
             // so it is below the tail limit and the compare below has bytes
@@ -1046,9 +1036,11 @@ macro_rules! bt_insert_and_collect_matches_body {
                     smaller_slot = &raw mut closed_side;
                     break;
                 }
+                // Only the side descended is read, after the compare, as
+                // upstream does (`matchIndex = nextPtr[1]`).
                 // SAFETY: as for `next_pair`.
                 smaller_slot = unsafe { next_pair.add(1) };
-                match_stored = next_larger;
+                match_stored = unsafe { *smaller_slot };
             } else {
                 // SAFETY: as above for `larger_slot`.
                 unsafe { *larger_slot = match_stored };
@@ -1058,7 +1050,8 @@ macro_rules! bt_insert_and_collect_matches_body {
                     break;
                 }
                 larger_slot = next_pair;
-                match_stored = next_smaller;
+                // SAFETY: as for `next_pair`.
+                match_stored = unsafe { *larger_slot };
             }
         }
 
