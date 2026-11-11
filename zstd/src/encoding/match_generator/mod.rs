@@ -485,6 +485,11 @@ pub struct MatchGeneratorDriver {
     /// A parser asked for each block in place of the backends, when one is
     /// installed (C `ZSTD_registerSequenceProducer`).
     producer: Option<ProducerSlot>,
+    /// A producer (or its removal, `None`) set since the frame was laid out,
+    /// applied at the next reset: whether a producer parses the frame sizes
+    /// its block buffers, so one cannot start halfway through it. Upstream
+    /// likewise applies a registered producer at the next frame.
+    staged_producer: Option<(Option<alloc::boxed::Box<dyn SequenceProducer>>, bool)>,
     /// This CPU's kernel tier, detected once at construction: the tier the
     /// [`Matcher`] entry points run under when a caller drives the driver
     /// through the trait rather than through the encoder's own tier.
@@ -779,11 +784,12 @@ impl MatchGeneratorDriver {
             #[cfg(feature = "ldm")]
             ldm_split_block: None,
             producer: None,
+            staged_producer: None,
             tier: super::fastpath::select_kernel(),
         }
     }
 
-    /// Ask `producer` for each block's parse from the next block on, in place
+    /// Ask `producer` for each block's parse from the next frame on, in place
     /// of the backends; `None` removes it. With `fallback` a block it fails on
     /// is matched by the backend instead; without, it goes out as literals
     /// and [`Self::take_producer_failure`] reports it.
@@ -792,6 +798,14 @@ impl MatchGeneratorDriver {
         producer: Option<alloc::boxed::Box<dyn SequenceProducer>>,
         fallback: bool,
     ) {
+        self.staged_producer = Some((producer, fallback));
+    }
+
+    /// Install the staged producer, if one was set since the last frame.
+    fn apply_staged_producer(&mut self) {
+        let Some((producer, fallback)) = self.staged_producer.take() else {
+            return;
+        };
         // Callers install the producer before every frame: the parse buffer
         // the last one grew stays for the next.
         let parse = self
@@ -1475,6 +1489,18 @@ impl Matcher for MatchGeneratorDriver {
         // hash chain otherwise. The Row backend runs that switch itself
         // (`RowMatchGenerator::use_chain`), so both finders share ONE parse
         // (upstream's single `lazy_generic`) and the level stays on `RowHash`.
+        // Fixed before any table opens the layout: the block buffers behind the
+        // tables are sized from it. A producer's matches may be as short as the
+        // format allows whatever the level searches for, so a frame it parses
+        // keeps the format's floor (upstream `ZSTD_maxNbSeq` divides by 3 under
+        // `useSequenceProducer`).
+        self.apply_staged_producer();
+        let sequence_floor = if self.producer.is_some() {
+            crate::encoding::workspace::FORMAT_MIN_MATCH
+        } else {
+            params.sequence_floor()
+        };
+        workspace.set_sequence_floor(sequence_floor);
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;

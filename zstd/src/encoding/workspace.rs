@@ -104,7 +104,11 @@ pub struct Workspace {
     /// The block ceiling the context set before the window was known, and the
     /// bytes it carves after the match finder for a given block size.
     block_target: usize,
-    trailing_for: fn(usize) -> usize,
+    trailing_for: fn(usize, usize) -> usize,
+    /// The shortest match a sequence of the frame carries, which bounds how
+    /// many sequences a block holds: the format's 3 unless the frame's match
+    /// finder guarantees more before the layout opens.
+    sequence_floor: usize,
     /// How the frame's input reaches the match finder, set with the layout.
     ingest: IngestPlan,
     /// The block size the open layout's trailing part was sized for.
@@ -116,6 +120,10 @@ pub struct Workspace {
     /// The open layout made the allocation zeroed, on fresh pages, so its
     /// regions hold zeros until their holders write them.
     zeroed: bool,
+    /// Zero tables [`Self::table_after`] wrote on fresh pages, which their
+    /// contents alone cannot tell from ones left demand-zero.
+    #[cfg(test)]
+    zero_tables_written: usize,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
@@ -142,6 +150,15 @@ const FRESH_PAGES_FROM: usize = 128 * 1024;
 const FRESH_PAGES_FROM: usize = 512 * 1024;
 #[cfg(all(not(target_env = "musl"), not(target_pointer_width = "32")))]
 const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
+
+/// The page a fault maps, the unit [`Workspace::table_after`] reasons about.
+const PAGE_BYTES: usize = 4096;
+
+/// Input bytes per table page from which a frame is taken to index every page
+/// of a zero table on fresh pages, so the table is written before use. Even a
+/// match finder that stores one position per 32 bytes then lands on each page
+/// at least once on average; one that stores more reaches every page.
+const INPUT_PER_TABLE_PAGE: usize = 32;
 
 /// Whether the workspace allocates from the target's system allocator, the only
 /// kind [`FRESH_PAGES_FROM`] describes. A `no_std` build always runs on one the
@@ -174,11 +191,14 @@ impl Workspace {
             retired: None,
             block_target: 0,
             trailing_for: no_trailing,
+            sequence_floor: FORMAT_MIN_MATCH,
             ingest: IngestPlan::Stream,
             block_capacity: 0,
             open: false,
             oversized_layouts: 0,
             zeroed: false,
+            #[cfg(test)]
+            zero_tables_written: 0,
         }
     }
 
@@ -218,14 +238,40 @@ impl Workspace {
     pub(crate) fn begin_layout(
         &mut self,
         block_target: usize,
-        trailing_for: fn(usize) -> usize,
+        trailing_for: fn(usize, usize) -> usize,
         ingest: IngestPlan,
     ) {
         self.release_retired();
         self.block_target = block_target;
         self.trailing_for = trailing_for;
+        self.sequence_floor = FORMAT_MIN_MATCH;
         self.ingest = ingest;
         self.open = false;
+    }
+
+    /// Raises the shortest match the frame's sequences carry, for a match
+    /// finder that guarantees more than the format's minimum. Only before the
+    /// layout opens, since the trailing part is sized from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layout is open, or `floor` is below the format's
+    /// minimum match.
+    pub(crate) fn set_sequence_floor(&mut self, floor: usize) {
+        assert!(
+            !self.open,
+            "the sequence floor is fixed before the layout opens"
+        );
+        assert!(
+            floor >= FORMAT_MIN_MATCH,
+            "no sequence is shorter than the format allows"
+        );
+        self.sequence_floor = floor;
+    }
+
+    /// The shortest match a sequence of the frame being laid out carries.
+    pub(crate) fn sequence_floor(&self) -> usize {
+        self.sequence_floor
     }
 
     /// Whether this layout has been opened.
@@ -270,7 +316,10 @@ impl Workspace {
         assert!(!self.open, "a workspace layout opens once per frame");
         self.block_capacity = self.block_for_window(window);
         let total = leading
-            .checked_add((self.trailing_for)(self.block_capacity))
+            .checked_add((self.trailing_for)(
+                self.block_capacity,
+                self.sequence_floor,
+            ))
             .expect("workspace size overflows usize");
         let reallocate = if total > self.capacity {
             true
@@ -299,9 +348,9 @@ impl Workspace {
         // A zeroed allocation costs nothing on pages the kernel hands out
         // fresh and a memset of all of it on memory the allocator recycles.
         // At `FRESH_PAGES_FROM` and above the pages are fresh, so it is taken
-        // whatever the tables: filling them there faults in pages the frame
-        // never indexes, 36-42% of the encode at 1 MiB and level 3 on musl
-        // and i686, and 70% at 10 KiB on musl. Below it a context rebuilt per
+        // whatever the tables, and the history and block buffers stay
+        // untouched until written; a table is still written first when the
+        // frame will index all of it (see `table_after`). Below it a context rebuilt per
         // frame lands on recycled memory, where a zeroed allocation is a
         // memset of the history and buffers as well as the tables, so only
         // the tables are filled, as upstream cleans only its tables
@@ -352,14 +401,38 @@ impl Workspace {
             && previous.generation == region.generation
             && previous.ptr == region.ptr
             && previous.len == count;
-        // An allocation this layout made is zeroed and no region of it has
-        // been written yet, so a table of zeros is already in place. Leaving
-        // it unwritten keeps its pages demand-zero: a large table a small
-        // frame barely touches faults in only the pages it indexes.
-        if !kept && !(self.zeroed && empty.is_zero()) {
-            region.fill(empty);
+        if !kept {
+            if !(self.zeroed && empty.is_zero()) {
+                region.fill(empty);
+            } else if self.frame_touches_every_page(region_bytes::<T>(count)) {
+                // A zeroed allocation already holds the zeros, but left
+                // demand-zero each page faults twice: the match finder's first
+                // touch is a probe, a read, which maps the shared zero page,
+                // and the store into the same slot faults again to allocate
+                // it. Writing the zeros first faults each page once, as
+                // upstream does by clearing its tables
+                // (`ZSTD_cwksp_clean_tables`).
+                region.zero();
+                #[cfg(test)]
+                {
+                    self.zero_tables_written += 1;
+                }
+            }
         }
         (region, kept)
+    }
+
+    /// Whether the frame being laid out will index nearly every page of a
+    /// table of `bytes`, so writing the table first saves a fault per page
+    /// instead of faulting pages the frame would never reach: a frame of
+    /// known length with at least [`INPUT_PER_TABLE_PAGE`] bytes per page. A
+    /// stream of unknown length leaves its tables demand-zero, since a large
+    /// table may meet only a few bytes.
+    fn frame_touches_every_page(&self, bytes: usize) -> bool {
+        let pages = bytes.div_ceil(PAGE_BYTES);
+        self.ingest
+            .exact_len()
+            .is_some_and(|len| len / INPUT_PER_TABLE_PAGE >= pages)
     }
 
     /// A table of `count` values, every one set to `value`. Holders go
@@ -549,9 +622,13 @@ impl Drop for Workspace {
 
 /// The trailing part of a layout with no block buffers behind the tables: a
 /// match finder laying out a workspace of its own, or one nobody began.
-pub(crate) fn no_trailing(_block: usize) -> usize {
+pub(crate) fn no_trailing(_block: usize, _sequence_floor: usize) -> usize {
     0
 }
+
+/// The shortest match the format allows (RFC 8878 3.1.1.3.2.1.1: a
+/// `Match_Length_Code` of 0 is a length of 3).
+pub(crate) const FORMAT_MIN_MATCH: usize = 3;
 
 /// A type whose alignment is [`ALIGN`], for the dangling pointer of an empty
 /// workspace.
@@ -642,6 +719,17 @@ impl<T: Copy> Region<T> {
             // value it replaces.
             unsafe { base.add(i).write(value) };
         }
+    }
+
+    /// Sets every byte to zero, the table of zeros a [`TableValue`] region
+    /// holds, as one memset.
+    fn zero(&mut self)
+    where
+        T: TableValue,
+    {
+        // SAFETY: the region spans `len` values of `T`, and all-zero bytes
+        // are a valid `TableValue` (a plain integer).
+        unsafe { core::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
     }
 }
 

@@ -549,6 +549,80 @@ fn producer_parse_builds_the_frame() {
     assert!(frame.len() < input.len() / 5, "{}", frame.len());
 }
 
+/// Parses a block as three literals and then nothing but three-byte matches at
+/// offset 3: the most sequences a block can hold, at the format's shortest
+/// match. Valid only on a block repeating a three-byte pattern.
+struct ThreeByteMatches;
+
+impl SequenceProducer for ThreeByteMatches {
+    fn produce(
+        &mut self,
+        block: &[u8],
+        _window_size: u64,
+        out: &mut Vec<ExternalSequence>,
+    ) -> Result<(), SequenceProducerError> {
+        let matches = (block.len() - 3) / 3;
+        out.push(seq(3, 3, 3));
+        out.extend((1..matches).map(|_| seq(3, 0, 3)));
+        out.push(ExternalSequence::delimiter(
+            (block.len() - 3 - 3 * matches) as u32,
+        ));
+        Ok(())
+    }
+}
+
+/// A producer's three-byte matches fit the block's sequence buffer at a level
+/// whose own search never emits one: the buffer is sized for the format's
+/// shortest match whenever a producer parses the frame (upstream
+/// `ZSTD_maxNbSeq` with `useSequenceProducer`). Sized for the level's four
+/// bytes instead, a full block of them overran it.
+#[test]
+fn producer_three_byte_matches_fit_at_a_four_byte_level() {
+    let input = b"abc".repeat(60_000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+    compressor.set_sequence_producer(Some(alloc::boxed::Box::new(ThreeByteMatches)), false);
+    let frame = compressor.compress_independent_frame(&input);
+    assert_eq!(decode(&frame), input);
+    assert!(!compressor.take_sequence_producer_failure());
+}
+
+/// A block with as many sequences as straddle the count header's forms
+/// (0x7EFF, 0x7F00, 0x7FFF, 0x8000) decodes: the counts from 0x7F00 up take
+/// the three-byte form, little-endian (RFC 8878 3.1.1.3.1).
+#[test]
+fn blocks_around_the_sequence_count_forms_decode() {
+    // `ThreeByteMatches` parses `3 * n` bytes as `n - 1` sequences.
+    for sequences in [0x7EFFusize, 0x7F00, 0x7FFF, 0x8000] {
+        let input = b"abc".repeat(sequences + 1);
+        let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_sequence_producer(Some(alloc::boxed::Box::new(ThreeByteMatches)), false);
+        let frame = compressor.compress_independent_frame(&input);
+        assert_eq!(decode(&frame), input, "{sequences} sequences");
+    }
+}
+
+/// A producer installed on a streaming context in the middle of a frame
+/// parses from the next frame on, as upstream applies a registered producer
+/// at the next frame: the running frame's block buffers were sized without
+/// one, and its blocks reaching the producer overran them.
+#[test]
+fn producer_installed_mid_frame_takes_effect_from_the_next_frame() {
+    let input = b"abc".repeat(60_000);
+    let mut context = crate::encoding::CompressionContext::new(CompressionLevel::Fastest);
+    let mut frame = Vec::new();
+    context.write(&mut frame, &input[..3]).unwrap();
+    context.set_sequence_producer(Some(alloc::boxed::Box::new(ThreeByteMatches)), false);
+    context.write(&mut frame, &input[3..]).unwrap();
+    context.finish_frame(&mut frame).unwrap();
+    assert_eq!(decode(&frame), input);
+
+    let mut next = Vec::new();
+    context.write(&mut next, &input).unwrap();
+    context.finish_frame(&mut next).unwrap();
+    assert_eq!(decode(&next), input);
+    assert!(!context.take_sequence_producer_failure());
+}
+
 /// A failing producer without fallback leaves blocks as literals only and
 /// reports it; with fallback the built-in matcher finds the matches.
 #[test]

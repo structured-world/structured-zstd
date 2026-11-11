@@ -1,7 +1,7 @@
 use super::*;
 
 /// A trailing part as large as the block it is sized for.
-fn one_byte_per_block_byte(block: usize) -> usize {
+fn one_byte_per_block_byte(block: usize, _sequence_floor: usize) -> usize {
     block
 }
 
@@ -70,7 +70,7 @@ fn a_new_table_starts_filled() {
     assert!(table.as_slice().iter().all(|&v| v == 0x1234));
 }
 
-fn buffers_up_to_fresh_pages(_block: usize) -> usize {
+fn buffers_up_to_fresh_pages(_block: usize, _sequence_floor: usize) -> usize {
     FRESH_PAGES_FROM
 }
 
@@ -161,6 +161,37 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     );
     ws.open(table, 1 << 14);
     assert!(!ws.on_fresh_pages());
+}
+
+// A zero table on fresh pages is written before use when the frame's known
+// length covers every page of it (left demand-zero, each page would fault
+// twice: the probe's read maps the zero page, the store faults again), and left
+// alone when the length is too short or unknown, so a stream does not clear a
+// large table for a few bytes.
+#[test]
+fn a_frame_covering_a_table_writes_it_and_a_stream_does_not() {
+    let pages = 4;
+    let bytes = pages * PAGE_BYTES;
+    let layout = |ingest| {
+        let mut ws = Workspace::new();
+        ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, ingest);
+        ws.open(bytes, 1 << 14);
+        assert!(ws.zeroed);
+        ws
+    };
+    let covering = INPUT_PER_TABLE_PAGE * pages;
+    // Carves the table and reports whether it was written, which its zeros
+    // alone cannot show.
+    let written = |ingest| {
+        let mut ws = layout(ingest);
+        let zeros = ws.table::<u32>(bytes / 4, 0);
+        assert!(zeros.as_slice().iter().all(|&v| v == 0));
+        ws.zero_tables_written == 1
+    };
+    assert!(written(IngestPlan::Slice(covering)));
+    assert!(written(IngestPlan::PledgedStream(covering)));
+    assert!(!written(IngestPlan::Slice(covering - 1)));
+    assert!(!written(IngestPlan::Stream));
 }
 
 // A region whose byte size fits but whose alignment padding does not is refused

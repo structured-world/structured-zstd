@@ -601,12 +601,14 @@ impl MatchTable {
         }
     }
 
-    /// The shortest match the optimal parser accepts and prices: three bytes
-    /// on every frame, where upstream accepts three only with a hash3 table
-    /// (zstd_opt.c: `minMatch = (cParams->minMatch == 3) ? 3 : 4`).
+    /// The shortest match the optimal parser accepts and prices: 3 for a
+    /// `minMatch` of 3, the frames with a hash3 table, and 4 otherwise
+    /// (upstream zstd_opt.c `ZSTD_compressBlock_opt_generic`: `minMatch =
+    /// (cParams->minMatch == 3) ? 3 : 4`, passed to the search as
+    /// `lengthToBeat`).
     #[inline(always)]
     pub(crate) fn opt_min_match(&self) -> usize {
-        3
+        if self.hash3_log != 0 { 3 } else { 4 }
     }
 
     /// Insert a position into the HC3 short-match side table without
