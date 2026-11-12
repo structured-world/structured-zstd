@@ -141,3 +141,28 @@ fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
         "reset must detach the HUF dictionary copy-on-write source"
     );
 }
+
+/// Every frame reset writes the table sources, the long-offset share, the
+/// frame count and the cold flag. Spread over two cache lines they cost small
+/// frames a line per frame in a decoder whose scratch falls out of cache
+/// between frames (small random frames decoded 2-3% slower that way).
+#[test]
+fn the_fields_a_frame_reset_touches_share_one_cache_line() {
+    use core::mem::offset_of;
+    let first = offset_of!(FSEScratch, ll_source);
+    let ends = [
+        offset_of!(FSEScratch, of_source) + core::mem::size_of::<SeqTableSource>(),
+        offset_of!(FSEScratch, ml_source) + core::mem::size_of::<SeqTableSource>(),
+        offset_of!(FSEScratch, offsets_long_share) + core::mem::size_of::<u32>(),
+        offset_of!(FSEScratch, ddict_is_cold) + core::mem::size_of::<bool>(),
+        offset_of!(FSEScratch, frame) + core::mem::size_of::<u32>(),
+    ];
+    assert_eq!(first % 64, 0, "the reset fields start a cache line");
+    for end in ends {
+        assert!(
+            end - first <= 64,
+            "a reset field ends {} bytes past the line start",
+            end - first
+        );
+    }
+}

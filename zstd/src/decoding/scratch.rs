@@ -384,7 +384,7 @@ pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
     fse.ddict_is_cold = false;
     // A new frame: a dictionary attached to it is warm only if the previous
     // frame attached the same one.
-    fse.frame += 1;
+    fse.frame = fse.frame.wrapping_add(1);
 
     // Same lazy-entropy skip as the FSE tables above: a Huffman table that
     // was never built this round (`max_num_bits == 0`) is already in its
@@ -536,11 +536,37 @@ fn expect_dict(dict: Option<&Dictionary>) -> &Dictionary {
     dict.expect("a Dict-sourced table requires the active dictionary borrow")
 }
 
+/// The fields every frame reset touches (the table sources through
+/// `offsets_long_share`, `frame` and `ddict_is_cold`) are laid out together
+/// right after the tables, whose size is a multiple of their alignment, so
+/// they share one cache line; the fields only a dictionary frame touches
+/// follow them.
 #[derive(Clone)]
+#[repr(C)]
 pub struct FSEScratch {
     pub offsets: AlignedFSETable,
     pub literal_lengths: AlignedFSETable,
     pub match_lengths: AlignedFSETable,
+    /// Copy-on-write source for each sequence FSE table axis. After
+    /// [`DecoderScratch::init_from_dict`] all three point at the shared
+    /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
+    /// eager `ZSTD_copyDDictParameters` memcpy is elided); a block that
+    /// rebuilds an axis (FSE_Compressed / RLE mode) writes the local
+    /// `AlignedFSETable` and flips that axis to `Local`, while a
+    /// Predefined-mode axis flips to `Predefined` and reads the cached
+    /// default table in place.
+    /// Repeat-mode blocks leave the source untouched, so they read
+    /// straight out of the shared dictionary handle until the first
+    /// rebuild. On the no-dict path every axis stays `Local`.
+    /// The `Dict`-sourced axes read the dictionary's tables through a
+    /// call-scoped `dict: Option<&Dictionary>` borrow threaded into the read
+    /// accessors by the decode pipeline (resolved once per decode from the
+    /// owner — the `FrameDecoder` registry or `FrameDecoderState::active_dict`).
+    /// No dictionary reference is STORED here: the borrow checker guarantees the
+    /// dictionary outlives every read, with no refcount and no per-frame clone.
+    ll_source: SeqTableSource,
+    of_source: SeqTableSource,
+    ml_source: SeqTableSource,
     /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
     /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to upstream zstd's
     /// `OffFSELog = 8` (256-entry reference).
@@ -564,38 +590,20 @@ pub struct FSEScratch {
     /// of the predefined and repeat tables is not considered "cold" in the
     /// upstream zstd model).
     pub ddict_is_cold: bool,
-    /// The dictionary last attached, by address (zero for none), the frame it
-    /// was attached on, and the current frame. A dictionary is warm only when
+    /// The current frame, the dictionary last attached by address (zero for
+    /// none) and the frame it was attached on. A dictionary is warm only when
     /// the previous frame attached the same one: upstream compares the
     /// dictionary's end with the one its context last held (`dctx->dictEnd`,
     /// zstd_decompress.c, ZSTD_decompressBegin_usingDDict), which a frame
     /// without a dictionary clears. Counting frames lets a frame without one
-    /// pay a single increment instead of clearing state. Only the prefetch
-    /// choice reads them, so a dictionary freed and another placed at its
-    /// address costs at most that choice, as upstream's comparison does.
+    /// pay a single increment instead of clearing state; the count wraps, and
+    /// a dictionary is then mistaken for warm only across exactly 2^32 frames.
+    /// Only the prefetch choice reads them, so a dictionary freed and another
+    /// placed at its address costs at most that choice, as upstream's
+    /// comparison does.
+    frame: u32,
+    dict_frame: u32,
     dict_identity: usize,
-    dict_frame: u64,
-    frame: u64,
-    /// Copy-on-write source for each sequence FSE table axis. After
-    /// [`DecoderScratch::init_from_dict`] all three point at the shared
-    /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
-    /// eager `ZSTD_copyDDictParameters` memcpy is elided); a block that
-    /// rebuilds an axis (FSE_Compressed / RLE mode) writes the local
-    /// `AlignedFSETable` and flips that axis to `Local`, while a
-    /// Predefined-mode axis flips to `Predefined` and reads the cached
-    /// default table in place.
-    /// Repeat-mode blocks leave the source untouched, so they read
-    /// straight out of the shared dictionary handle until the first
-    /// rebuild. On the no-dict path every axis stays `Local`.
-    /// The `Dict`-sourced axes read the dictionary's tables through a
-    /// call-scoped `dict: Option<&Dictionary>` borrow threaded into the read
-    /// accessors by the decode pipeline (resolved once per decode from the
-    /// owner — the `FrameDecoder` registry or `FrameDecoderState::active_dict`).
-    /// No dictionary reference is STORED here: the borrow checker guarantees the
-    /// dictionary outlives every read, with no refcount and no per-frame clone.
-    ll_source: SeqTableSource,
-    of_source: SeqTableSource,
-    ml_source: SeqTableSource,
 }
 
 impl FSEScratch {
@@ -729,8 +737,9 @@ impl FSEScratch {
     pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
         let identity = core::ptr::from_ref(dict.as_dict()).addr();
-        // `frame` counts resets, one per frame; 2^64 of them never happen.
-        self.ddict_is_cold = identity != self.dict_identity || self.dict_frame + 1 != self.frame;
+        // `frame` counts resets, one per frame, and wraps (see the field).
+        self.ddict_is_cold =
+            identity != self.dict_identity || self.dict_frame.wrapping_add(1) != self.frame;
         self.dict_identity = identity;
         self.dict_frame = self.frame;
         // Re-arm all three COW axes every frame (a prior frame may have rebuilt
