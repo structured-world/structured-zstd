@@ -456,8 +456,12 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
+      # The build runs third-party build scripts; nothing here needs Git
+      # credentials, so none are left in the checkout for them to read.
       - uses: actions/checkout@v7.0.1
         if: needs.changes.outputs.code == 'true'
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/mold
         if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable

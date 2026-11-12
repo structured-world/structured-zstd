@@ -54,6 +54,42 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
     }
 }
 
+/// The doubling copy reads only bytes already written: a destination grown
+/// in place leaves the bytes past the write uninitialised (`FlatBuf`'s spare
+/// capacity), and a load that reaches into them reads uninitialised memory
+/// even when no such byte reaches the output. The match is written into
+/// uninitialised capacity, so an interpreter that tracks initialisation
+/// (Miri) rejects any such load; the output is checked as well.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn match_copy_doubling_reads_only_written_bytes() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 128;
+    for offset in [1usize, 5, 16, 31, 32, 40, 100] {
+        for length in [offset + 1, 3 * offset + 5, 300] {
+            let mut expected: alloc::vec::Vec<u8> = (0..PREFIX as u32)
+                .map(|b| (b as u8).wrapping_mul(37) ^ 0x5a)
+                .collect();
+            let mut out = expected.clone();
+            out.reserve_exact(length + 31);
+            for _ in 0..length {
+                expected.push(expected[expected.len() - offset]);
+            }
+            // SAFETY: `offset <= PREFIX` initialised bytes precede the match,
+            // the capacity holds it plus its 31-byte overshoot, and the CPU
+            // has AVX2.
+            unsafe {
+                super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(PREFIX), offset, length)
+            };
+            // SAFETY: the copy wrote every byte of the match.
+            let written = unsafe { core::slice::from_raw_parts(out.as_ptr(), PREFIX + length) };
+            assert_eq!(written, &expected[..], "offset {offset} length {length}");
+        }
+    }
+}
+
 /// The shuffle copy expanded in an SSSE3 scope, as the executor expands it.
 ///
 /// # Safety

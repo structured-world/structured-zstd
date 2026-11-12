@@ -495,6 +495,16 @@ pub(crate) mod x86 {
         unsafe {
             let mut written = 0usize;
             let mut distance = offset;
+            // Below 32 bytes of distance a vector load would reach past the
+            // bytes in place, so those pieces, 31 bytes at most in all, are
+            // copied exactly.
+            while written < length && distance < 32 {
+                let piece = distance.min(length - written);
+                let at = dst.add(written);
+                copy_short_exact(at, at.sub(distance), piece);
+                written += piece;
+                distance *= 2;
+            }
             while written < length {
                 let piece = distance.min(length - written);
                 let at = dst.add(written);
@@ -514,27 +524,62 @@ pub(crate) mod x86 {
         }
     }
 
-    /// `length` bytes from `src` to `dst` in libc memcpy's shape: past 128
-    /// bytes, 128 per pass with the stores on 32-byte boundaries and the last
-    /// 128 bytes written to end exactly at `dst + length`, so the pass count
-    /// stays short enough for the loop exit to be predicted and nothing is
-    /// written past the end. Up to 128 bytes go 32 at a time, writing up to 31
-    /// bytes past the end from source bytes that may be unwritten yet, which
-    /// the caller overwrites or leaves as overshoot.
+    /// `n < 32` bytes from `src` to `dst`, exactly: two overlapping moves of
+    /// the widest size that fits, or bytes for the last three.
     ///
     /// # Safety
-    /// Caller in `target_feature(avx2)` scope; `src + length <= dst` or the
-    /// regions are disjoint; room for `length + 31` bytes at `dst`.
+    /// `src + n <= dst`; both valid for `n` bytes.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn copy_short_exact(dst: *mut u8, src: *const u8, n: usize) {
+        debug_assert!(n < 32);
+        unsafe {
+            if n >= 16 {
+                copy16(dst, src);
+                copy16(dst.add(n - 16), src.add(n - 16));
+            } else if n >= 8 {
+                let head = src.cast::<u64>().read_unaligned();
+                let tail = src.add(n - 8).cast::<u64>().read_unaligned();
+                dst.cast::<u64>().write_unaligned(head);
+                dst.add(n - 8).cast::<u64>().write_unaligned(tail);
+            } else if n >= 4 {
+                let head = src.cast::<u32>().read_unaligned();
+                let tail = src.add(n - 4).cast::<u32>().read_unaligned();
+                dst.cast::<u32>().write_unaligned(head);
+                dst.add(n - 4).cast::<u32>().write_unaligned(tail);
+            } else {
+                for i in 0..n {
+                    *dst.add(i) = *src.add(i);
+                }
+            }
+        }
+    }
+
+    /// `length` bytes from `src` to `dst`, reading only `src..dst`, in libc
+    /// memcpy's shape: past 128 bytes, 128 per pass with the stores on 32-byte
+    /// boundaries and the last 128 bytes written to end exactly at
+    /// `dst + length`, so the pass count stays short enough for the loop exit
+    /// to be predicted; from 32 to 128 bytes, 32 at a time with the last move
+    /// ending exactly at the end. Below 32 bytes one move, which the distance
+    /// keeps within the bytes in place and which writes up to 31 bytes past
+    /// the end, overshoot the caller overwrites or leaves.
+    ///
+    /// # Safety
+    /// Caller in `target_feature(avx2)` scope; `src + 32 <= dst` and
+    /// `src + length <= dst`; room for `length + 31` bytes at `dst`.
     #[cfg(feature = "kernel-avx2")]
     #[inline(always)]
     unsafe fn copy_back_avx2(dst: *mut u8, src: *const u8, length: usize) {
         unsafe {
             copy32_avx2(dst, src);
             if length <= 128 {
-                let mut off = 32usize;
-                while off < length {
-                    copy32_avx2(dst.add(off), src.add(off));
-                    off += 32;
+                if length > 32 {
+                    let mut off = 32usize;
+                    while off + 32 < length {
+                        copy32_avx2(dst.add(off), src.add(off));
+                        off += 32;
+                    }
+                    copy32_avx2(dst.add(length - 32), src.add(length - 32));
                 }
                 return;
             }
