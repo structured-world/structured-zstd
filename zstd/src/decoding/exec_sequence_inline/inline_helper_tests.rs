@@ -1,20 +1,10 @@
 use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
 
-/// The doubling match copy in an AVX2 scope, as the executor expands it.
-///
-/// # Safety
-/// The CPU has AVX2, plus the copy's own contract.
-#[cfg(feature = "std")]
-#[target_feature(enable = "avx2")]
-unsafe fn match_copy_doubling(dst: *mut u8, offset: usize, length: usize) {
-    unsafe { super::x86::match_copy_doubling_avx2(dst, offset, length) }
-}
-
 /// The doubling copy of a match writes what a byte-by-byte copy writes, for
 /// short and long offsets, a match no longer than its offset, lengths around each
 /// doubled piece and past the distance limit, and every alignment of the
 /// write, and stays within its 31-byte overshoot.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
 #[test]
 fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -47,7 +37,9 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
                 let dst = prefix.len();
                 // SAFETY: `offset <= 400` bytes precede the match, the buffer
                 // holds it plus its 31-byte overshoot, and the CPU has AVX2.
-                unsafe { match_copy_doubling(out.as_mut_ptr().add(dst), offset, length) };
+                unsafe {
+                    super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(dst), offset, length)
+                };
                 assert_eq!(
                     out[..expected.len()],
                     expected[..],

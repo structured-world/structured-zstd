@@ -485,6 +485,8 @@ pub(crate) mod x86 {
     /// # Safety
     /// The CPU has AVX2; `offset >= 1` bytes of output are in place before
     /// `dst`; room for `length + 31` bytes at `dst`.
+    // Gated to the tier that calls it, as `MAX_WILDCOPY_OVERSHOOT` is.
+    #[cfg(feature = "kernel-avx2")]
     #[target_feature(enable = "avx2")]
     #[inline(never)]
     pub(crate) unsafe fn match_copy_doubling_avx2(dst: *mut u8, offset: usize, length: usize) {
@@ -523,6 +525,7 @@ pub(crate) mod x86 {
     /// # Safety
     /// Caller in `target_feature(avx2)` scope; `src + length <= dst` or the
     /// regions are disjoint; room for `length + 31` bytes at `dst`.
+    #[cfg(feature = "kernel-avx2")]
     #[inline(always)]
     unsafe fn copy_back_avx2(dst: *mut u8, src: *const u8, length: usize) {
         unsafe {
