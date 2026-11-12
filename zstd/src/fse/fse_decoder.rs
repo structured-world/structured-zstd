@@ -67,10 +67,20 @@ impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
 impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
-    // Inlined into the sequence-section setup, which runs it once per axis
-    // per block, as upstream's `ZSTD_initFseState` is.
-    #[inline(always)]
+    // A call: inlined into the Huffman weight decode, which builds a table
+    // around it, it cost that body more than the call it saved.
+    #[inline(never)]
     pub fn init_state<K: CpuKernel>(
+        &mut self,
+        bits: &mut BitReaderReversed<'_, K>,
+    ) -> Result<(), FSEDecoderError> {
+        self.init_state_inline(bits)
+    }
+
+    /// [`Self::init_state`], inlined into the sequence-section setup, which
+    /// runs it once per axis per block, as upstream's `ZSTD_initFseState` is.
+    #[inline(always)]
+    pub(crate) fn init_state_inline<K: CpuKernel>(
         &mut self,
         bits: &mut BitReaderReversed<'_, K>,
     ) -> Result<(), FSEDecoderError> {

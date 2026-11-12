@@ -148,13 +148,13 @@ where
     let mut of_dec = SeqFSEDecoder::new(of_src);
 
     ll_dec
-        .init_state(&mut br)
+        .init_state_inline(&mut br)
         .map_err(DecodeSequenceError::from)?;
     of_dec
-        .init_state(&mut br)
+        .init_state_inline(&mut br)
         .map_err(DecodeSequenceError::from)?;
     ml_dec
-        .init_state(&mut br)
+        .init_state_inline(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
     let max_update_bits = ll_src.accuracy_log + ml_src.accuracy_log + of_src.accuracy_log;
