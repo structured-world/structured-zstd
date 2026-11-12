@@ -5,7 +5,6 @@ rust-version = "1.92"
 authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 edition = "2024"
 license = "Apache-2.0"
-homepage = "https://github.com/structured-world/structured-zstd"
 repository = "https://github.com/structured-world/structured-zstd"
 description = "WebAssembly bindings for structured-zstd — pure-Rust zstd codec for browser, Node.js and Deno."
 # npm-only distribution (the npm package is @structured-world/structured-zstd);

@@ -486,7 +486,9 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// the only call site is
     /// `sequence_section_decoder::execute_one_sequence_pipelined_avx2`
     /// which is itself target_feature-tagged.
-    #[cfg(target_arch = "x86_64")]
+    // A soft-float x86_64 target (no SSE2 in its baseline) cannot enable AVX2;
+    // it keeps the trait's default.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn exec_sequence_inline_avx2(
