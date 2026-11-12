@@ -730,7 +730,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // (256-symbol alphabet bounded by `u8`); zero-init covers
         // every slot. `u16` as upstream's `symbolNext`: a counter never
         // passes `2 * table_size - 1`, and `table_size <= CAP <= 512`.
-        let mut symbol_next = [0u16; 256];
+        //
+        // Only the counters of this table's alphabet are set, not all 256: the
+        // spread holds only symbols below `nb_symbols`, so no other counter is
+        // read, and a table build no longer clears 512 bytes it never uses.
+        let mut symbol_next = [core::mem::MaybeUninit::<u16>::uninit(); 256];
+        for counter in &mut symbol_next[..nb_symbols] {
+            counter.write(0);
+        }
 
         // Pass 1: place -1 probability symbols at the top of the
         // table AND initialise `symbol_next` for them. Upstream zstd:
@@ -748,7 +755,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             if prob == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
-                symbol_next[symbol] = 1;
+                symbol_next[symbol].write(1);
             }
         }
 
@@ -764,28 +771,39 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // when there are no -1 symbols: both place the k-th in-order symbol at
         // `next_position`-walk step k.
         if negative_idx == table_size {
-            let mut in_order = [0u8; FSE_FAST_SPREAD_BUF];
+            // Not cleared: the lay-down below writes `[0, table_size)` in full
+            // (the probabilities sum to `table_size`), and only those
+            // positions are read.
+            let mut in_order = [core::mem::MaybeUninit::<u8>::uninit(); FSE_FAST_SPREAD_BUF];
             let mut pos = 0usize;
             for symbol in 0..nb_symbols {
                 let prob = probs[symbol];
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u16;
+                symbol_next[symbol].write(prob as u16);
                 let n = prob as usize;
                 // 8 copies of the symbol byte; lay down 8 at a time (counts are
                 // mostly <= 8 on small table-logs, so the inner loop rarely runs).
-                let bytes = ((symbol as u8) as u64)
-                    .wrapping_mul(0x0101_0101_0101_0101)
-                    .to_le_bytes();
-                in_order[pos..pos + 8].copy_from_slice(&bytes);
-                let mut i = 8;
-                while i < n {
-                    in_order[pos + i..pos + i + 8].copy_from_slice(&bytes);
-                    i += 8;
+                let word = ((symbol as u8) as u64).wrapping_mul(0x0101_0101_0101_0101);
+                // The probabilities sum to `table_size <= 512`, so `pos + n`
+                // stays within it and each 8-byte write within the 8 bytes of
+                // slack past it.
+                assert!(pos + n <= table_size, "FSE lay-down past the table");
+                let lay = in_order.as_mut_ptr().cast::<u8>();
+                // SAFETY: `pos + i + 8 <= pos + n + 8 <= table_size + 8 <=
+                // FSE_FAST_SPREAD_BUF` for every write below.
+                unsafe {
+                    lay.add(pos).cast::<u64>().write_unaligned(word);
+                    let mut i = 8;
+                    while i < n {
+                        lay.add(pos + i).cast::<u64>().write_unaligned(word);
+                        i += 8;
+                    }
                 }
                 pos += n;
             }
+            debug_assert_eq!(pos, table_size, "lay-down covers the table");
             let table_mask = table_size - 1;
             let step = (table_size >> 1) + (table_size >> 3) + 3;
             let spread_live = &mut spread[..table_size];
@@ -796,10 +814,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 debug_assert!(position <= table_mask);
                 // SAFETY: both positions are masked by `table_mask = table_size
                 // - 1` (`position` starts at 0 and is re-masked every step), so
-                // each is below `table_size == spread_live.len()`.
+                // each is below `table_size == spread_live.len()`; `s + 1 <
+                // table_size`, which the lay-down wrote in full.
                 unsafe {
-                    *spread_live.get_unchecked_mut(position) = in_order[s];
-                    *spread_live.get_unchecked_mut(paired) = in_order[s + 1];
+                    *spread_live.get_unchecked_mut(position) = in_order[s].assume_init();
+                    *spread_live.get_unchecked_mut(paired) = in_order[s + 1].assume_init();
                 }
                 position = (position + 2 * step) & table_mask;
                 s += 2;
@@ -811,7 +830,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u16;
+                symbol_next[symbol].write(prob as u16);
                 let symbol_u8 = symbol as u8;
                 for _ in 0..prob {
                     spread[position] = symbol_u8;
@@ -1329,10 +1348,13 @@ const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
 /// (at least 1) and stays below `2 * table_size`; the bit count is then within
 /// the accuracy log by construction, asserted rather than tested per state.
 #[inline(always)]
+///
+/// `symbol_next` holds a counter for every symbol below the alphabet size the
+/// spread was built from; the spread holds no other symbol.
 fn fill_decode_entries<E: FseEntry>(
     decode: &mut [core::mem::MaybeUninit<E>],
     spread: &[u8],
-    symbol_next: &mut [u16; 256],
+    symbol_next: &mut [core::mem::MaybeUninit<u16>; 256],
     accuracy_log: u8,
     with_meta: impl Fn(u8, E) -> E,
 ) {
@@ -1341,9 +1363,12 @@ fn fill_decode_entries<E: FseEntry>(
     //        = leading_zeros(next_state) - (31 - accuracy_log).
     let leading_zeros_at_no_bits = 31 - u32::from(accuracy_log);
     for (slot, &symbol) in decode.iter_mut().zip(spread) {
-        let next_state = u32::from(symbol_next[symbol as usize]);
+        let counter = &mut symbol_next[symbol as usize];
+        // SAFETY: the spread holds only symbols of the alphabet, whose
+        // counters the caller set before building the spread.
+        let next_state = u32::from(unsafe { counter.assume_init() });
         debug_assert!(next_state >= 1 && next_state < 2 * table_size);
-        symbol_next[symbol as usize] = (next_state + 1) as u16;
+        counter.write((next_state + 1) as u16);
         let nb = next_state.leading_zeros() - leading_zeros_at_no_bits;
         debug_assert!(nb <= u32::from(accuracy_log));
         // `next_state << nb` is in `[table_size, 2 * table_size)`, so the new
