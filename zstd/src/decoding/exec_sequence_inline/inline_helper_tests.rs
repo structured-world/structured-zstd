@@ -54,6 +54,51 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
     }
 }
 
+/// A match from 4 KiB or more back goes, on a CPU with fast string moves, by a
+/// vector head up to a 64-byte destination boundary and `rep movsb` for the
+/// rest; it writes what a byte-by-byte copy writes for every destination
+/// alignment, lengths around the 4 KiB threshold, and stays within its
+/// overshoot. Without fast string moves the same cases run the vector loop.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 9000;
+    for skew in 0..64usize {
+        let prefix: alloc::vec::Vec<u8> = (0..(PREFIX + skew) as u32)
+            .map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for offset in [4096usize, 5000, 8191] {
+            for length in [256usize, 4095, 4096, 4097, 4096 + 64 + 7, 20000] {
+                let mut expected = prefix.clone();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                let mut out = prefix.clone();
+                out.resize(prefix.len() + length + 31 + 16, 0xee);
+                let dst = prefix.len();
+                // SAFETY: `offset < PREFIX` bytes precede the match, the
+                // buffer holds it plus its 31-byte overshoot, and the CPU has
+                // AVX2.
+                unsafe {
+                    super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(dst), offset, length)
+                };
+                assert_eq!(
+                    out[..expected.len()],
+                    expected[..],
+                    "skew {skew} offset {offset} length {length}"
+                );
+                assert!(
+                    out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                    "skew {skew} offset {offset} length {length} wrote past its overshoot",
+                );
+            }
+        }
+    }
+}
+
 /// The doubling copy reads only bytes already written: a destination grown
 /// in place leaves the bytes past the write uninitialised (`FlatBuf`'s spare
 /// capacity), and a load that reaches into them reads uninitialised memory

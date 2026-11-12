@@ -492,6 +492,14 @@ pub(crate) mod x86 {
     pub(crate) unsafe fn match_copy_doubling_avx2(dst: *mut u8, offset: usize, length: usize) {
         // Above the bytes a store buffer of a few dozen 32-byte entries holds.
         const DOUBLING_DISTANCE_LIMIT: usize = 2048;
+        // A piece this long from a source this far back (a long-distance match,
+        // whose source lies beyond the caches) goes, with fast string moves,
+        // by `rep movsb`, as libc memcpy moves it (glibc's
+        // `__x86_rep_movsb_threshold` for 32-byte vectors). A short-offset
+        // match never gets there: its distance stops doubling below it, and
+        // the vector loop over a near source outruns `rep movsb`.
+        const REP_MOVSB_MIN: usize = 4096;
+        let erms = fast_string_moves();
         unsafe {
             let mut written = 0usize;
             let mut distance = offset;
@@ -508,7 +516,18 @@ pub(crate) mod x86 {
             while written < length {
                 let piece = distance.min(length - written);
                 let at = dst.add(written);
-                copy_back_avx2(at, at.sub(distance), piece);
+                if erms && distance >= REP_MOVSB_MIN && piece >= REP_MOVSB_MIN {
+                    // As glibc does, the string move starts on a 64-byte
+                    // boundary of the destination, where its microcode runs
+                    // fastest; the head goes by two vector moves first.
+                    let src = at.sub(distance);
+                    copy32_avx2(at, src);
+                    copy32_avx2(at.add(32), src.add(32));
+                    let head = 64 - (at.addr() & 63);
+                    rep_movsb(at.add(head), src.add(head), piece - head);
+                } else {
+                    copy_back_avx2(at, at.sub(distance), piece);
+                }
                 written += piece;
                 // Past the store buffer's reach the distance stops growing, so
                 // the source stays in cache lines the copy just wrote rather
@@ -521,6 +540,52 @@ pub(crate) mod x86 {
                     distance *= 2;
                 }
             }
+        }
+    }
+
+    /// Whether the CPU has fast string moves (ERMS), detected once.
+    #[cfg(all(feature = "kernel-avx2", feature = "std"))]
+    #[inline]
+    fn fast_string_moves() -> bool {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        // 0 unknown, 1 absent, 2 present.
+        static ERMS: AtomicU8 = AtomicU8::new(0);
+        match ERMS.load(Ordering::Relaxed) {
+            0 => {
+                let present = std::arch::is_x86_feature_detected!("ermsb");
+                ERMS.store(if present { 2 } else { 1 }, Ordering::Relaxed);
+                present
+            }
+            state => state == 2,
+        }
+    }
+
+    // no-std: a compile-time `target_feature = "ermsb"` would stand in for the
+    // run-time check; without one the vector copy serves every piece.
+    #[cfg(all(feature = "kernel-avx2", not(feature = "std")))]
+    #[inline]
+    fn fast_string_moves() -> bool {
+        false
+    }
+
+    /// `n` bytes from `src` to `dst` by `rep movsb`.
+    ///
+    /// # Safety
+    /// `src + n <= dst`; both valid for `n` bytes.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
+        // SAFETY: the caller's contract; the direction flag is clear at every
+        // call boundary (System V and Windows x64), so the move runs forward,
+        // and it touches no flags.
+        unsafe {
+            core::arch::asm!(
+                "rep movsb",
+                inout("rcx") n => _,
+                inout("rdi") dst => _,
+                inout("rsi") src => _,
+                options(nostack, preserves_flags),
+            );
         }
     }
 
