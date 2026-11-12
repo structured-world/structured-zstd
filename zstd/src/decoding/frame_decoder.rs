@@ -4884,67 +4884,71 @@ impl FrameDecoder {
         // (random / already-compressed data) emit exactly this shape, so the win
         // lands on small high-entropy frames where the per-frame machinery, not
         // the 1-block copy, dominates.
+        //
+        // The first block's header is read once, here, and the block loop
+        // below starts from it rather than parsing it again. A header that
+        // fails to read is reported with the coordinates the loop would give.
+        let mut block_dec = block_decoder::with_kernel(kernel);
+        let mut block_index = state.block_counter as u32;
+        let mut block_frame_offset = state.bytes_read_counter as u32;
+        let (mut block_header, mut hsize) = block_dec
+            .read_block_header(&mut *input)
+            .map_err(|source| block_header_decode_error(source, block_index, block_frame_offset))?;
         {
-            let mut probe = *input;
-            let mut header_dec = block_decoder::with_kernel(kernel);
-            if let Ok((bh, hsize)) = header_dec.read_block_header(&mut probe) {
-                let n = bh.decompressed_size as usize;
-                // A frame that declares no size takes the shortcut too: the
-                // slice is its limit, and holding the block means holding the
-                // frame. Without this the probe parsed the header that the
-                // general loop below parses again, on the very path (a small
-                // frame from a streamed producer) this decode is for. The
-                // block maximum is checked here as the general path checks it:
-                // a block past it is malformed, and the shortcut must not be
-                // the way around that.
-                if bh.last_block
-                    && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
-                    && declared_size.is_none_or(|declared| declared == n as u64)
-                    && n <= state.block_maximum()
-                    && probe.len() >= n
-                    && output.len() >= n
-                {
-                    output[..n].copy_from_slice(&probe[..n]);
-                    *input = &probe[n..];
-                    state.bytes_read_counter += u64::from(hsize) + n as u64;
-                    state.block_counter += 1;
-                    // Consume the trailing 4-byte content checksum UNCONDITIONALLY
-                    // when the frame declares one — exactly like the general
-                    // direct loop and `decode_blocks`. Only the hash SEEDING is
-                    // `hash`-gated; the byte consumption / counter / `check_sum`
-                    // must not be, or a no-`hash` build leaves the 4 bytes in
-                    // `*input` (misparsed as the next frame) and never sets
-                    // `check_sum` (so `is_finished` stays false).
-                    if state.frame_header.descriptor.content_checksum_flag() {
-                        let mut chksum = [0u8; 4];
-                        Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
-                        state.bytes_read_counter += 4;
-                        state.check_sum = Some(u32::from_le_bytes(chksum));
-                        // Mirror the general path: seed the scratch hash so
-                        // `verify_content_checksum` / `get_calculated_checksum`
-                        // read the digest. Skipped under `ContentChecksum::None`.
-                        #[cfg(feature = "hash")]
-                        if self.content_checksum != ContentChecksum::None {
-                            use core::hash::Hasher;
-                            let mut h = twox_hash::XxHash64::with_seed(0);
-                            h.write(&output[..n]);
-                            match &mut state.decoder_scratch {
-                                DecoderScratchKind::Flat(s) => s.buffer.set_hash(h),
-                                DecoderScratchKind::Ring(s) => s.buffer.set_hash(h),
-                            }
-                        }
-                    }
-                    #[cfg(all(feature = "lsm", feature = "hash"))]
-                    if self.per_block_checksums_enabled {
+            let bh = &block_header;
+            let n = bh.decompressed_size as usize;
+            // A frame that declares no size takes the shortcut too: the
+            // slice is its limit, and holding the block means holding the
+            // frame. The block maximum is checked here as the general path
+            // checks it: a block past it is malformed, and the shortcut
+            // must not be the way around that.
+            if bh.last_block
+                && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
+                && declared_size.is_none_or(|declared| declared == n as u64)
+                && n <= state.block_maximum()
+                && input.len() >= n
+                && output.len() >= n
+            {
+                output[..n].copy_from_slice(&input[..n]);
+                *input = &input[n..];
+                state.bytes_read_counter += u64::from(hsize) + n as u64;
+                state.block_counter += 1;
+                // Consume the trailing 4-byte content checksum UNCONDITIONALLY
+                // when the frame declares one — exactly like the general
+                // direct loop and `decode_blocks`. Only the hash SEEDING is
+                // `hash`-gated; the byte consumption / counter / `check_sum`
+                // must not be, or a no-`hash` build leaves the 4 bytes in
+                // `*input` (misparsed as the next frame) and never sets
+                // `check_sum` (so `is_finished` stays false).
+                if state.frame_header.descriptor.content_checksum_flag() {
+                    let mut chksum = [0u8; 4];
+                    Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
+                    state.bytes_read_counter += 4;
+                    state.check_sum = Some(u32::from_le_bytes(chksum));
+                    // Mirror the general path: seed the scratch hash so
+                    // `verify_content_checksum` / `get_calculated_checksum`
+                    // read the digest. Skipped under `ContentChecksum::None`.
+                    #[cfg(feature = "hash")]
+                    if self.content_checksum != ContentChecksum::None {
                         use core::hash::Hasher;
                         let mut h = twox_hash::XxHash64::with_seed(0);
                         h.write(&output[..n]);
-                        self.computed_block_checksums.push(h.finish() as u32);
+                        match &mut state.decoder_scratch {
+                            DecoderScratchKind::Flat(s) => s.buffer.set_hash(h),
+                            DecoderScratchKind::Ring(s) => s.buffer.set_hash(h),
+                        }
                     }
-                    state.decoder_scratch.set_total_output(n as u64);
-                    state.frame_finished = true;
-                    return Ok(n);
                 }
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                if self.per_block_checksums_enabled {
+                    use core::hash::Hasher;
+                    let mut h = twox_hash::XxHash64::with_seed(0);
+                    h.write(&output[..n]);
+                    self.computed_block_checksums.push(h.finish() as u32);
+                }
+                state.decoder_scratch.set_total_output(n as u64);
+                state.frame_finished = true;
+                return Ok(n);
             }
         }
 
@@ -5010,7 +5014,6 @@ impl FrameDecoder {
         // sync with `decode_blocks` so post-call accessors
         // (`bytes_read_from_source`, `blocks_decoded`) return
         // accurate values.
-        let mut block_dec = block_decoder::with_kernel(kernel);
         // Track total output bytes against the declared
         // `frame_content_size` via the buffer's actual write
         // counter — `BlockHeader.decompressed_size` is 0 for
@@ -5054,14 +5057,6 @@ impl FrameDecoder {
             } else {
                 None
             };
-            // Failing-block coordinates captured before the header read (see
-            // the `decode_blocks` loop for the rationale).
-            let block_index = state.block_counter as u32;
-            let block_frame_offset = state.bytes_read_counter as u32;
-            let (block_header, hsize) =
-                block_dec.read_block_header(&mut *input).map_err(|source| {
-                    block_header_decode_error(source, block_index, block_frame_offset)
-                })?;
             state.bytes_read_counter += u64::from(hsize);
             // Pre-flight FCS check ONLY for Raw / RLE blocks where
             // `decompressed_size` is the actual block output size.
@@ -5194,6 +5189,13 @@ impl FrameDecoder {
                 }
                 break;
             }
+            // Failing-block coordinates captured before the header read (see
+            // the `decode_blocks` loop for the rationale).
+            block_index = state.block_counter as u32;
+            block_frame_offset = state.bytes_read_counter as u32;
+            (block_header, hsize) = block_dec.read_block_header(&mut *input).map_err(|source| {
+                block_header_decode_error(source, block_index, block_frame_offset)
+            })?;
         }
         // Final sanity: blocks summed to exactly the declared size.
         if let Some(declared) = declared_size
