@@ -67,47 +67,38 @@ impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
 impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
+    // Inlined into the sequence-section setup, which runs it once per axis
+    // per block, as upstream's `ZSTD_initFseState` is.
+    #[inline(always)]
     pub fn init_state<K: CpuKernel>(
         &mut self,
         bits: &mut BitReaderReversed<'_, K>,
     ) -> Result<(), FSEDecoderError> {
-        // Uninitialised = no decode entries. (Previously this checked
-        // `accuracy_log == 0`, but a valid RLE table has accuracy_log 0
-        // with a single entry — upstream zstd's RLE DTable. An empty `decode`
-        // vec is the real "never built" signal; the `InvalidTableShape`
-        // check below still enforces `decode.len() == 1 << accuracy_log`,
-        // which holds for the 1-entry RLE table since `1 << 0 == 1`.)
+        // Uninitialised = no decode entries: a Repeat-mode section with no
+        // table before it, which malformed input can declare. (A valid RLE
+        // table has accuracy_log 0 with a single entry, so `decode_len`, not
+        // the log, is the "never built" signal.)
         if self.table.decode_len == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
-        // Defense-in-depth internal-invariant guard: in normal builds
-        // `crate::fse` is not externally reachable, but malformed
-        // tables can still arise from internal misuse, future
-        // `feature = "fuzz-exports"`. Validate up-front that
-        // `decode.len() == 1 << accuracy_log` and surface a typed
-        // `InvalidTableShape` error (distinct from
-        // `TableIsUninitialized` to keep error triage unambiguous).
-        // Without this, `read_entry`'s unchecked indexing (the
-        // `cfg(not(fuzz-exports))` arm) could hit UB on a malformed
-        // table in release builds. `checked_shl` covers the
-        // pathological case where `accuracy_log >= usize::BITS`.
-        // Branch cost is a single per-call check; the per-sequence
-        // hot path (`update_state_fast`) is unaffected.
+        // Every table this crate builds holds exactly `1 << accuracy_log`
+        // entries, which is what lets `read_entry` index without a bounds
+        // check. Only `fuzz-exports` lets a caller hand in a table built
+        // elsewhere, so there it is checked and reported.
         let accuracy_log = self.table.accuracy_log;
         let decode_len = self.table.decode_len;
-        let expected =
-            1usize
-                .checked_shl(accuracy_log.into())
-                .ok_or(FSEDecoderError::InvalidTableShape {
-                    decode_len,
-                    accuracy_log,
-                })?;
-        if decode_len != expected {
+        #[cfg(feature = "fuzz-exports")]
+        if 1usize.checked_shl(accuracy_log.into()) != Some(decode_len) {
             return Err(FSEDecoderError::InvalidTableShape {
                 decode_len,
                 accuracy_log,
             });
         }
+        debug_assert_eq!(
+            1usize.checked_shl(accuracy_log.into()),
+            Some(decode_len),
+            "FSE table holds 1 << accuracy_log entries"
+        );
         let new_state = bits.get_bits(self.table.accuracy_log);
         // SAFETY: `accuracy_log` bits read from the bitstream produce
         // `new_state < (1 << accuracy_log) = table_size = decode.len()`.
