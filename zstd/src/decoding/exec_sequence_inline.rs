@@ -138,50 +138,28 @@ macro_rules! exec_sequence_avx2_inline_at {
         // once per block. Both lengths are bounded by a block's FSE expansion,
         // so the sum cannot overflow. Everything else, including whether the
         // write fits at all, belongs to the branch that is almost never taken,
-        // which the rare long match shares with the tight tail.
+        // A long match is decided after it, on the path that has room for the
+        // overshoot, so this gate stays one comparison.
         let total = lit_length_v + match_length_v;
-        let fits = tail + total <= cap_w;
-        if !fits | (match_length_v >= 256) {
-            if fits {
-                // A long match with room for the overshoot: a copy from a fixed
-                // short distance would read its own recent stores, so it goes
-                // from doubling distances instead.
-                // SAFETY: as in the hot path below: `fits` leaves room for the
-                // doubling copy's 31-byte overshoot, and `offset_v` bytes of
-                // output precede the match (the caller's window check).
+        if tail + total > cap_w {
+            sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
+                // Tight tail: the write fits but the overshoot would not.
+                // SAFETY: `sequence_output_fits` holds the sequence within
+                // `cap`, `cap_w` is this cursor's overshoot end, and
+                // `offset_v` bytes of output precede the match.
                 unsafe {
-                    let op_lit = base.add(tail);
-                    copy16(op_lit, lit_src_v);
-                    if lit_length_v > 16 {
-                        wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
-                    }
-                    $crate::decoding::exec_sequence_inline::x86::match_copy_doubling_avx2(
-                        base.add(tail + lit_length_v),
+                    $crate::decoding::exec_sequence_inline::x86::exec_tight_tail_avx2(
+                        base,
+                        tail,
+                        cap_w,
+                        lit_src_v,
+                        lit_length_v,
                         offset_v,
                         match_length_v,
                     );
                 }
-                Ok(total)
-            } else {
-                sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
-                    // Tight tail: the write fits but the overshoot would not.
-                    // SAFETY: `sequence_output_fits` holds the sequence within
-                    // `cap`, `cap_w` is this cursor's overshoot end, and
-                    // `offset_v` bytes of output precede the match.
-                    unsafe {
-                        $crate::decoding::exec_sequence_inline::x86::exec_tight_tail_avx2(
-                            base,
-                            tail,
-                            cap_w,
-                            lit_src_v,
-                            lit_length_v,
-                            offset_v,
-                            match_length_v,
-                        );
-                    }
-                    total
-                })
-            }
+                total
+            })
         } else {
             // SAFETY: the enclosing fn carries
             // `#[target_feature(enable = "...,bmi2,avx2")]`, the caller vouches
@@ -199,7 +177,17 @@ macro_rules! exec_sequence_avx2_inline_at {
                 // (zstd_decompress_block.c:1077), not at the 32-byte vector
                 // width: a 32-byte arm would add a data-dependent branch to
                 // every match.
-                if offset_v >= 16 {
+                if match_length_v >= 256 {
+                    // A long match: a copy from a fixed short distance would read
+                    // its own recent stores, so it goes from doubling distances
+                    // instead. The gate above leaves room for its 31-byte
+                    // overshoot, and `offset_v` bytes of output precede it.
+                    $crate::decoding::exec_sequence_inline::x86::match_copy_doubling_avx2(
+                        op_match,
+                        offset_v,
+                        match_length_v,
+                    );
+                } else if offset_v >= 16 {
                     wildcopy_no_overlap(op_match, match_src, match_length_v);
                 } else {
                     // Sixteen bytes of written output before the match, which
