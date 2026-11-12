@@ -435,8 +435,14 @@ impl HuffmanTable {
                 // stats (upstream zstd `HUF_readStats` shape) accumulate in locals
                 // and commit to `self` after the loop, replacing the
                 // separate weight-sum and rank-count passes.
+                // The weights go straight into the buffer's room, counted in a
+                // local, and are committed once the stream ends; an error
+                // leaves the buffer empty.
                 let weights = &mut self.weights;
                 weights.clear();
+                weights.reserve(255);
+                let weights_ptr = weights.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+                let mut weight_count = 0usize;
                 let mut weight_sum = 0u32;
                 let mut weight_rank_count = [0u32; (MAX_MAX_NUM_BITS as usize) + 1];
                 macro_rules! push_weight {
@@ -450,16 +456,19 @@ impl HuffmanTable {
                         // bottom check would have run, and 256 explicit
                         // weights would wrap symbol index 256 to 0 through
                         // the u8 entry packing in the table fill.
-                        if weights.len() >= 255 {
+                        if weight_count >= 255 {
                             return Err(err::TooManyWeights {
-                                got: weights.len() + 1,
+                                got: weight_count + 1,
                             });
                         }
                         weight_rank_count[w as usize] += 1;
-                        if w > 0 {
-                            weight_sum += 1u32 << (w - 1);
-                        }
-                        weights.push(w);
+                        // `(1 << w) >> 1` is 0 for weight 0, without a branch, as
+                        // upstream's `HUF_readStats` sums it.
+                        weight_sum += (1u32 << w) >> 1;
+                        // SAFETY: `reserve(255)` leaves room for 255 weights and
+                        // the cap above stops at 255.
+                        unsafe { weights_ptr.add(weight_count).write(w) };
+                        weight_count += 1;
                     }};
                 }
 
@@ -496,6 +505,8 @@ impl HuffmanTable {
                         break;
                     }
                 }
+                // SAFETY: the loop wrote every weight below `weight_count`.
+                unsafe { weights.set_len(weight_count) };
                 self.weight_sum = weight_sum;
                 self.weight_rank_count = weight_rank_count;
             }
