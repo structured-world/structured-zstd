@@ -17,9 +17,10 @@
 #![cfg(target_arch = "x86_64")]
 
 use super::buffer_backend::BufferBackend;
-use super::decode_buffer::DecodeBuffer;
+use super::decode_buffer::{DecodeBuffer, dict_match_slice};
 use super::exec_sequence_inline::{
-    MAX_WILDCOPY_OVERSHOOT, exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at,
+    MAX_WILDCOPY_OVERSHOOT, exec_sequence_avx2_dict_inline, exec_sequence_avx2_dict_inline_at,
+    exec_sequence_avx2_inline_at,
 };
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
@@ -120,6 +121,14 @@ struct OutCursor {
     /// modular. The buffer's own `head` would not do: `op - head` is not the
     /// live length once the ring wraps.
     live_base: core::num::Wrapping<usize>,
+    /// A dictionary match's literals must end below this write position for
+    /// the window to still hold the dictionary: the position at capture plus
+    /// the room [`DecodeBuffer::dict_window_room`] reported, plus one, or zero
+    /// when there was none. Output since capture is counted against that room
+    /// in full, which is exact where the backend counts inline writes and
+    /// errs toward refusing where it does not; a refusal goes to the paths
+    /// that ask the buffer. Only a block-stable cursor reads it.
+    dict_end: usize,
 }
 
 impl OutCursor {
@@ -127,6 +136,11 @@ impl OutCursor {
     #[inline(always)]
     fn capture<B: BufferBackend>(buffer: &mut DecodeBuffer<B>) -> Self {
         let live = buffer.len();
+        let dict_room = if B::CURSOR_IS_BLOCK_STABLE {
+            buffer.dict_window_room()
+        } else {
+            None
+        };
         let backend = buffer.buffer_mut();
         let base = if B::SUPPORTS_INLINE_SEQUENCE_EXEC {
             // SAFETY: the const says this backend is linear and overrides it.
@@ -139,6 +153,12 @@ impl OutCursor {
         // output ceiling, which a carried cursor cannot ask the backend about
         // once it is ahead of it.
         let cap = backend.inline_write_limit();
+        // Past `usize::MAX` the window never runs out within this output.
+        let dict_end = dict_room.map_or(0, |room| {
+            op.checked_add(room)
+                .and_then(|end| end.checked_add(1))
+                .unwrap_or(usize::MAX)
+        });
         Self {
             base,
             op,
@@ -162,6 +182,7 @@ impl OutCursor {
                     .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
             ),
             live_base: core::num::Wrapping(op) - core::num::Wrapping(live),
+            dict_end,
         }
     }
 
@@ -329,6 +350,47 @@ macro_rules! execute_one_body {
                 // the source is a separate allocation, so the output-resident bound
                 // does not apply and asking for it would refuse every such match on
                 // a wrapped ring.
+            }
+
+            // A match wholly inside the dictionary, on the cursor this loop
+            // carries: upstream's extDict branch of `ZSTD_execSequence`
+            // (zstd_decompress_block.c 1052-1058) rebases onto the dictionary
+            // and copies, on registers. A zero offset is no dictionary match
+            // and goes on to the refusal below.
+            if B::CURSOR_IS_BLOCK_STABLE
+                && inline_literals_ok
+                && $cur.op + lits.len() < $cur.dict_end
+                && let Some(dict_src) = dict_match_slice(
+                    $dict_content,
+                    $cur.live() + lits.len(),
+                    offset,
+                    seq_ml_v as usize,
+                )
+            {
+                // SAFETY: parent-slice provenance, as above.
+                let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                let r = exec_sequence_avx2_dict_inline_at!(
+                    $cur.base,
+                    $cur.op,
+                    $cur.cap,
+                    $cur.cap_w,
+                    lit_src,
+                    seq_ll_v as usize,
+                    dict_src,
+                    seq_ml_v as usize
+                );
+                match r {
+                    Ok(total) => {
+                        $cur.op += total;
+                        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                            $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                        }
+                        break 'exec_inner Ok(());
+                    }
+                    Err(e) => {
+                        break 'exec_inner Err(DecompressBlockError::ExecuteSequencesError(e));
+                    }
+                }
             }
 
             // Everything below reads or writes through the buffer, so it gets

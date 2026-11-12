@@ -374,26 +374,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // than a `checked_add` quietly costing a value on every sequence.
         debug_assert!(self.buffer.len().checked_add(lit_length).is_some());
         let after_literals = self.buffer.len() + lit_length;
-        // Reaches back no further than the output holds: not a dictionary
-        // match at all, and the inline executor's own source covers it.
-        if offset <= after_literals {
+        if lit_length > self.dict_window_room()? {
             return None;
         }
-        let bytes_from_dict = offset - after_literals;
+        dict_match_slice(dict_content, after_literals, offset, match_length)
+    }
 
+    /// How much more output the window lets a dictionary match follow: the
+    /// window less everything decoded so far, `None` once the dictionary has
+    /// left the window. A match's literals count against it, as the cold path
+    /// counts them after pushing them.
+    #[inline(always)]
+    pub(crate) fn dict_window_room(&self) -> Option<usize> {
         let total_output = self.total_output_counter.max(self.buffer.len() as u64);
-        if total_output + lit_length as u64 > self.window_size as u64 {
-            return None;
-        }
-
-        // Starts before the dictionary does, or runs out of it into the
-        // output. Both are the cold path's to resolve.
-        if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
-            return None;
-        }
-
-        let low = dict_content.len() - bytes_from_dict;
-        Some(&dict_content[low..])
+        // At most `window_size`, so it fits `usize`.
+        (self.window_size as u64)
+            .checked_sub(total_output)
+            .map(|room| room as usize)
     }
 
     /// Return the last `n` bytes of the visible buffer as two
@@ -1402,6 +1399,28 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             self.delivered -= release;
         }
     }
+}
+
+/// The dictionary from a match's first byte to its end, when the match lies
+/// wholly inside `dict_content`; `after_literals` is the output the match is
+/// measured back from, literals included (upstream's `oLitEnd`). `None` when
+/// the match reaches back no further than the output (or its offset is zero),
+/// starts before the dictionary, or runs out of it into the output.
+#[inline(always)]
+pub(crate) fn dict_match_slice(
+    dict_content: &[u8],
+    after_literals: usize,
+    offset: usize,
+    match_length: usize,
+) -> Option<&[u8]> {
+    if offset <= after_literals {
+        return None;
+    }
+    let bytes_from_dict = offset - after_literals;
+    if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
+        return None;
+    }
+    Some(&dict_content[dict_content.len() - bytes_from_dict..])
 }
 
 /// Like Write::write_all but returns partial write length even on error

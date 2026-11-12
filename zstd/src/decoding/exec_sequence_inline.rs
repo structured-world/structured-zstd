@@ -300,73 +300,106 @@ pub(crate) use overlap_match_shuffle;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_dict_inline {
     ($buffer:expr, $lit_src:expr, $lit_length:expr, $dict_src:expr, $match_length:expr) => {{
-        use crate::decoding::buffer_backend::sequence_output_fits;
-        use crate::decoding::exec_sequence_inline::x86::{
-            copy16, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
-        };
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
-        let lit_length_v: usize = $lit_length;
-        let match_length_v: usize = $match_length;
-        let lit_src_v: *const u8 = $lit_src;
-        let dict_src_v: &[u8] = $dict_src;
-        debug_assert!(dict_src_v.len() >= match_length_v);
         let backend = $buffer.buffer_mut();
         let cap = backend.cap();
         let tail = backend.tail();
-        match sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0) {
-            Err(e) => Err(e),
-            Ok(total) => {
-                // SAFETY: as for `exec_sequence_avx2_inline` on the destination
-                // side — linear backend, `sequence_output_fits` validated
-                // `tail + total <= cap`. The source side is the dictionary
-                // slice, valid for reads of its whole length, and every read
-                // below is bounded by that length.
-                unsafe {
-                    let base = backend.inline_exec_base_ptr();
-                    let dict_ptr = dict_src_v.as_ptr();
-                    let room = dict_src_v.len();
-                    if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
-                        // Tight tail: an overshoot would run past the output.
-                        // Copy both halves exactly; the dictionary source
-                        // cannot overlap the destination.
-                        let op = base.add(tail);
-                        core::ptr::copy_nonoverlapping(lit_src_v, op, lit_length_v);
-                        core::ptr::copy_nonoverlapping(
-                            dict_ptr,
-                            op.add(lit_length_v),
-                            match_length_v,
-                        );
-                    } else {
-                        let op_lit = base.add(tail);
-                        let op_match = base.add(tail + lit_length_v);
-                        copy16(op_lit, lit_src_v);
-                        if lit_length_v > 16 {
-                            wildcopy_no_overlap(
-                                op_lit.add(16),
-                                lit_src_v.add(16),
-                                lit_length_v - 16,
-                            );
-                        }
-                        // A wildcopy reads up to the match length rounded up to
-                        // its stride; past the dictionary's end there is nothing
-                        // to read, so that case copies exactly.
-                        if room >= match_length_v.next_multiple_of(32) {
-                            wildcopy_no_overlap_avx2(op_match, dict_ptr, match_length_v);
-                        } else if room >= match_length_v.next_multiple_of(16) {
-                            wildcopy_no_overlap(op_match, dict_ptr, match_length_v);
-                        } else {
-                            core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length_v);
-                        }
-                    }
-                    backend.inline_exec_commit(tail + total);
-                }
-                Ok(())
-            }
-        }
+        // SAFETY: a linear backend (the caller's gate), so its base addresses
+        // the output from `tail` on.
+        let base = unsafe { backend.inline_exec_base_ptr() };
+        // The overshoot end is the backend's own capacity less the stride.
+        // Saturating is the meaning: a capacity below the overshoot leaves no
+        // room for an overshooting write, and an end of zero sends the
+        // sequence to the exact copy.
+        let r = $crate::decoding::exec_sequence_inline::exec_sequence_avx2_dict_inline_at!(
+            base,
+            tail,
+            cap,
+            cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            $lit_src,
+            $lit_length,
+            $dict_src,
+            $match_length
+        );
+        r.map(|total| {
+            // SAFETY: the copy wrote `[tail, tail + total)`, within `cap`.
+            unsafe { backend.inline_exec_commit(tail + total) };
+        })
     }};
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_dict_inline;
+
+/// [`exec_sequence_avx2_dict_inline!`]'s body, addressed by an explicit cursor
+/// as [`exec_sequence_avx2_inline_at!`] is, so the AVX2 sequence loop runs a
+/// dictionary match on the position it keeps in locals, without handing it to
+/// the buffer and taking it back. Returns the bytes written.
+///
+/// # Safety
+/// The enclosing function must carry `target_feature(avx2)` or the CPU must
+/// have it; `base` is the start of a linear output valid for writes through
+/// `cap`, and through `cap_w + 31` for an overshooting copy; `lit_src` is
+/// readable for the literal length rounded up to 16; `$dict_src` holds the
+/// match at its front.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+macro_rules! exec_sequence_avx2_dict_inline_at {
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $dict_src:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+        };
+        let lit_length_v: usize = $lit_length;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let dict_src_v: &[u8] = $dict_src;
+        let base: *mut u8 = $base;
+        let tail: usize = $tail;
+        debug_assert!(dict_src_v.len() >= match_length_v);
+        let total = lit_length_v + match_length_v;
+        let dict_ptr = dict_src_v.as_ptr();
+        if tail + total > $cap_w {
+            sequence_output_fits(lit_length_v, match_length_v, tail, $cap, 0).map(|total| {
+                // Tight tail: an overshoot would run past the output. Copy both
+                // halves exactly; the dictionary source cannot overlap the
+                // destination.
+                // SAFETY: `sequence_output_fits` validated `tail + total <= cap`;
+                // the dictionary slice holds the match.
+                unsafe {
+                    let op = base.add(tail);
+                    core::ptr::copy_nonoverlapping(lit_src_v, op, lit_length_v);
+                    core::ptr::copy_nonoverlapping(dict_ptr, op.add(lit_length_v), match_length_v);
+                }
+                total
+            })
+        } else {
+            // SAFETY: `tail + total <= cap_w` leaves the write and its overshoot
+            // inside the output; the literal source carries the copiers' slack,
+            // and every dictionary read is bounded by the slice's length.
+            unsafe {
+                let room = dict_src_v.len();
+                let op_lit = base.add(tail);
+                let op_match = base.add(tail + lit_length_v);
+                copy16(op_lit, lit_src_v);
+                if lit_length_v > 16 {
+                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                }
+                // A wildcopy reads up to the match length rounded up to its
+                // stride; past the dictionary's end there is nothing to read,
+                // so that case copies exactly.
+                if room >= match_length_v.next_multiple_of(32) {
+                    wildcopy_no_overlap_avx2(op_match, dict_ptr, match_length_v);
+                } else if room >= match_length_v.next_multiple_of(16) {
+                    wildcopy_no_overlap(op_match, dict_ptr, match_length_v);
+                } else {
+                    core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length_v);
+                }
+            }
+            Ok(total)
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) use exec_sequence_avx2_dict_inline_at;
 
 // x86_64 only: SSE2 is the architectural baseline there (every x86_64
 // CPU has SSE2 by definition). 32-bit `x86` is excluded because the
