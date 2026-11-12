@@ -3,10 +3,9 @@ use crate::decoding::dictionary::Dictionary;
 
 #[test]
 fn init_from_dict_marks_fse_ddict_is_cold() {
-    // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
-    // `dctx->ddictIsCold = 1`. Mirror: `init_from_dict` must
-    // leave `fse.ddict_is_cold = true` so the first
-    // sequence-section decode of the frame engages the prefetch
+    // The first dictionary a scratch attaches is cold: upstream's
+    // `ZSTD_decompressBegin_usingDDict` finds no dictionary end in its context,
+    // and the first sequence-section decode of the frame engages the prefetch
     // pipeline regardless of `offsets_long_share`.
     extern crate std;
     let dict_raw =
@@ -24,6 +23,43 @@ fn init_from_dict_marks_fse_ddict_is_cold() {
         scratch.fse.ddict_is_cold,
         "init_from_dict must set ddict_is_cold = true"
     );
+}
+
+/// A dictionary is cold only on a frame whose previous frame did not decode
+/// with that same dictionary, as upstream's `ddictIsCold = (dctx->dictEnd !=
+/// dictEnd)` (zstd_decompress.c, ZSTD_decompressBegin_usingDDict). Marking it
+/// cold on every frame sent each frame of a dictionary stream with sixteen
+/// sequences or more to the prefetching decoder, which upstream runs only
+/// after a dictionary change.
+#[test]
+fn ddict_is_cold_only_when_the_dictionary_changes() {
+    extern crate std;
+    let dict_raw =
+        std::fs::read("./dict_tests/dictionary").expect("dictionary fixture should load");
+    let first = DictionaryHandle::from_dictionary(
+        Dictionary::decode_dict(&dict_raw).expect("dictionary should parse"),
+    );
+    let second = DictionaryHandle::from_dictionary(
+        Dictionary::decode_dict(&dict_raw).expect("dictionary should parse"),
+    );
+    let mut scratch: DecoderScratch = DecoderScratch::new(1024);
+    let mut frame = |dict: Option<&DictionaryHandle>| {
+        scratch.reset(1024);
+        if let Some(dict) = dict {
+            scratch.init_from_dict(dict);
+        }
+        scratch.fse.ddict_is_cold
+    };
+    assert!(frame(Some(&first)), "the first dictionary frame is cold");
+    assert!(!frame(Some(&first)), "the same dictionary again is warm");
+    assert!(!frame(Some(&first)), "and stays warm");
+    assert!(!frame(None), "a frame without a dictionary is never cold");
+    assert!(
+        frame(Some(&first)),
+        "a dictionary after a frame without one is cold"
+    );
+    assert!(frame(Some(&second)), "another dictionary is cold");
+    assert!(!frame(Some(&second)), "and warm on its next frame");
 }
 
 #[test]

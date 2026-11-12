@@ -236,6 +236,8 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 offsets_long_share: 0,
                 ddict_is_cold: false,
+                current_dict: 0,
+                previous_dict: 0,
                 ll_source: SeqTableSource::Local,
                 of_source: SeqTableSource::Local,
                 ml_source: SeqTableSource::Local,
@@ -338,13 +340,6 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.fse.attach_dict(dict);
         self.huf.attach_dict();
         self.offset_hist = d.offset_hist;
-        // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
-        // `dctx->ddictIsCold = 1` so the first block of the frame
-        // engages the prefetch decoder regardless of long-offset
-        // share. We do the same here; the first
-        // `decode_and_execute_sequences` call consumes the flag and
-        // resets it to `false`.
-        self.fse.ddict_is_cold = true;
     }
 }
 
@@ -386,6 +381,9 @@ pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
     // alongside `offsets_long_share` so the no-dict path keeps
     // the documented "no behaviour change" property.
     fse.ddict_is_cold = false;
+    // The frame starting now has no dictionary until one is attached; the one
+    // the previous frame used is kept to tell a cold dictionary from a warm one.
+    fse.previous_dict = core::mem::take(&mut fse.current_dict);
 
     // Same lazy-entropy skip as the FSE tables above: a Huffman table that
     // was never built this round (`max_num_bits == 0`) is already in its
@@ -553,18 +551,27 @@ pub struct FSEScratch {
     /// of re-walking `offsets.decode` per block.
     pub offsets_long_share: u32,
     /// Mirrors upstream zstd `ZSTD_DCtx::ddictIsCold`. Set to `true` when a
-    /// dictionary is freshly attached (its FSE / HUF tables are not
-    /// yet in cache); the first sequence-section decode of the
-    /// resulting frame engages the pipelined prefetch decoder
-    /// regardless of long-offset share, then clears the flag so
-    /// subsequent blocks fall back to the `offsets_long_share`
-    /// heuristic. The `num_sequences >= ADVANCE * 2` guard still
-    /// applies: blocks too small to fill the lookahead pipeline take
-    /// the short-block fallback in both the cold-dict and warm cases.
-    /// Without a dictionary the flag stays `false` (cache state of the
-    /// predefined and repeat tables is not considered "cold" in the
+    /// frame attaches a dictionary the previous frame did not decode with
+    /// (its FSE / HUF tables are not yet in cache); the first
+    /// sequence-section decode of the resulting frame engages the
+    /// pipelined prefetch decoder regardless of long-offset share, then
+    /// clears the flag so subsequent blocks fall back to the
+    /// `offsets_long_share` heuristic. The `num_sequences >= ADVANCE * 2`
+    /// guard still applies: blocks too small to fill the lookahead
+    /// pipeline take the short-block fallback in both the cold-dict and
+    /// warm cases. Without a dictionary the flag stays `false` (cache state
+    /// of the predefined and repeat tables is not considered "cold" in the
     /// upstream zstd model).
     pub ddict_is_cold: bool,
+    /// The dictionary the current frame decodes with, by address, and the
+    /// one the previous frame decoded with; zero for none. Upstream compares
+    /// the dictionary's end with the one its context last held
+    /// (`dctx->dictEnd`, zstd_decompress.c, ZSTD_decompressBegin_usingDDict).
+    /// Only the prefetch choice reads them, so a dictionary freed and another
+    /// placed at its address costs at most that choice, as upstream's
+    /// comparison does.
+    current_dict: usize,
+    previous_dict: usize,
     /// Copy-on-write source for each sequence FSE table axis. After
     /// [`DecoderScratch::init_from_dict`] all three point at the shared
     /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
@@ -612,6 +619,8 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             offsets_long_share: 0,
             ddict_is_cold: false,
+            current_dict: 0,
+            previous_dict: 0,
             ll_source: SeqTableSource::Local,
             of_source: SeqTableSource::Local,
             ml_source: SeqTableSource::Local,
@@ -640,6 +649,8 @@ impl FSEScratch {
             );
             addr_of_mut!((*this).offsets_long_share).write(0);
             addr_of_mut!((*this).ddict_is_cold).write(false);
+            addr_of_mut!((*this).current_dict).write(0);
+            addr_of_mut!((*this).previous_dict).write(0);
             addr_of_mut!((*this).ll_source).write(SeqTableSource::Local);
             addr_of_mut!((*this).of_source).write(SeqTableSource::Local);
             addr_of_mut!((*this).ml_source).write(SeqTableSource::Local);
@@ -664,6 +675,7 @@ impl FSEScratch {
         // dictionary attached, so carrying a stale `true` here would mis-arm
         // the prefetch pipeline on the restored frame.
         self.ddict_is_cold = false;
+        self.current_dict = 0;
         self.ll_source = SeqTableSource::Local;
         self.of_source = SeqTableSource::Local;
         self.ml_source = SeqTableSource::Local;
@@ -710,6 +722,9 @@ impl FSEScratch {
     /// stored — so this costs NO refcount bump.
     pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
+        let identity = core::ptr::from_ref(dict.as_dict()).addr();
+        self.ddict_is_cold = identity != self.previous_dict;
+        self.current_dict = identity;
         // Re-arm all three COW axes every frame (a prior frame may have rebuilt
         // any of them to `Local`).
         self.ll_source = SeqTableSource::Dict;
