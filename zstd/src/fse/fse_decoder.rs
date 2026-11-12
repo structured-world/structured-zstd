@@ -79,7 +79,11 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
 
     /// [`Self::init_state`], inlined into the sequence-section setup, which
     /// runs it once per axis per block, as upstream's `ZSTD_initFseState` is.
-    #[inline(always)]
+    /// Forced inline only in optimized builds, as the sequence executor is: at
+    /// `-O0` each of the three copies keeps its own stack slots, which grew the
+    /// setup's debug frame from 1,584 B to 3,184 B (x86_64).
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline)]
     pub(crate) fn init_state_inline<K: CpuKernel>(
         &mut self,
         bits: &mut BitReaderReversed<'_, K>,
