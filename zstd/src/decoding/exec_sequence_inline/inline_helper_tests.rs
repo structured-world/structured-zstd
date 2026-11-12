@@ -38,7 +38,12 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
                 // SAFETY: `offset <= 400` bytes precede the match, the buffer
                 // holds it plus its 31-byte overshoot, and the CPU has AVX2.
                 unsafe {
-                    super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(dst), offset, length)
+                    super::x86::match_copy_doubling_avx2(
+                        out.as_mut_ptr().add(dst),
+                        offset,
+                        length,
+                        crate::cpu_kernel::detect_fast_string_moves(),
+                    )
                 };
                 assert_eq!(
                     out[..expected.len()],
@@ -66,34 +71,41 @@ fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
         return;
     }
     const PREFIX: usize = 9000;
-    for skew in 0..64usize {
-        let prefix: alloc::vec::Vec<u8> = (0..(PREFIX + skew) as u32)
-            .map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        for offset in [4096usize, 5000, 8191] {
-            for length in [256usize, 4095, 4096, 4097, 4096 + 64 + 7, 20000] {
-                let mut expected = prefix.clone();
-                for _ in 0..length {
-                    expected.push(expected[expected.len() - offset]);
+    let erms = std::arch::is_x86_feature_detected!("ermsb");
+    for fast_string_moves in [false, erms] {
+        for skew in 0..64usize {
+            let prefix: alloc::vec::Vec<u8> = (0..(PREFIX + skew) as u32)
+                .map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            for offset in [4096usize, 5000, 8191] {
+                for length in [256usize, 4095, 4096, 4097, 4096 + 64 + 7, 20000] {
+                    let mut expected = prefix.clone();
+                    for _ in 0..length {
+                        expected.push(expected[expected.len() - offset]);
+                    }
+                    let mut out = prefix.clone();
+                    out.resize(prefix.len() + length + 31 + 16, 0xee);
+                    let dst = prefix.len();
+                    // SAFETY: `offset < PREFIX` bytes precede the match, the
+                    // buffer holds it plus its 31-byte overshoot, the CPU has
+                    // AVX2, and has fast string moves when they are asked for.
+                    unsafe {
+                        super::x86::match_copy_doubling_avx2(
+                            out.as_mut_ptr().add(dst),
+                            offset,
+                            length,
+                            fast_string_moves,
+                        )
+                    };
+                    let what = alloc::format!(
+                        "string moves {fast_string_moves} skew {skew} offset {offset} length {length}"
+                    );
+                    assert_eq!(out[..expected.len()], expected[..], "{what}");
+                    assert!(
+                        out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                        "{what} wrote past its overshoot",
+                    );
                 }
-                let mut out = prefix.clone();
-                out.resize(prefix.len() + length + 31 + 16, 0xee);
-                let dst = prefix.len();
-                // SAFETY: `offset < PREFIX` bytes precede the match, the
-                // buffer holds it plus its 31-byte overshoot, and the CPU has
-                // AVX2.
-                unsafe {
-                    super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(dst), offset, length)
-                };
-                assert_eq!(
-                    out[..expected.len()],
-                    expected[..],
-                    "skew {skew} offset {offset} length {length}"
-                );
-                assert!(
-                    out[dst + length + 31..].iter().all(|&b| b == 0xee),
-                    "skew {skew} offset {offset} length {length} wrote past its overshoot",
-                );
             }
         }
     }
@@ -145,6 +157,7 @@ fn tight_tail_writes_the_sequence_like_a_byte_copy() {
                             lit_length,
                             offset,
                             match_length,
+                            crate::cpu_kernel::detect_fast_string_moves(),
                         )
                     };
                     let what = alloc::format!(
@@ -188,7 +201,12 @@ fn match_copy_doubling_reads_only_written_bytes() {
             // the capacity holds it plus its 31-byte overshoot, and the CPU
             // has AVX2.
             unsafe {
-                super::x86::match_copy_doubling_avx2(out.as_mut_ptr().add(PREFIX), offset, length)
+                super::x86::match_copy_doubling_avx2(
+                    out.as_mut_ptr().add(PREFIX),
+                    offset,
+                    length,
+                    crate::cpu_kernel::detect_fast_string_moves(),
+                )
             };
             // SAFETY: the copy wrote every byte of the match.
             let written = unsafe { core::slice::from_raw_parts(out.as_ptr(), PREFIX + length) };

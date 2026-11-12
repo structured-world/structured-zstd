@@ -511,7 +511,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         meta: SeqMeta<'_>,
     ) -> Result<usize, FSETableError> {
         let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
+        // The description parse stores the new log before validating it; with
+        // the decode length cleared, a failed parse leaves the table unbuilt
+        // instead of pairing that log with the previous table's length, which
+        // the state init trusts outside debug builds.
         self.accuracy_log = 0;
+        self.decode_len = 0;
 
         let bytes_read = self.read_probabilities(source, max_log)?;
         self.build_decoding_table_meta(meta)?;

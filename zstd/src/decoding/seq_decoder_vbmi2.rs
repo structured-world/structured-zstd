@@ -160,7 +160,8 @@ macro_rules! execute_one_body {
                         lit_src,
                         seq_ll_v as usize,
                         offset,
-                        seq_ml_v as usize
+                        seq_ml_v as usize,
+                        $buffer.fast_string_moves()
                     );
                     if let Ok(total) = r {
                         // SAFETY: the copy wrote exactly `total` bytes at `tail`.

@@ -993,6 +993,21 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     CpuKernelTag::Scalar
 }
 
+/// Whether the CPU moves strings fast (ERMS), for the AVX2 decoder's long
+/// matches from far back. Answered when a decoder is built and kept in it, as
+/// the kernel tier is; the decode reads the kept answer.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", feature = "std"))]
+pub(crate) fn detect_fast_string_moves() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::arch::is_x86_feature_detected!("ermsb"))
+}
+
+/// Without std the build's baseline answers.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", not(feature = "std")))]
+pub(crate) fn detect_fast_string_moves() -> bool {
+    cfg!(target_feature = "ermsb")
+}
+
 impl CpuKernelTag {
     /// Stable lowercase diagnostic name for this tier (used by
     /// [`active_cpu_kernel_name`] and the bench/dashboard reporting). Pure

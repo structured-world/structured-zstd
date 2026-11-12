@@ -222,3 +222,50 @@ fn every_kernel_advances_the_state_alike() {
         same_as_scalar!(crate::cpu_kernel::SveKernel);
     }
 }
+
+/// A failed rebuild must leave the table without a width: the literal decoder
+/// trusts a nonzero `max_num_bits` to mean a decode table of `1 << max_num_bits`
+/// entries and indexes it unchecked, so a width left over from the previous
+/// table (or one set before a later check rejects it) over an emptied table
+/// would read past it on the next Treeless section.
+#[test]
+fn a_failed_rebuild_leaves_the_table_without_a_width() {
+    // Two direct weights of 1: a valid 2-bit table.
+    let valid = [129u8, 0x11];
+    // Three direct weights of 12: their sum needs 13 bits, past the 12 allowed.
+    let too_wide = [130u8, 0xCC, 0xC0];
+
+    let mut table = HuffmanTable::new();
+    table
+        .build_decoder(&valid)
+        .expect("two weights of 1 build a table");
+    assert_eq!(table.max_num_bits, 2);
+
+    assert!(table.build_decoder(&[]).is_err());
+    assert_eq!(
+        (
+            table.max_num_bits,
+            table.state_mask,
+            table.packed_decode.len()
+        ),
+        (0, 0, 0),
+        "a rebuild failing on its header leaves the previous width"
+    );
+
+    table
+        .build_decoder(&valid)
+        .expect("two weights of 1 build a table");
+    assert!(matches!(
+        table.build_decoder(&too_wide),
+        Err(HuffmanTableError::MaxBitsTooHigh { got: 13 })
+    ));
+    assert_eq!(
+        (
+            table.max_num_bits,
+            table.state_mask,
+            table.packed_decode.len()
+        ),
+        (0, 0, 0),
+        "a rebuild rejected for its width keeps that width"
+    );
+}

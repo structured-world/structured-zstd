@@ -328,7 +328,12 @@ impl HuffmanTable {
     ///
     /// Returns the number of bytes read.
     pub fn build_decoder(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
+        // The width goes with the table: the literal decoder indexes a table
+        // of `1 << max_num_bits` entries unchecked whenever the width is
+        // nonzero, so a failed rebuild must leave neither.
         self.packed_decode.clear();
+        self.max_num_bits = 0;
+        self.state_mask = 0;
 
         let bytes_used = self.read_weights(source)?;
         self.build_table_from_weights()?;
@@ -621,12 +626,13 @@ impl HuffmanTable {
         }
 
         self.bits[self.weights.len()] = max_bits + 1 - last_weight;
-        self.max_num_bits = max_bits;
-        self.state_mask = (1_u64 << max_bits) - 1;
-
+        // Checked before the width is stored, so a rejected width never
+        // reaches the table (see `build_decoder`).
         if max_bits > MAX_MAX_NUM_BITS {
             return Err(err::MaxBitsTooHigh { got: max_bits });
         }
+        self.max_num_bits = max_bits;
+        self.state_mask = (1_u64 << max_bits) - 1;
 
         Ok(max_bits)
     }

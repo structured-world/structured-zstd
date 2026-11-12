@@ -63,6 +63,12 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// soon as the caller has room for it, as upstream copies each decoded
     /// block out of its window buffer (`zstd_decompress.c`, `zdss_flush`).
     delivered: usize,
+    /// Whether long matches from far back may go by `rep movsb`, see
+    /// [`crate::cpu_kernel::detect_fast_string_moves`]. A decoder setting the
+    /// frame layer applies as each frame starts; read only on the rare long
+    /// match path, so it is never a live value in the sequence loop.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    fast_string_moves: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -128,6 +134,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            fast_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -159,6 +167,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            fast_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -236,6 +246,20 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline]
     pub(crate) fn set_block_limit(&mut self, limit: usize) {
         self.block_limit = limit.min(crate::common::MAX_BLOCK_SIZE as usize);
+    }
+
+    /// Apply the decoder's answer to [`crate::cpu_kernel::detect_fast_string_moves`].
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn set_fast_string_moves(&mut self, fast: bool) {
+        self.fast_string_moves = fast;
+    }
+
+    /// Whether long matches from far back may go by `rep movsb`.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn fast_string_moves(&self) -> bool {
+        self.fast_string_moves
     }
 
     /// What the frame says it will produce in total, when it says so. The

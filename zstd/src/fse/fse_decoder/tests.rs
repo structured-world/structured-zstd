@@ -173,3 +173,25 @@ fn is_populated_detects_built_rle_table() {
         "an RLE table (decode_len = 1, accuracy_log = 0) must report populated"
     );
 }
+
+/// A rebuild that fails while reading the table description stores the new
+/// accuracy log before rejecting it. The decode length must not survive from
+/// the previous table: the state init trusts `decode_len == 1 << accuracy_log`
+/// outside debug builds, so an RLE table's single entry under a larger log
+/// would let a Repeat-mode section read past it.
+#[test]
+fn a_rebuild_failing_on_its_description_leaves_the_table_unbuilt() {
+    let mut t = SeqFSETable::new(52);
+    t.build_rle(5);
+    assert!(t.is_populated());
+    // Low nibble 15: accuracy log 5 + 15 = 20, past every table's limit.
+    let res = t.build_decoder(&[0x0F, 0, 0, 0], 9);
+    assert!(
+        matches!(res, Err(FSETableError::AccLogTooBig { .. })),
+        "{res:?}"
+    );
+    assert!(
+        !t.is_populated(),
+        "the RLE table's decode length outlived a failed rebuild"
+    );
+}

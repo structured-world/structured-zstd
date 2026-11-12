@@ -214,6 +214,10 @@ pub struct FrameDecoder {
     /// caller-sized target, so detecting there put an atomic read and a branch
     /// on every call; feature detection belongs before the work, not inside it.
     kernel: crate::cpu_kernel::CpuKernelTag,
+    /// Whether long matches from far back may go by `rep movsb`, resolved with
+    /// `kernel` and applied to each frame's buffer.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    fast_string_moves: bool,
     /// A dictionary [`Self::arm_dict`] installed before the decoder had a
     /// frame state to hold it, taken by the first
     /// [`Self::reset_with_active_dict`]. Only ever `Some` while `state` is
@@ -877,6 +881,15 @@ impl DecoderScratchKind {
         }
     }
 
+    /// Hand the decoder's fast-string-move answer to the inner `DecodeBuffer`.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    fn set_fast_string_moves(&mut self, fast: bool) {
+        match self {
+            Self::Ring(s) => s.buffer.set_fast_string_moves(fast),
+            Self::Flat(s) => s.buffer.set_fast_string_moves(fast),
+        }
+    }
+
     /// Forward the drain-time hash toggle to the inner `DecodeBuffer`
     /// (streaming path). Called by the frame layer from the decoder's
     /// `ContentChecksum` mode before each decode.
@@ -1255,6 +1268,8 @@ impl FrameDecoder {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
             kernel: crate::cpu_kernel::detect_cpu_kernel(),
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            fast_string_moves: crate::cpu_kernel::detect_fast_string_moves(),
             armed_dict: None,
             #[cfg(feature = "legacy")]
             legacy: None,
@@ -1297,6 +1312,17 @@ impl FrameDecoder {
         }
     }
 
+    /// Hand the decoder's fast-string-move answer to the frame state's buffer,
+    /// as each frame starts (a reset may rebuild that buffer).
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    fn apply_fast_string_moves(&mut self) {
+        let fast = self.fast_string_moves;
+        if let Some(state) = self.state.as_mut() {
+            state.decoder_scratch.set_fast_string_moves(fast);
+        }
+    }
+
     /// Read the frame header from `source` into the frame state, creating it
     /// on first use. A v0.5-v0.7 frame is started instead when its magic
     /// number is what the header begins with, its dictionary chosen from
@@ -1324,7 +1350,11 @@ impl FrameDecoder {
             }
         };
         match parsed {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+                self.apply_fast_string_moves();
+                Ok(true)
+            }
             #[cfg(feature = "legacy")]
             Err(FrameDecoderError::ReadFrameHeaderError(
                 crate::decoding::errors::ReadFrameHeaderError::BadMagicNumber(magic),
@@ -2380,6 +2410,8 @@ impl FrameDecoder {
                     .and_then(|state| state.frame_header.dictionary_id())
             }
         };
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        self.apply_fast_string_moves();
         #[cfg(feature = "lsm")]
         if let Some(state) = self.state.as_ref() {
             self.validate_expectations(&state.frame_header)?;
@@ -2628,6 +2660,8 @@ impl FrameDecoder {
                 self.armed_dict = None;
             }
         }
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        self.apply_fast_string_moves();
         #[cfg(feature = "lsm")]
         {
             let header = &self
@@ -4994,6 +5028,8 @@ impl FrameDecoder {
         let backend = UserSliceBackend::from_slice(output);
         let mut buffer = DecodeBuffer::from_backend(backend, window_size);
         buffer.set_block_limit(block_limit);
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        buffer.set_fast_string_moves(self.fast_string_moves);
         let mut direct = DirectScratch {
             huf,
             fse,
