@@ -643,7 +643,35 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
         }
         decoder.init_state(&mut br);
-        while br.bits_remaining() > -(table.max_num_bits as isize) {
+        // Four symbols per refill, written straight into the reserved room,
+        // while each of the four would pass the loop condition below (a
+        // symbol takes at most `max_bits`, so more than `2 * max_bits` left
+        // keeps the fourth above `-max_bits`) and four fit the section:
+        // upstream's `HUF_decodeStreamX1` reloads once per four symbols on a
+        // 64-bit container. The loop below finishes the stream symbol by
+        // symbol, exactly as before, so every input decodes as it did.
+        let max_bits = table.max_num_bits;
+        let fast_floor = 2 * max_bits as isize;
+        let limit = base + regen;
+        let target_ptr: *mut u8 = target.as_mut_ptr();
+        let mut cursor = base;
+        while cursor + 4 <= limit && br.bits_remaining() > fast_floor {
+            br.ensure_bits(4 * max_bits);
+            for _ in 0..4 {
+                // SAFETY: `target.reserve(regen)` above leaves room through
+                // `base + regen`, and `cursor + 4 <= limit` keeps the four
+                // writes inside it.
+                unsafe {
+                    target_ptr
+                        .add(cursor)
+                        .write(decoder.decode_symbol_and_advance_no_refill(&mut br));
+                }
+                cursor += 1;
+            }
+        }
+        // SAFETY: every byte in `[base, cursor)` was written above.
+        unsafe { target.set_len(cursor) };
+        while br.bits_remaining() > -(max_bits as isize) {
             target.push(decoder.decode_symbol_and_advance(&mut br));
         }
         let expected = -(table.max_num_bits as isize);
