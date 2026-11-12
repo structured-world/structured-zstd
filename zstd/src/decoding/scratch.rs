@@ -236,8 +236,9 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 offsets_long_share: 0,
                 ddict_is_cold: false,
-                current_dict: 0,
-                previous_dict: 0,
+                dict_identity: 0,
+                dict_frame: 0,
+                frame: 0,
                 ll_source: SeqTableSource::Local,
                 of_source: SeqTableSource::Local,
                 ml_source: SeqTableSource::Local,
@@ -381,9 +382,9 @@ pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
     // alongside `offsets_long_share` so the no-dict path keeps
     // the documented "no behaviour change" property.
     fse.ddict_is_cold = false;
-    // The frame starting now has no dictionary until one is attached; the one
-    // the previous frame used is kept to tell a cold dictionary from a warm one.
-    fse.previous_dict = core::mem::take(&mut fse.current_dict);
+    // A new frame: a dictionary attached to it is warm only if the previous
+    // frame attached the same one.
+    fse.frame += 1;
 
     // Same lazy-entropy skip as the FSE tables above: a Huffman table that
     // was never built this round (`max_num_bits == 0`) is already in its
@@ -563,15 +564,18 @@ pub struct FSEScratch {
     /// of the predefined and repeat tables is not considered "cold" in the
     /// upstream zstd model).
     pub ddict_is_cold: bool,
-    /// The dictionary the current frame decodes with, by address, and the
-    /// one the previous frame decoded with; zero for none. Upstream compares
-    /// the dictionary's end with the one its context last held
-    /// (`dctx->dictEnd`, zstd_decompress.c, ZSTD_decompressBegin_usingDDict).
-    /// Only the prefetch choice reads them, so a dictionary freed and another
-    /// placed at its address costs at most that choice, as upstream's
-    /// comparison does.
-    current_dict: usize,
-    previous_dict: usize,
+    /// The dictionary last attached, by address (zero for none), the frame it
+    /// was attached on, and the current frame. A dictionary is warm only when
+    /// the previous frame attached the same one: upstream compares the
+    /// dictionary's end with the one its context last held (`dctx->dictEnd`,
+    /// zstd_decompress.c, ZSTD_decompressBegin_usingDDict), which a frame
+    /// without a dictionary clears. Counting frames lets a frame without one
+    /// pay a single increment instead of clearing state. Only the prefetch
+    /// choice reads them, so a dictionary freed and another placed at its
+    /// address costs at most that choice, as upstream's comparison does.
+    dict_identity: usize,
+    dict_frame: u64,
+    frame: u64,
     /// Copy-on-write source for each sequence FSE table axis. After
     /// [`DecoderScratch::init_from_dict`] all three point at the shared
     /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
@@ -619,8 +623,9 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             offsets_long_share: 0,
             ddict_is_cold: false,
-            current_dict: 0,
-            previous_dict: 0,
+            dict_identity: 0,
+            dict_frame: 0,
+            frame: 0,
             ll_source: SeqTableSource::Local,
             of_source: SeqTableSource::Local,
             ml_source: SeqTableSource::Local,
@@ -649,8 +654,9 @@ impl FSEScratch {
             );
             addr_of_mut!((*this).offsets_long_share).write(0);
             addr_of_mut!((*this).ddict_is_cold).write(false);
-            addr_of_mut!((*this).current_dict).write(0);
-            addr_of_mut!((*this).previous_dict).write(0);
+            addr_of_mut!((*this).dict_identity).write(0);
+            addr_of_mut!((*this).dict_frame).write(0);
+            addr_of_mut!((*this).frame).write(0);
             addr_of_mut!((*this).ll_source).write(SeqTableSource::Local);
             addr_of_mut!((*this).of_source).write(SeqTableSource::Local);
             addr_of_mut!((*this).ml_source).write(SeqTableSource::Local);
@@ -675,7 +681,7 @@ impl FSEScratch {
         // dictionary attached, so carrying a stale `true` here would mis-arm
         // the prefetch pipeline on the restored frame.
         self.ddict_is_cold = false;
-        self.current_dict = 0;
+        self.dict_identity = 0;
         self.ll_source = SeqTableSource::Local;
         self.of_source = SeqTableSource::Local;
         self.ml_source = SeqTableSource::Local;
@@ -723,8 +729,10 @@ impl FSEScratch {
     pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
         let identity = core::ptr::from_ref(dict.as_dict()).addr();
-        self.ddict_is_cold = identity != self.previous_dict;
-        self.current_dict = identity;
+        // `frame` counts resets, one per frame; 2^64 of them never happen.
+        self.ddict_is_cold = identity != self.dict_identity || self.dict_frame + 1 != self.frame;
+        self.dict_identity = identity;
+        self.dict_frame = self.frame;
         // Re-arm all three COW axes every frame (a prior frame may have rebuilt
         // any of them to `Local`).
         self.ll_source = SeqTableSource::Dict;
