@@ -660,15 +660,23 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         let limit = base + regen;
         let target_ptr: *mut u8 = target.as_mut_ptr();
         let mut cursor = base;
+        // The lookup takes the next `max_bits` bits as upstream's
+        // `BIT_lookBitsFast` does: shift the consumed bits out, then down by
+        // a constant, with no mask and no shift amount to compute on the
+        // chain each symbol waits on. Equal to `peek_bits(max_bits)` while
+        // `bits_consumed + max_bits <= 64`, which the refill below holds.
+        let index_shift = u32::from(64 - max_bits);
         while cursor + 4 <= limit && br.bits_remaining() > fast_floor {
             br.ensure_bits(4 * max_bits);
             for _ in 0..4 {
+                debug_assert!(br.bits_consumed + max_bits <= 64);
                 // SAFETY: `max_bits` bits index below `1 << max_bits`, the
                 // table's length; `target.reserve(regen)` above leaves room
                 // through `base + regen`, and `cursor + 4 <= limit` keeps the
                 // four writes inside it.
                 unsafe {
-                    let entry = *packed.get_unchecked(br.peek_bits(max_bits) as usize);
+                    let index = (br.bit_container << br.bits_consumed) >> index_shift;
+                    let entry = *packed.get_unchecked(index as usize);
                     br.consume(entry as u8);
                     target_ptr.add(cursor).write((entry >> 8) as u8);
                 }
