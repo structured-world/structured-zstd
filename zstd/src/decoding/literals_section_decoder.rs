@@ -628,7 +628,6 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
     } else {
         //just decode the one stream
         assert!(num_streams == 1);
-        let mut decoder = HuffmanDecoder::new(table);
         let mut br = BitReaderReversed::<K>::new(source);
         let mut skipped_bits = 0;
         loop {
@@ -642,44 +641,57 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
             //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
         }
-        decoder.init_state(&mut br);
+        // Each symbol is the table entry the next `max_bits` bits index, and
+        // takes the entry's code length off the stream, as upstream's
+        // `HUF_decodeSymbolX1` looks the bits up and skips them; no state
+        // carries those bits between symbols, so `bits_remaining` counts them
+        // as unread and the stream ends at 0 left.
+        let max_bits = table.max_num_bits;
+        let packed = &table.packed_decode[..];
+        debug_assert_eq!(packed.len(), 1usize << max_bits);
         // Four symbols per refill, written straight into the reserved room,
         // while each of the four would pass the loop condition below (a
-        // symbol takes at most `max_bits`, so more than `2 * max_bits` left
-        // keeps the fourth above `-max_bits`) and four fit the section:
-        // upstream's `HUF_decodeStreamX1` reloads once per four symbols on a
-        // 64-bit container. The loop below finishes the stream symbol by
-        // symbol, exactly as before, so every input decodes as it did.
-        let max_bits = table.max_num_bits;
-        let fast_floor = 2 * max_bits as isize;
+        // symbol takes at most `max_bits`, so more than `3 * max_bits` left
+        // keeps the fourth's lookup window inside the stream) and four fit
+        // the section: upstream's `HUF_decodeStreamX1` reloads once per four
+        // symbols on a 64-bit container. The loop below finishes the stream
+        // symbol by symbol.
+        let fast_floor = 3 * max_bits as isize;
         let limit = base + regen;
         let target_ptr: *mut u8 = target.as_mut_ptr();
         let mut cursor = base;
         while cursor + 4 <= limit && br.bits_remaining() > fast_floor {
             br.ensure_bits(4 * max_bits);
             for _ in 0..4 {
-                // SAFETY: `target.reserve(regen)` above leaves room through
-                // `base + regen`, and `cursor + 4 <= limit` keeps the four
-                // writes inside it.
+                // SAFETY: `max_bits` bits index below `1 << max_bits`, the
+                // table's length; `target.reserve(regen)` above leaves room
+                // through `base + regen`, and `cursor + 4 <= limit` keeps the
+                // four writes inside it.
                 unsafe {
-                    target_ptr
-                        .add(cursor)
-                        .write(decoder.decode_symbol_and_advance_no_refill(&mut br));
+                    let entry = *packed.get_unchecked(br.peek_bits(max_bits) as usize);
+                    br.consume(entry as u8);
+                    target_ptr.add(cursor).write((entry >> 8) as u8);
                 }
                 cursor += 1;
             }
         }
         // SAFETY: every byte in `[base, cursor)` was written above.
         unsafe { target.set_len(cursor) };
-        while br.bits_remaining() > -(max_bits as isize) {
-            target.push(decoder.decode_symbol_and_advance(&mut br));
+        while br.bits_remaining() > 0 {
+            br.ensure_bits(max_bits);
+            // SAFETY: as above.
+            let entry = unsafe { *packed.get_unchecked(br.peek_bits(max_bits) as usize) };
+            br.consume(entry as u8);
+            target.push((entry >> 8) as u8);
         }
-        let expected = -(table.max_num_bits as isize);
-        if br.bits_remaining() != expected {
+        if br.bits_remaining() != 0 {
             target.truncate(base);
+            // Reported as the reader that carried the lookup bits as state
+            // counted them, `max_bits` lower.
+            let max_bits = max_bits as isize;
             return Err(DecompressLiteralsError::BitstreamReadMismatch {
-                read_til: br.bits_remaining(),
-                expected,
+                read_til: br.bits_remaining() - max_bits,
+                expected: -max_bits,
             });
         }
         bytes_read += source.len() as u32;

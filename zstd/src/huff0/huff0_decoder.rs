@@ -109,6 +109,10 @@ impl<'t> HuffmanDecoder<'t> {
     /// already in hand, and the cycles overlap across repeats on every decode
     /// shape. So the mask is not a fallback that the accelerated tiers give up
     /// something by taking: it is the better form, and no tier overrides it.
+    ///
+    /// The literals decoder reads a single stream without this state; the
+    /// round-trip check and its tests still step through it.
+    #[cfg(any(test, feature = "fuzz-exports"))]
     #[inline(always)]
     pub fn decode_symbol_and_advance<K: crate::cpu_kernel::CpuKernel>(
         &mut self,
