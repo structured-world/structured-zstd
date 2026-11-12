@@ -71,6 +71,35 @@ extern crate std;
 #[cfg(not(feature = "rustc-dep-of-std"))]
 extern crate alloc;
 
+// A tier of the target's own architecture that the target cannot enable is a
+// build configuration error, not a tier to drop silently: a soft-float target
+// (no SSE2 on x86_64, no NEON on aarch64) refuses the vector features the tier
+// is compiled with. Tiers of another architecture stay out of the build.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_feature = "sse2"),
+    any(
+        feature = "kernel-sse",
+        feature = "kernel-bmi2",
+        feature = "kernel-avx2",
+        feature = "kernel-vbmi2"
+    )
+))]
+compile_error!(
+    "the x86 kernel tiers (`kernel-sse`, `kernel-bmi2`, `kernel-avx2`, `kernel-vbmi2`) need a \
+     target with SSE2; this soft-float target cannot enable them: build with \
+     `--no-default-features` and leave them out"
+);
+#[cfg(all(
+    target_arch = "aarch64",
+    not(target_feature = "neon"),
+    any(feature = "kernel-neon", feature = "kernel-sve")
+))]
+compile_error!(
+    "the aarch64 kernel tiers (`kernel-neon`, `kernel-sve`) need a target with NEON; this \
+     soft-float target cannot enable them: build with `--no-default-features` and leave them out"
+);
+
 #[cfg(feature = "std")]
 pub(crate) const VERBOSE: bool = false;
 

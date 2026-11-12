@@ -442,7 +442,13 @@ pub(crate) unsafe fn priceset_range_nonabort_avx2<const ACCURATE: bool>(
 /// deinterleaves the 4 contiguous `[price, generation]` pairs natively into
 /// two registers (prices, gens) — no shuffle chain. `Some(prices)` only when
 /// all 4 generations equal `stamp` (`vminvq` of the equality mask is all-ones).
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+/// A soft-float aarch64 target (no NEON) cannot enable it, so the NEON
+/// kernels do not exist there.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon"
+))]
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn priceset_cached_prices4_neon(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
@@ -462,7 +468,11 @@ unsafe fn priceset_cached_prices4_neon(cells: &[[u32; 2]], stamp: u32) -> Option
 /// NEON 4-lane `next_cost < node_price` bitmask. NEON has an unsigned compare
 /// (`vcltq_u32`) but no movemask; AND the all-ones lane mask with lane weights
 /// `[1,2,4,8]` and horizontal-add (`vaddvq_u32`) to pack the 4 bits.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon"
+))]
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
@@ -478,7 +488,11 @@ unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32])
     vaddvq_u32(bits) as u8
 }
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon"
+))]
 #[target_feature(enable = "neon")]
 #[inline]
 #[allow(clippy::too_many_arguments)]

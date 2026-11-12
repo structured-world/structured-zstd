@@ -626,6 +626,10 @@ jobs:
       - name: Clippy (embedded — kernel-scalar only)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,hash -- -D warnings
+      # The x86 tiers' code without std, on the host, which can enable them.
+      - name: Clippy (no_std + x86 tiers)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel-avx2,hash -- -D warnings
       - name: Clippy (embedded_minimal — kernel-scalar + std)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,std,hash -- -D warnings
@@ -641,9 +645,10 @@ jobs:
       # float unit. A kernel target has neither (x86_64-unknown-none is
       # -sse,-sse2,...,+soft-float), so a vector type that
       # reaches codegen there fails only on that target, as an LLVM error
-      # rather than a type error. Build for it directly, with no SIMD tier and
-      # with the x86 tiers enabled (they must stay inert without the target
-      # feature), in both profiles since -O0 and -O3 lower differently.
+      # rather than a type error. Build for it directly, with no SIMD tier, in
+      # both profiles since -O0 and -O3 lower differently. The x86 tiers cannot
+      # be enabled on it, and asking for them is refused with a message that
+      # says so.
       - name: Install bare-metal target
         run: rustup target add x86_64-unknown-none
       - name: Build (x86_64-unknown-none)
@@ -651,10 +656,17 @@ jobs:
         run: |
           for profile in dev release; do
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features hash
-            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features caller-workspace,hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features legacy,hash
           done
+      - name: Refuse the x86 tiers (x86_64-unknown-none)
+        working-directory: zstd
+        run: |
+          if cargo build -p structured-zstd --lib --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash 2> refused.log; then
+            echo "the x86 tiers built on a soft-float target" >&2
+            exit 1
+          fi
+          grep -q "the x86 kernel tiers" refused.log
 
   wasm:
     # #347 / #348: the wasm32 simd128 kernel tier + the npm package
