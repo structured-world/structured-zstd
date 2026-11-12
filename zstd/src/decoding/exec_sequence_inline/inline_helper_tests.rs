@@ -99,6 +99,68 @@ fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
     }
 }
 
+/// A sequence at the very end of an output, its overshoot end `cap_w` 1 to 31
+/// bytes before the sequence's own end, writes what a byte-by-byte copy
+/// writes, whether its match takes the split copy (offset 32 or more) or the
+/// exact one, and writes nothing past the memory the overshoot may use.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn tight_tail_writes_the_sequence_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 5000;
+    let prefix: alloc::vec::Vec<u8> = (0..PREFIX as u32)
+        .map(|b| (b.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    let literals: alloc::vec::Vec<u8> = (0..64u8).map(|b| b ^ 0xa5).collect();
+    for offset in [1usize, 7, 16, 31, 32, 33, 100, 380, 4096] {
+        for lit_length in [0usize, 1, 17] {
+            for match_length in [3usize, 40, 255, 256, 300, 3600] {
+                for short in 1..32usize {
+                    let end = PREFIX + lit_length + match_length;
+                    let Some(cap_w) = end.checked_sub(short) else {
+                        continue;
+                    };
+                    if cap_w < PREFIX {
+                        continue;
+                    }
+                    let mut expected = prefix.clone();
+                    expected.extend_from_slice(&literals[..lit_length]);
+                    for _ in 0..match_length {
+                        expected.push(expected[expected.len() - offset]);
+                    }
+                    let mut out = prefix.clone();
+                    out.resize(cap_w + 31 + 16, 0xee);
+                    // SAFETY: the buffer holds the sequence (`end <= cap_w + 31`)
+                    // and the overshoot end; the literals hold 16 bytes past
+                    // their length; `offset <= PREFIX` bytes precede the match;
+                    // the host has AVX2.
+                    unsafe {
+                        super::x86::exec_tight_tail_avx2(
+                            out.as_mut_ptr(),
+                            PREFIX,
+                            cap_w,
+                            literals.as_ptr(),
+                            lit_length,
+                            offset,
+                            match_length,
+                        )
+                    };
+                    let what = alloc::format!(
+                        "offset {offset} lit {lit_length} match {match_length} short {short}"
+                    );
+                    assert_eq!(out[..end], expected[..], "{what}");
+                    assert!(
+                        out[cap_w + 31..].iter().all(|&b| b == 0xee),
+                        "{what} wrote past the overshoot end"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The doubling copy reads only bytes already written: a destination grown
 /// in place leaves the bytes past the write uninitialised (`FlatBuf`'s spare
 /// capacity), and a load that reaches into them reads uninitialised memory

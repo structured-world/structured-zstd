@@ -165,12 +165,14 @@ macro_rules! exec_sequence_avx2_inline_at {
             } else {
                 sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
                     // Tight tail: the write fits but the overshoot would not.
-                    // SAFETY: as below, with the exact copy in place of the
-                    // overshooting one.
+                    // SAFETY: `sequence_output_fits` holds the sequence within
+                    // `cap`, `cap_w` is this cursor's overshoot end, and
+                    // `offset_v` bytes of output precede the match.
                     unsafe {
-                        $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
+                        $crate::decoding::exec_sequence_inline::x86::exec_tight_tail_avx2(
                             base,
                             tail,
+                            cap_w,
                             lit_src_v,
                             lit_length_v,
                             offset_v,
@@ -573,6 +575,70 @@ pub(crate) mod x86 {
                     distance *= 2;
                 }
             }
+        }
+    }
+
+    /// A sequence whose bytes end within the output but whose overshoot would
+    /// not. When its literals end within `cap_w` and its match comes from 32
+    /// bytes back or more, the match goes by the overshooting copies up to
+    /// `cap_w`, whose overshoot stays inside the output's memory, and only the
+    /// rest, under 32 bytes, by an exact copy, as upstream's `ZSTD_safecopy`
+    /// wildcopies to `oend_w` and finishes byte by byte
+    /// (zstd_decompress_block.c, ZSTD_execSequenceEnd). Anything else takes
+    /// the exact copy whole. The last match of a frame filling its buffer
+    /// exactly is the case: it would otherwise go by libc memcpy, a call per
+    /// doubled piece.
+    ///
+    /// Out of line: it runs once at the end of such a frame.
+    ///
+    /// # Safety
+    /// The CPU has AVX2; `base` is valid for writes through
+    /// `tail + lit_length + match_length`, which ends past `cap_w`, and
+    /// through `cap_w + 31`; `lit_src` is readable for the literal length
+    /// rounded up to 16; `offset <= tail + lit_length`.
+    #[cfg(feature = "kernel-avx2")]
+    #[target_feature(enable = "avx2")]
+    #[inline(never)]
+    pub(crate) unsafe fn exec_tight_tail_avx2(
+        base: *mut u8,
+        tail: usize,
+        cap_w: usize,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) {
+        unsafe {
+            let match_at = tail + lit_length;
+            // The match runs past `cap_w` (the caller's branch); what lies past
+            // it is the rest, at most the 31 bytes between `cap_w` and the end
+            // of an output whose memory reaches its write limit, and below the
+            // offset, so its exact copy reads no byte it writes.
+            if offset < 32 || match_at > cap_w || match_at + match_length - cap_w >= 32 {
+                return super::exec_sequence_bounded_copy(
+                    base,
+                    tail,
+                    lit_src,
+                    lit_length,
+                    offset,
+                    match_length,
+                );
+            }
+            let op_lit = base.add(tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+            let head = cap_w - match_at;
+            let rest = match_length - head;
+            let op_match = base.add(match_at);
+            if head >= 256 {
+                match_copy_doubling_avx2(op_match, offset, head);
+            } else if head > 0 {
+                wildcopy_no_overlap(op_match, op_match.sub(offset), head);
+            }
+            let at = op_match.add(head);
+            copy_short_exact(at, at.sub(offset), rest);
         }
     }
 
