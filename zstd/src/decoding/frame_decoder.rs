@@ -214,11 +214,6 @@ pub struct FrameDecoder {
     /// caller-sized target, so detecting there put an atomic read and a branch
     /// on every call; feature detection belongs before the work, not inside it.
     kernel: crate::cpu_kernel::CpuKernelTag,
-    /// Whether long matches from far back may go by `rep movsb`, resolved with
-    /// `kernel`, for the buffer a direct decode builds per frame. The scratch
-    /// buffers take the answer when they are built.
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-    fast_string_moves: bool,
     /// A dictionary [`Self::arm_dict`] installed before the decoder had a
     /// frame state to hold it, taken by the first
     /// [`Self::reset_with_active_dict`]. Only ever `Some` while `state` is
@@ -1260,8 +1255,6 @@ impl FrameDecoder {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
             kernel: crate::cpu_kernel::detect_cpu_kernel(),
-            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-            fast_string_moves: crate::cpu_kernel::detect_fast_string_moves(),
             armed_dict: None,
             #[cfg(feature = "legacy")]
             legacy: None,
@@ -4979,6 +4972,13 @@ impl FrameDecoder {
             None
         };
         let block_limit = state.block_limit;
+        // The scratch's buffer took the string-move answer when it was built;
+        // this frame's buffer over the caller's slice copies it from there.
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        let fast_string_moves = match &state.decoder_scratch {
+            DecoderScratchKind::Flat(s) => s.buffer.fast_string_moves(),
+            DecoderScratchKind::Ring(s) => s.buffer.fast_string_moves(),
+        };
         let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => (
@@ -5002,7 +5002,7 @@ impl FrameDecoder {
         let mut buffer = DecodeBuffer::from_backend(backend, window_size);
         buffer.set_block_limit(block_limit);
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        buffer.set_fast_string_moves(self.fast_string_moves);
+        buffer.set_fast_string_moves(fast_string_moves);
         let mut direct = DirectScratch {
             huf,
             fse,
