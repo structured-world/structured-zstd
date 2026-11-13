@@ -335,8 +335,16 @@ pub type FSETable = FSETableImpl<Entry, 64>;
 pub type SeqFSETable = FSETableImpl<SeqSymbol, 512>;
 
 impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
+    /// The build's spread scratch is sized for `MAX_SPREAD` states, so a table
+    /// type with more capacity than that does not compile.
+    const CAP_FITS_SPREAD: () = assert!(
+        CAP <= MAX_SPREAD,
+        "an FSE table holds at most MAX_SPREAD states"
+    );
+
     /// Initialize a new empty Finite State Entropy decoding table.
     pub fn new(max_symbol: u8) -> Self {
+        let () = Self::CAP_FITS_SPREAD;
         FSETableImpl {
             max_symbol,
             // Lazy: the first `read_probabilities` grows it. Pre-reserving 256
@@ -707,7 +715,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
         let table_size = 1 << accuracy_log;
         // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
-        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
+        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both
+        // (`CAP <= MAX_SPREAD` is checked when the table type is compiled).
         // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
         // `build_from_probabilities` accepts acc_log up to
         // `ENTRY_MAX_ACCURACY_LOG` (16) and is reachable from fuzz, so reject an
@@ -795,13 +804,13 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 // 8 copies of the symbol byte; lay down 8 at a time (counts are
                 // mostly <= 8 on small table-logs, so the inner loop rarely runs).
                 let word = ((symbol as u8) as u64).wrapping_mul(0x0101_0101_0101_0101);
-                // The probabilities sum to `table_size <= 512`, so `pos + n`
-                // stays within it and each 8-byte write within the 8 bytes of
-                // slack past it.
+                // The probabilities sum to `table_size <= CAP <= MAX_SPREAD`, so
+                // `pos + n` stays within it and each 8-byte write within the 8
+                // bytes of slack past it.
                 assert!(pos + n <= table_size, "FSE lay-down past the table");
                 let lay = in_order.as_mut_ptr().cast::<u8>();
                 // SAFETY: `pos + i + 8 <= pos + n + 8 <= table_size + 8 <=
-                // FSE_FAST_SPREAD_BUF` for every write below.
+                // MAX_SPREAD + 8 == FSE_FAST_SPREAD_BUF` for every write below.
                 unsafe {
                     lay.add(pos).cast::<u64>().write_unaligned(word);
                     let mut i = 8;
@@ -1341,12 +1350,12 @@ fn mismatch_diagnostic(_probs: &[i32]) -> Vec<i32> {
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
 /// In-order spread scratch for the fast `build_decoding_table_inner` path:
-/// the largest table reaching it is `1 << 9 = 512` entries (the
-/// `table_size <= CAP` guard in `build_decoding_table_inner` rejects anything
-/// larger before the spread runs), plus 8 bytes of slack so the 8-byte symbol
-/// lay-down can over-write past the last symbol without bounds-checking each
-/// tail write.
-const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
+/// the largest table reaching it is `MAX_SPREAD` entries (no table type has
+/// more capacity, and the `table_size <= CAP` guard in
+/// `build_decoding_table_inner` rejects anything larger before the spread
+/// runs), plus 8 bytes of slack so the 8-byte symbol lay-down can over-write
+/// past the last symbol without bounds-checking each tail write.
+const FSE_FAST_SPREAD_BUF: usize = MAX_SPREAD + 8;
 
 /// The per-state pass of a table build (upstream zstd `ZSTD_buildFSETable_body`):
 /// each state takes the next count of the symbol spread there, which gives its
