@@ -4842,6 +4842,7 @@ impl FrameDecoder {
     /// frame's checksum (or after the last block, when the frame
     /// has `content_checksum_flag = 0`). `self.state.frame_finished`
     /// is set so [`Self::is_finished`] reports `true`.
+    #[inline(always)]
     fn run_direct_decode(
         &mut self,
         input: &mut &[u8],
@@ -4852,22 +4853,37 @@ impl FrameDecoder {
         {
             self.direct_frames += 1;
         }
-        use super::block_decoder;
-        use super::decode_buffer::DecodeBuffer;
-        use super::scratch::DirectScratch;
-        use super::user_slice_buf::UserSliceBackend;
-        use crate::io::Read;
-        use FrameDecoderError as err;
+        // The first byte of a block header holds Last_Block in bit 0 and
+        // Block_Type in bits 1-2, Raw_Block being 0 (RFC 8878 3.1.1.2). Only
+        // a frame whose first block is its last and raw can take the
+        // single-block copy, and every other frame goes straight to the block
+        // loop on this one test.
+        if let [first, ..] = **input
+            && first & 0b111 == 0b001
+            && let Some(written) = self.copy_single_raw_frame(input, output, declared_size)
+        {
+            return Ok(written);
+        }
+        self.run_direct_blocks(input, output, declared_size)
+    }
 
-        // The most the frame may write: its declared size, or the caller's
-        // slice for a frame that declares none.
-        let limit = declared_size.unwrap_or(output.len() as u64);
-        // Output past `limit`: the frame lied about its size, or it does not
-        // fit the caller's slice.
-        let overflow = |produced: u64| match declared_size {
-            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
-            None => err::TargetTooSmall,
-        };
+    /// A frame that is a single raw block spanning its whole content, copied
+    /// into `output` as upstream copies it (`ZSTD_copyRawBlock`, one
+    /// `memmove`, in `ZSTD_decompressFrame`), without the per-frame buffer
+    /// and the block loop. Incompressible payloads (random or
+    /// already-compressed data) produce exactly this shape, and on a small
+    /// one the per-frame machinery, not the copy, is the cost. `None` when the
+    /// frame is not that shape or its checksum is cut short, with `input`
+    /// untouched. Out of line, apart from the block loop, so that neither
+    /// shapes the other's code; it cannot fail, so the answer fits registers.
+    #[inline(never)]
+    fn copy_single_raw_frame(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        declared_size: Option<u64>,
+    ) -> Option<usize> {
+        use super::block_decoder;
 
         let kernel = self.kernel;
         let state = self
@@ -4875,15 +4891,6 @@ impl FrameDecoder {
             .as_mut()
             .expect("caller ensures init populated state");
 
-        // Fast path: a frame that is a single RAW block spanning the whole
-        // declared content. Upstream zstd handles this as one `ZSTD_copyRawBlock`
-        // (a `memmove`) inside `ZSTD_decompressFrame`; do the same here — a direct
-        // `copy_from_slice` into the caller's output slice — skipping the
-        // `DirectScratch` / `DecodeBuffer` / `UserSliceBackend` wrapper
-        // construction and the general per-block loop. Incompressible payloads
-        // (random / already-compressed data) emit exactly this shape, so the win
-        // lands on small high-entropy frames where the per-frame machinery, not
-        // the 1-block copy, dominates.
         {
             let mut probe = *input;
             let mut header_dec = block_decoder::with_kernel(kernel);
@@ -4897,11 +4904,17 @@ impl FrameDecoder {
                 // block maximum is checked here as the general path checks it:
                 // a block past it is malformed, and the shortcut must not be
                 // the way around that.
+                // A frame whose declared checksum is cut short is left to the
+                // block loop, which reports it: the copy then has nothing to
+                // fail on, and its answer travels in registers.
+                let has_checksum = state.frame_header.descriptor.content_checksum_flag();
+                let trailer = if has_checksum { 4 } else { 0 };
                 if bh.last_block
                     && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
                     && declared_size.is_none_or(|declared| declared == n as u64)
                     && n <= state.block_maximum()
-                    && probe.len() >= n
+                    // `n` is at most a block (128 KiB): the sum cannot wrap.
+                    && probe.len() >= n + trailer
                     && output.len() >= n
                 {
                     output[..n].copy_from_slice(&probe[..n]);
@@ -4915,11 +4928,13 @@ impl FrameDecoder {
                     // must not be, or a no-`hash` build leaves the 4 bytes in
                     // `*input` (misparsed as the next frame) and never sets
                     // `check_sum` (so `is_finished` stays false).
-                    if state.frame_header.descriptor.content_checksum_flag() {
-                        let mut chksum = [0u8; 4];
-                        Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
+                    if has_checksum {
+                        let (chksum, rest) = input
+                            .split_first_chunk::<4>()
+                            .expect("the trailer's length is checked above");
+                        *input = rest;
                         state.bytes_read_counter += 4;
-                        state.check_sum = Some(u32::from_le_bytes(chksum));
+                        state.check_sum = Some(u32::from_le_bytes(*chksum));
                         // Mirror the general path: seed the scratch hash so
                         // `verify_content_checksum` / `get_calculated_checksum`
                         // read the digest. Skipped under `ContentChecksum::None`.
@@ -4943,10 +4958,44 @@ impl FrameDecoder {
                     }
                     state.decoder_scratch.set_total_output(n as u64);
                     state.frame_finished = true;
-                    return Ok(n);
+                    return Some(n);
                 }
             }
         }
+        None
+    }
+
+    /// The block loop of [`Self::run_direct_decode`], for every frame
+    /// [`Self::copy_single_raw_frame`] does not take.
+    #[inline(never)]
+    fn run_direct_blocks(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        declared_size: Option<u64>,
+    ) -> Result<usize, FrameDecoderError> {
+        use super::block_decoder;
+        use super::decode_buffer::DecodeBuffer;
+        use super::scratch::DirectScratch;
+        use super::user_slice_buf::UserSliceBackend;
+        use crate::io::Read;
+        use FrameDecoderError as err;
+
+        // The most the frame may write: its declared size, or the caller's
+        // slice for a frame that declares none.
+        let limit = declared_size.unwrap_or(output.len() as u64);
+        // Output past `limit`: the frame lied about its size, or it does not
+        // fit the caller's slice.
+        let overflow = |produced: u64| match declared_size {
+            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
+            None => err::TargetTooSmall,
+        };
+
+        let kernel = self.kernel;
+        let state = self
+            .state
+            .as_mut()
+            .expect("caller ensures init populated state");
 
         // Borrow persistent fields out of whichever scratch variant
         // `init` produced (Flat for single_segment, Ring for

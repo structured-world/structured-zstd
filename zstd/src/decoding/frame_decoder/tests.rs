@@ -4251,3 +4251,31 @@ fn a_compressed_block_past_the_block_maximum_is_refused() {
         None => panic!("expected a FrameDecoderError, got {err:?}"),
     }
 }
+
+/// A frame of one raw block whose declared content checksum is cut short is
+/// refused with the checksum read error on the direct path. The single-block
+/// copy leaves such a frame to the block loop, so the report has to come from
+/// there; a copy that took the frame anyway would return its bytes as a
+/// finished frame.
+#[test]
+fn a_raw_frame_with_a_cut_checksum_fails_on_the_checksum() {
+    // Magic, descriptor (single segment + content checksum), a one-byte
+    // content size of 5, a last raw block of 5 bytes, then 2 of the 4
+    // checksum bytes.
+    let frame = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x24, 5, 0x29, 0, 0, b'h', b'e', b'l', b'l', b'o', 0xAA, 0xBB,
+    ];
+    let mut decoder = FrameDecoder::new();
+    let mut out = [0u8; 5];
+    let err = decoder
+        .decode_all(&frame, &mut out)
+        .expect_err("a frame without its whole checksum must not decode");
+    assert!(
+        matches!(err, FrameDecoderError::FailedToReadChecksum(_)),
+        "expected the checksum read error, got {err:?}",
+    );
+    assert_eq!(
+        decoder.direct_frames, 1,
+        "the frame must be refused on the direct path"
+    );
+}
