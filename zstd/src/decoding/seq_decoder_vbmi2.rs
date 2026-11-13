@@ -143,13 +143,15 @@ macro_rules! execute_one_body {
                     // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
                     // backend is linear and overrides this.
                     let base = unsafe { backend.inline_exec_base_ptr() };
-                    // Saturating is the meaning: an output shorter than the
+                    // The sequence's own bytes end within the write limit, the
+                    // overshoot within the backend's memory, as upstream bounds
+                    // it. Saturating is the meaning: memory shorter than the
                     // overshoot leaves no room for an overshooting write, and an
                     // end of zero says so, sending the sequence to the exact
                     // copier. The gate is the comparison against this, not this.
-                    let cap_w = cap.saturating_sub(
+                    let cap_w = cap.min(backend.inline_overshoot_end().saturating_sub(
                         crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT,
-                    );
+                    ));
                     let r = exec_sequence_avx2_inline_at!(
                         base,
                         tail,
@@ -158,7 +160,8 @@ macro_rules! execute_one_body {
                         lit_src,
                         seq_ll_v as usize,
                         offset,
-                        seq_ml_v as usize
+                        seq_ml_v as usize,
+                        $buffer.fast_string_moves()
                     );
                     if let Ok(total) = r {
                         // SAFETY: the copy wrote exactly `total` bytes at `tail`.

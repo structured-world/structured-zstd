@@ -2386,6 +2386,101 @@ fn ref_prefix_is_single_use_and_roundtrips() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A frame compressed against `prefix`, which decodes only with it referenced.
+fn prefixed_frame(prefix: &[u8], payload: &[u8]) -> Vec<u8> {
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    unsafe { ZSTD_freeCCtx(cctx) };
+    frame
+}
+
+/// One `ZSTD_decompressStream` call over all of `src` into `out`.
+fn stream_once(dctx: *mut crate::ZSTD_DCtx, src: &[u8], out: &mut [u8]) -> (usize, usize) {
+    let mut inb = ZSTD_inBuffer {
+        src: src.as_ptr().cast(),
+        size: src.len(),
+        pos: 0,
+    };
+    let mut outb = ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let rc = unsafe { ZSTD_decompressStream(dctx, &mut outb, &mut inb) };
+    (rc, outb.pos)
+}
+
+/// A prefix is single-use, and a session reset after a frame began drops it,
+/// even when the frame never got past a rejected header (upstream zstd
+/// #4848). Kept, it would apply to the next frame after the caller abandoned
+/// the frame meant to use it, reading the caller's buffer past that point.
+/// The prefix stays alive for the whole test, so a frame needing it fails
+/// only because the prefix is gone.
+#[test]
+fn dctx_reset_after_a_rejected_header_drops_the_prefix() {
+    let prefix = dict_payload();
+    let mut payload = prefix[..2048].to_vec();
+    payload.extend_from_slice(b"unique suffix after prefix material 0123456789");
+    let frame = prefixed_frame(&prefix, &payload);
+    // Magic, then a frame header descriptor with the reserved bit set.
+    let bad_header = [0x28u8, 0xB5, 0x2F, 0xFD, 0x08, 0x00];
+
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let (rc, _) = stream_once(dctx, &bad_header, &mut out);
+    assert_ne!(ZSTD_isError(rc), 0, "the reserved bit must be rejected");
+    assert_eq!(unsafe { crate::params::ZSTD_DCtx_reset(dctx, 1) }, 0);
+    let (rc, _) = stream_once(dctx, &frame, &mut out);
+    assert_ne!(
+        ZSTD_isError(rc),
+        0,
+        "the prefix must not outlive the frame abandoned by the reset"
+    );
+    unsafe { ZSTD_freeDCtx(dctx) };
+    drop(prefix);
+}
+
+/// A session reset before any input has begun a frame leaves the prefix for
+/// the next frame (upstream zstd #4848 keeps it then too).
+#[test]
+fn dctx_reset_before_any_input_keeps_the_prefix() {
+    let prefix = dict_payload();
+    let mut payload = prefix[..2048].to_vec();
+    payload.extend_from_slice(b"unique suffix after prefix material 0123456789");
+    let frame = prefixed_frame(&prefix, &payload);
+
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    assert_eq!(unsafe { crate::params::ZSTD_DCtx_reset(dctx, 1) }, 0);
+    let (rc, written) = stream_once(dctx, &frame, &mut out);
+    assert_eq!(rc, 0, "the prefixed frame decodes whole");
+    assert_eq!(&out[..written], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+}
+
 #[test]
 fn cctx_ref_prefix_is_spent_by_a_too_small_destination() {
     // A prefix is single-use, and upstream spends it when the frame starts

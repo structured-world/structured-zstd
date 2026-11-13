@@ -150,6 +150,20 @@ pub(crate) trait BufferBackend: Sized {
         self.cap()
     }
 
+    /// The end an overshooting copy may write up to, which can lie past
+    /// [`Self::inline_write_limit`]: that limit bounds the sequence's own
+    /// bytes, while the bytes a wildcopy writes past them are scratch, so
+    /// they need only stay in the backend's memory. Upstream bounds its
+    /// overshoot the same way, by the destination's capacity
+    /// (`ZSTD_decompressSequences` takes `dstCapacity`; `oend_w` is its end
+    /// less `WILDCOPY_OVERLENGTH`). A backend whose limit is its memory's end
+    /// keeps the default.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn inline_overshoot_end(&self) -> usize {
+        self.inline_write_limit()
+    }
+
     /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`

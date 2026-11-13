@@ -283,7 +283,9 @@ impl BufferBackend for FlatBuf {
     /// load at offset 16..31 would read uninitialised destination
     /// bytes; same bound as the `UserSliceBackend::exec_sequence_inline_avx2`
     /// override).
-    #[cfg(target_arch = "x86_64")]
+    // A soft-float x86_64 target (no SSE2 in its baseline) cannot enable AVX2;
+    // it keeps the trait's default.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn exec_sequence_inline_avx2(

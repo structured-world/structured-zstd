@@ -206,6 +206,11 @@ pub struct ZSTD_DCtx {
     /// Whether `ZSTD_decompressStream` holds back the frame's last input byte
     /// because the frame is decoded but its output not all handed out yet.
     pub(crate) stream_hostage: bool,
+    /// Whether the last frame `ZSTD_decompressStream` began entering was
+    /// refused at its header. The stream stays at its boundary then (the next
+    /// call reads a header again), yet a frame was begun, which a session
+    /// reset reads: upstream's stage has left `zdss_init`.
+    pub(crate) stream_header_rejected: bool,
     /// Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
     /// `ZSTD_DCtx_refDDict` / `ZSTD_DCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_decompressDCtx` / `ZSTD_decompressStream`.
@@ -580,6 +585,7 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         stream_staged: Vec::new(),
         stream_no_progress: 0,
         stream_hostage: false,
+        stream_header_rejected: false,
         attached_ddict: crate::attach::DCtxDictAttach::None,
     })
 }
@@ -600,14 +606,24 @@ pub extern "C" fn ZSTD_createDCtx_advanced(
 impl ZSTD_DCtx {
     /// `ZSTD_reset_session_only`: abandon any in-flight frame. The decoder
     /// instance (and its reusable workspace) survives; loaded dictionaries
-    /// and parameters are untouched.
+    /// and parameters are untouched, and so is a prefix no frame has begun
+    /// with yet.
     pub(crate) fn reset_session(&mut self) {
+        // A prefix is for one frame: once a frame has begun, even one refused
+        // at its header before it could take the prefix, the reset abandons
+        // that frame and the prefix with it (upstream zstd #4848,
+        // `ZSTD_DCtx_reset`). Kept, it would apply to a later frame and read
+        // the caller's buffer after the caller let the frame go.
+        if !self.stream_frame_done || self.stream_header_rejected {
+            self.consume_prefix();
+        }
         // A frame mid-decode lives inside `decoder`'s internal state and is
         // re-initialised by the next `init`/`reset` call; just mark the
         // stream as sitting at a frame boundary again.
         self.stream_frame_done = true;
         self.stream_no_progress = 0;
         self.stream_hostage = false;
+        self.stream_header_rejected = false;
         // An abandoned frame may have taken a prefix; it is not kept.
         self.frame_ended();
     }

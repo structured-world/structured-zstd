@@ -1309,7 +1309,11 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
             }
             dctx.stream_entry = StreamEntry::Entered;
         }
-        match enter_stream_frame(dctx, inp, src) {
+        let entry = enter_stream_frame(dctx, inp, src);
+        // A refused header leaves the stream at its boundary, but a session
+        // reset has to know a frame was begun (see `reset_session`).
+        dctx.stream_header_rejected = entry.is_err();
+        match entry {
             Ok(FrameEntry::Started) => {}
             Ok(FrameEntry::WantsInput) => return 1,
             Ok(FrameEntry::Skipped) => return 0,

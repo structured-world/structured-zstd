@@ -114,13 +114,17 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
 ///
+/// `$fast_string_moves` is expanded only on the long-match and tight-tail
+/// paths, so the caller can name the buffer's kept answer there without the
+/// sequence loop carrying it.
+///
 /// # Safety
 /// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
 /// the start of a linear output valid for writes through `cap`, and `lit_src`
 /// must be readable for the literal length rounded up to 16.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline_at {
-    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr, $fast_string_moves:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
@@ -133,26 +137,30 @@ macro_rules! exec_sequence_avx2_inline_at {
         let cap: usize = $cap;
         let cap_w: usize = $cap_w;
         let tail: usize = $tail;
-        // One comparison decides the hot path, exactly as upstream's
-        // `oMatchEnd > oend_w`: `cap_w` is the end with the overshoot already
-        // taken off, computed once per block. Both lengths are bounded by a
-        // block's FSE expansion, so the sum cannot overflow. Everything else,
-        // including whether the write fits at all, belongs to the branch that
-        // is almost never taken.
+        // One branch decides the hot path, as upstream's `oMatchEnd > oend_w`:
+        // `cap_w` is the end with the overshoot already taken off, computed
+        // once per block. Both lengths are bounded by a block's FSE expansion,
+        // so the sum cannot overflow. Everything else, including whether the
+        // write fits at all, belongs to the branch that is almost never taken,
+        // A long match is decided after it, on the path that has room for the
+        // overshoot, so this gate stays one comparison.
         let total = lit_length_v + match_length_v;
         if tail + total > cap_w {
             sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
                 // Tight tail: the write fits but the overshoot would not.
-                // SAFETY: as below, with the exact copy in place of the
-                // overshooting one.
+                // SAFETY: `sequence_output_fits` holds the sequence within
+                // `cap`, `cap_w` is this cursor's overshoot end, and
+                // `offset_v` bytes of output precede the match.
                 unsafe {
-                    $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
+                    $crate::decoding::exec_sequence_inline::x86::exec_tight_tail_avx2(
                         base,
                         tail,
+                        cap_w,
                         lit_src_v,
                         lit_length_v,
                         offset_v,
                         match_length_v,
+                        $fast_string_moves,
                     );
                 }
                 total
@@ -170,11 +178,22 @@ macro_rules! exec_sequence_avx2_inline_at {
                 if lit_length_v > 16 {
                     wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
                 }
-                // Two ways, as upstream's `ZSTD_execSequence` splits at
-                // `WILDCOPY_VECLEN` only (zstd_decompress_block.c:1077): a
-                // separate 32-byte arm adds a data-dependent branch to every
-                // match.
-                if offset_v >= 16 {
+                // Split at `WILDCOPY_VECLEN`, as upstream's `ZSTD_execSequence`
+                // (zstd_decompress_block.c:1077), not at the 32-byte vector
+                // width: a 32-byte arm would add a data-dependent branch to
+                // every match.
+                if match_length_v >= 256 {
+                    // A long match: a copy from a fixed short distance would read
+                    // its own recent stores, so it goes from doubling distances
+                    // instead. The gate above leaves room for its 31-byte
+                    // overshoot, and `offset_v` bytes of output precede it.
+                    $crate::decoding::exec_sequence_inline::x86::match_copy_doubling_avx2(
+                        op_match,
+                        offset_v,
+                        match_length_v,
+                        $fast_string_moves,
+                    );
+                } else if offset_v >= 16 {
                     wildcopy_no_overlap(op_match, match_src, match_length_v);
                 } else {
                     // Sixteen bytes of written output before the match, which
@@ -277,73 +296,106 @@ pub(crate) use overlap_match_shuffle;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_dict_inline {
     ($buffer:expr, $lit_src:expr, $lit_length:expr, $dict_src:expr, $match_length:expr) => {{
-        use crate::decoding::buffer_backend::sequence_output_fits;
-        use crate::decoding::exec_sequence_inline::x86::{
-            copy16, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
-        };
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
-        let lit_length_v: usize = $lit_length;
-        let match_length_v: usize = $match_length;
-        let lit_src_v: *const u8 = $lit_src;
-        let dict_src_v: &[u8] = $dict_src;
-        debug_assert!(dict_src_v.len() >= match_length_v);
         let backend = $buffer.buffer_mut();
         let cap = backend.cap();
         let tail = backend.tail();
-        match sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0) {
-            Err(e) => Err(e),
-            Ok(total) => {
-                // SAFETY: as for `exec_sequence_avx2_inline` on the destination
-                // side — linear backend, `sequence_output_fits` validated
-                // `tail + total <= cap`. The source side is the dictionary
-                // slice, valid for reads of its whole length, and every read
-                // below is bounded by that length.
-                unsafe {
-                    let base = backend.inline_exec_base_ptr();
-                    let dict_ptr = dict_src_v.as_ptr();
-                    let room = dict_src_v.len();
-                    if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
-                        // Tight tail: an overshoot would run past the output.
-                        // Copy both halves exactly; the dictionary source
-                        // cannot overlap the destination.
-                        let op = base.add(tail);
-                        core::ptr::copy_nonoverlapping(lit_src_v, op, lit_length_v);
-                        core::ptr::copy_nonoverlapping(
-                            dict_ptr,
-                            op.add(lit_length_v),
-                            match_length_v,
-                        );
-                    } else {
-                        let op_lit = base.add(tail);
-                        let op_match = base.add(tail + lit_length_v);
-                        copy16(op_lit, lit_src_v);
-                        if lit_length_v > 16 {
-                            wildcopy_no_overlap(
-                                op_lit.add(16),
-                                lit_src_v.add(16),
-                                lit_length_v - 16,
-                            );
-                        }
-                        // A wildcopy reads up to the match length rounded up to
-                        // its stride; past the dictionary's end there is nothing
-                        // to read, so that case copies exactly.
-                        if room >= match_length_v.next_multiple_of(32) {
-                            wildcopy_no_overlap_avx2(op_match, dict_ptr, match_length_v);
-                        } else if room >= match_length_v.next_multiple_of(16) {
-                            wildcopy_no_overlap(op_match, dict_ptr, match_length_v);
-                        } else {
-                            core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length_v);
-                        }
-                    }
-                    backend.inline_exec_commit(tail + total);
-                }
-                Ok(())
-            }
-        }
+        // SAFETY: a linear backend (the caller's gate), so its base addresses
+        // the output from `tail` on.
+        let base = unsafe { backend.inline_exec_base_ptr() };
+        // The overshoot end is the backend's own capacity less the stride.
+        // Saturating is the meaning: a capacity below the overshoot leaves no
+        // room for an overshooting write, and an end of zero sends the
+        // sequence to the exact copy.
+        let r = $crate::decoding::exec_sequence_inline::exec_sequence_avx2_dict_inline_at!(
+            base,
+            tail,
+            cap,
+            cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            $lit_src,
+            $lit_length,
+            $dict_src,
+            $match_length
+        );
+        r.map(|total| {
+            // SAFETY: the copy wrote `[tail, tail + total)`, within `cap`.
+            unsafe { backend.inline_exec_commit(tail + total) };
+        })
     }};
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_dict_inline;
+
+/// [`exec_sequence_avx2_dict_inline!`]'s body, addressed by an explicit cursor
+/// as [`exec_sequence_avx2_inline_at!`] is, so the AVX2 sequence loop runs a
+/// dictionary match on the position it keeps in locals, without handing it to
+/// the buffer and taking it back. Returns the bytes written.
+///
+/// # Safety
+/// The enclosing function must carry `target_feature(avx2)` or the CPU must
+/// have it; `base` is the start of a linear output valid for writes through
+/// `cap`, and through `cap_w + 31` for an overshooting copy; `lit_src` is
+/// readable for the literal length rounded up to 16; `$dict_src` holds the
+/// match at its front.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+macro_rules! exec_sequence_avx2_dict_inline_at {
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $dict_src:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+        };
+        let lit_length_v: usize = $lit_length;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let dict_src_v: &[u8] = $dict_src;
+        let base: *mut u8 = $base;
+        let tail: usize = $tail;
+        debug_assert!(dict_src_v.len() >= match_length_v);
+        let total = lit_length_v + match_length_v;
+        let dict_ptr = dict_src_v.as_ptr();
+        if tail + total > $cap_w {
+            sequence_output_fits(lit_length_v, match_length_v, tail, $cap, 0).map(|total| {
+                // Tight tail: an overshoot would run past the output. Copy both
+                // halves exactly; the dictionary source cannot overlap the
+                // destination.
+                // SAFETY: `sequence_output_fits` validated `tail + total <= cap`;
+                // the dictionary slice holds the match.
+                unsafe {
+                    let op = base.add(tail);
+                    core::ptr::copy_nonoverlapping(lit_src_v, op, lit_length_v);
+                    core::ptr::copy_nonoverlapping(dict_ptr, op.add(lit_length_v), match_length_v);
+                }
+                total
+            })
+        } else {
+            // SAFETY: `tail + total <= cap_w` leaves the write and its overshoot
+            // inside the output; the literal source carries the copiers' slack,
+            // and every dictionary read is bounded by the slice's length.
+            unsafe {
+                let room = dict_src_v.len();
+                let op_lit = base.add(tail);
+                let op_match = base.add(tail + lit_length_v);
+                copy16(op_lit, lit_src_v);
+                if lit_length_v > 16 {
+                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                }
+                // A wildcopy reads up to the match length rounded up to its
+                // stride; past the dictionary's end there is nothing to read,
+                // so that case copies exactly.
+                if room >= match_length_v.next_multiple_of(32) {
+                    wildcopy_no_overlap_avx2(op_match, dict_ptr, match_length_v);
+                } else if room >= match_length_v.next_multiple_of(16) {
+                    wildcopy_no_overlap(op_match, dict_ptr, match_length_v);
+                } else {
+                    core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length_v);
+                }
+            }
+            Ok(total)
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) use exec_sequence_avx2_dict_inline_at;
 
 // x86_64 only: SSE2 is the architectural baseline there (every x86_64
 // CPU has SSE2 by definition). 32-bit `x86` is excluded because the
@@ -441,6 +493,254 @@ pub(crate) mod x86 {
                     break;
                 }
             }
+        }
+    }
+
+    /// A match copied in pieces whose source lies ever farther back: `offset`
+    /// bytes from `offset` back, then `2 * offset` bytes from `2 * offset`
+    /// back, and so on; one no longer than its offset is a single plain piece.
+    /// The output repeats with period `offset`, so any multiple of it is a
+    /// valid source distance once that much is written. Read from a fixed
+    /// short distance, every load takes
+    /// bytes the copy stored a few cycles before, still in the store buffer,
+    /// and one straddling two stores cannot be forwarded and waits for them;
+    /// doubling the distance moves the source out of that window after the
+    /// first piece, as libc memcpy over doubling pieces does. May overshoot up
+    /// to 31 bytes past `dst + length`.
+    ///
+    /// Out of line: it runs on rare long matches, where a call costs nothing
+    /// beside the copy, and keeps its loops out of the sequence loop's code.
+    ///
+    /// `fast_string_moves` is the decoder's kept answer to
+    /// [`crate::cpu_kernel::detect_fast_string_moves`].
+    ///
+    /// # Safety
+    /// The CPU has AVX2; `offset >= 1` bytes of output are in place before
+    /// `dst`; room for `length + 31` bytes at `dst`.
+    // Gated to the tier that calls it, as `MAX_WILDCOPY_OVERSHOOT` is.
+    #[cfg(feature = "kernel-avx2")]
+    #[target_feature(enable = "avx2")]
+    #[inline(never)]
+    pub(crate) unsafe fn match_copy_doubling_avx2(
+        dst: *mut u8,
+        offset: usize,
+        length: usize,
+        fast_string_moves: bool,
+    ) {
+        // Above the bytes a store buffer of a few dozen 32-byte entries holds.
+        const DOUBLING_DISTANCE_LIMIT: usize = 2048;
+        // A piece this long from a source this far back (a long-distance match,
+        // whose source lies beyond the caches) goes, with fast string moves,
+        // by `rep movsb`, as libc memcpy moves it (glibc's
+        // `__x86_rep_movsb_threshold` for 32-byte vectors). A short-offset
+        // match never gets there: its distance stops doubling below it, and
+        // the vector loop over a near source outruns `rep movsb`.
+        const REP_MOVSB_MIN: usize = 4096;
+        unsafe {
+            let mut written = 0usize;
+            let mut distance = offset;
+            // Below 32 bytes of distance a vector load would reach past the
+            // bytes in place, so those pieces, 31 bytes at most in all, are
+            // copied exactly.
+            while written < length && distance < 32 {
+                let piece = distance.min(length - written);
+                let at = dst.add(written);
+                copy_short_exact(at, at.sub(distance), piece);
+                written += piece;
+                distance *= 2;
+            }
+            while written < length {
+                let piece = distance.min(length - written);
+                let at = dst.add(written);
+                if fast_string_moves && distance >= REP_MOVSB_MIN && piece >= REP_MOVSB_MIN {
+                    // As glibc does, the string move starts on a 64-byte
+                    // boundary of the destination, where its microcode runs
+                    // fastest; the head goes by two vector moves first.
+                    let src = at.sub(distance);
+                    copy32_avx2(at, src);
+                    copy32_avx2(at.add(32), src.add(32));
+                    let head = 64 - (at.addr() & 63);
+                    rep_movsb(at.add(head), src.add(head), piece - head);
+                } else {
+                    copy_back_avx2(at, at.sub(distance), piece);
+                }
+                written += piece;
+                // Past the store buffer's reach the distance stops growing, so
+                // the source stays in cache lines the copy just wrote rather
+                // than ones a long match left behind in a farther level; a
+                // fixed distance stays valid, as every piece writes as much as
+                // it reads. Below that, after this piece `written + offset`
+                // bytes of the period run are in place, which is the next
+                // distance.
+                if distance < DOUBLING_DISTANCE_LIMIT {
+                    distance *= 2;
+                }
+            }
+        }
+    }
+
+    /// A sequence whose bytes end within the output but whose overshoot would
+    /// not. When its literals end within `cap_w` and its match comes from 32
+    /// bytes back or more, the match goes by the overshooting copies up to
+    /// `cap_w`, whose overshoot stays inside the output's memory, and only the
+    /// rest, under 32 bytes, by an exact copy, as upstream's `ZSTD_safecopy`
+    /// wildcopies to `oend_w` and finishes byte by byte
+    /// (zstd_decompress_block.c, ZSTD_execSequenceEnd). Anything else takes
+    /// the exact copy whole. The last match of a frame filling its buffer
+    /// exactly is the case: it would otherwise go by libc memcpy, a call per
+    /// doubled piece.
+    ///
+    /// Out of line: it runs once at the end of such a frame.
+    /// `fast_string_moves` goes to [`match_copy_doubling_avx2`].
+    ///
+    /// # Safety
+    /// The CPU has AVX2; `base` is valid for writes through
+    /// `tail + lit_length + match_length`, which ends past `cap_w`, and
+    /// through `cap_w + 31`; `lit_src` is readable for the literal length
+    /// rounded up to 16; `offset <= tail + lit_length`.
+    #[cfg(feature = "kernel-avx2")]
+    #[target_feature(enable = "avx2")]
+    #[inline(never)]
+    // The sequence's fields and the cursor, passed as the macro holds them in
+    // registers; once per frame, so no struct is worth building for them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn exec_tight_tail_avx2(
+        base: *mut u8,
+        tail: usize,
+        cap_w: usize,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+        fast_string_moves: bool,
+    ) {
+        unsafe {
+            let match_at = tail + lit_length;
+            // The match runs past `cap_w` (the caller's branch); what lies past
+            // it is the rest, at most the 31 bytes between `cap_w` and the end
+            // of an output whose memory reaches its write limit, and below the
+            // offset, so its exact copy reads no byte it writes.
+            if offset < 32 || match_at > cap_w || match_at + match_length - cap_w >= 32 {
+                return super::exec_sequence_bounded_copy(
+                    base,
+                    tail,
+                    lit_src,
+                    lit_length,
+                    offset,
+                    match_length,
+                );
+            }
+            let op_lit = base.add(tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+            let head = cap_w - match_at;
+            let rest = match_length - head;
+            let op_match = base.add(match_at);
+            if head >= 256 {
+                match_copy_doubling_avx2(op_match, offset, head, fast_string_moves);
+            } else if head > 0 {
+                wildcopy_no_overlap(op_match, op_match.sub(offset), head);
+            }
+            let at = op_match.add(head);
+            copy_short_exact(at, at.sub(offset), rest);
+        }
+    }
+
+    /// `n` bytes from `src` to `dst` by `rep movsb`.
+    ///
+    /// # Safety
+    /// `src + n <= dst`; both valid for `n` bytes.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
+        // SAFETY: the caller's contract; the direction flag is clear at every
+        // call boundary (System V and Windows x64), so the move runs forward,
+        // and it touches no flags.
+        unsafe {
+            core::arch::asm!(
+                "rep movsb",
+                inout("rcx") n => _,
+                inout("rdi") dst => _,
+                inout("rsi") src => _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// `n < 32` bytes from `src` to `dst`, exactly: two overlapping moves of
+    /// the widest size that fits, or bytes for the last three.
+    ///
+    /// # Safety
+    /// `src + n <= dst`; both valid for `n` bytes.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn copy_short_exact(dst: *mut u8, src: *const u8, n: usize) {
+        debug_assert!(n < 32);
+        unsafe {
+            if n >= 16 {
+                copy16(dst, src);
+                copy16(dst.add(n - 16), src.add(n - 16));
+            } else if n >= 8 {
+                let head = src.cast::<u64>().read_unaligned();
+                let tail = src.add(n - 8).cast::<u64>().read_unaligned();
+                dst.cast::<u64>().write_unaligned(head);
+                dst.add(n - 8).cast::<u64>().write_unaligned(tail);
+            } else if n >= 4 {
+                let head = src.cast::<u32>().read_unaligned();
+                let tail = src.add(n - 4).cast::<u32>().read_unaligned();
+                dst.cast::<u32>().write_unaligned(head);
+                dst.add(n - 4).cast::<u32>().write_unaligned(tail);
+            } else {
+                for i in 0..n {
+                    *dst.add(i) = *src.add(i);
+                }
+            }
+        }
+    }
+
+    /// `length` bytes from `src` to `dst`, reading only `src..dst`, in libc
+    /// memcpy's shape: past 128 bytes, 128 per pass with the stores on 32-byte
+    /// boundaries and the last 128 bytes written to end exactly at
+    /// `dst + length`, so the pass count stays short enough for the loop exit
+    /// to be predicted; from 32 to 128 bytes, 32 at a time with the last move
+    /// ending exactly at the end. Below 32 bytes one move, which the distance
+    /// keeps within the bytes in place and which writes up to 31 bytes past
+    /// the end, overshoot the caller overwrites or leaves.
+    ///
+    /// # Safety
+    /// Caller in `target_feature(avx2)` scope; `src + 32 <= dst` and
+    /// `src + length <= dst`; room for `length + 31` bytes at `dst`.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn copy_back_avx2(dst: *mut u8, src: *const u8, length: usize) {
+        unsafe {
+            copy32_avx2(dst, src);
+            if length <= 128 {
+                if length > 32 {
+                    let mut off = 32usize;
+                    while off + 32 < length {
+                        copy32_avx2(dst.add(off), src.add(off));
+                        off += 32;
+                    }
+                    copy32_avx2(dst.add(length - 32), src.add(length - 32));
+                }
+                return;
+            }
+            let tail = length - 128;
+            let mut off = 32 - (dst.addr() & 31);
+            while off < tail {
+                copy32_avx2(dst.add(off), src.add(off));
+                copy32_avx2(dst.add(off + 32), src.add(off + 32));
+                copy32_avx2(dst.add(off + 64), src.add(off + 64));
+                copy32_avx2(dst.add(off + 96), src.add(off + 96));
+                off += 128;
+            }
+            copy32_avx2(dst.add(tail), src.add(tail));
+            copy32_avx2(dst.add(tail + 32), src.add(tail + 32));
+            copy32_avx2(dst.add(tail + 64), src.add(tail + 64));
+            copy32_avx2(dst.add(tail + 96), src.add(tail + 96));
         }
     }
 

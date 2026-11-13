@@ -304,13 +304,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             self.tail,
         );
 
-        // Tight-tail: the literal+match bytes fit exactly but the
-        // <=15-byte wildcopy overshoot of the fast path would write
-        // past `cap`. Take the exact (non-overshooting) copy so the
-        // final sequence(s) near the buffer end stay in-bounds. Only
-        // the trailing sequence(s) of a tightly-sized output slice hit
-        // this; the bulk of the frame still takes the SIMD fast path.
-        if new_tail + MAX_WILDCOPY_OVERSHOOT > cap {
+        // Tight-tail: the sequence's own bytes must end within `cap`
+        // (the per-block ceiling), while the <=15-byte wildcopy overshoot
+        // only has to stay inside the slice, as upstream bounds it by the
+        // destination's capacity. When either does not hold, take the
+        // exact (non-overshooting) copy. Only the trailing sequence(s) of
+        // a slice without room past the data hit this.
+        if new_tail
+            > cap.min(
+                self.inline_overshoot_end()
+                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            )
+        {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above), so the exact
             // copies stay in-bounds; `offset <= tail + lit_length`
@@ -322,8 +327,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         }
 
         // SAFETY: the tight-tail branch was not taken, so pointer arithmetic
-        // stays within `self.slice` for the writes (tail + total + overshoot
-        // <= cap) and reads (match src = tail + lit_length -
+        // stays within `self.slice` for the writes (tail + total <= cap and
+        // tail + total + overshoot <= slice.len()) and reads (match src = tail + lit_length -
         // offset, bounded by `offset <= tail + lit_length`). Literal
         // reads use the caller-provided `lit_src` whose provenance
         // covers the parent literals buffer (NOT a sub-slice), so
@@ -413,7 +418,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
 
         // Tight-tail bounded copy; see the x86 arm for the rationale.
-        if new_tail + MAX_WILDCOPY_OVERSHOOT > cap {
+        if new_tail
+            > cap.min(
+                self.inline_overshoot_end()
+                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            )
+        {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above) bounds the
             // exact copies; `offset <= tail + lit_length` keeps the
@@ -467,9 +477,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// SSE2 helpers — they're capped by the caller-side
     /// `inline_path_safe` gate at 16-byte slack and changing them
     /// would require re-tightening that gate. The 31-byte AVX2 stride
-    /// overshoot is contained by the per-sequence `overshoot = 0`
-    /// capacity guard plus the tight-tail bounded copy (the slice
-    /// carries no trailing slack), not by slice-tail padding.
+    /// overshoot must stay inside the slice; a sequence whose overshoot
+    /// would not takes the tight-tail bounded copy.
     ///
     /// # Safety
     /// Same preconditions as [`Self::exec_sequence_inline`] plus
@@ -477,7 +486,9 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// the only call site is
     /// `sequence_section_decoder::execute_one_sequence_pipelined_avx2`
     /// which is itself target_feature-tagged.
-    #[cfg(target_arch = "x86_64")]
+    // A soft-float x86_64 target (no SSE2 in its baseline) cannot enable AVX2;
+    // it keeps the trait's default.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn exec_sequence_inline_avx2(
@@ -493,10 +504,9 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             wildcopy_overlap_8byte_stride,
         };
         // 31-byte tail overshoot bound: the AVX2 no-overlap match wildcopy may
-        // write up to 31 bytes past `tail + total`. The slice carries NO
-        // trailing slack (`from_slice` takes the caller's exact buffer), so
-        // this overshoot is handled by the tight-tail bounded branch below
-        // rather than absorbed by slice capacity.
+        // write up to 31 bytes past `tail + total`. It lands in the caller's
+        // room past the data when the slice has it; otherwise the tight-tail
+        // bounded branch below takes the sequence.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let cap = self.sequence_cap;
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and every
@@ -521,8 +531,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             self.tail,
         );
 
-        // Tight-tail bounded copy; see the SSE2 arm for the rationale.
-        if total + MAX_WILDCOPY_OVERSHOOT > cap - self.tail {
+        // Tight-tail bounded copy; see the SSE2 arm for the rationale. The
+        // guard above already holds the sequence's bytes within `cap`; here
+        // only the overshoot is checked, against the slice's end.
+        if new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             // SAFETY: `total <= cap - tail` (guard above) bounds the
             // exact copies; `offset <= tail + lit_length` keeps the
             // match source valid; `lit_src` reads exactly `lit_length`
@@ -600,6 +612,14 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     #[inline(always)]
     unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
         self.tail = new_tail;
+    }
+
+    /// The slice's end: the per-block ceiling in [`Self::cap`] bounds the
+    /// sequence bytes, while the overshoot may run into the caller's room past
+    /// them, which the decode leaves unspecified.
+    #[inline(always)]
+    fn inline_overshoot_end(&self) -> usize {
+        self.slice.len()
     }
 
     /// `new()` exists for trait conformance but is not used on the

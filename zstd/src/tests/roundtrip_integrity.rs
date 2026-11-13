@@ -1177,3 +1177,90 @@ fn assert_one_shot_long_distance_is_owned(
         "long-distance roundtrip mismatch at {level:?}"
     );
 }
+
+/// `len` bytes of log lines cycled from `lines`: one long match per frame,
+/// reaching back a line set's length, ends at the frame's end.
+fn cycled_lines(lines: &[&[u8]], len: usize) -> Vec<u8> {
+    lines
+        .iter()
+        .copied()
+        .flatten()
+        .copied()
+        .cycle()
+        .take(len)
+        .collect()
+}
+
+/// Decodes `input` with `decode_all` into an output with `room` bytes past
+/// the data and checks the data.
+fn assert_decode_all_with_room(input: &[u8], expected: &[u8], room: usize, what: &str) {
+    let mut output = vec![0xEEu8; expected.len() + room];
+    let written = crate::decoding::FrameDecoder::new()
+        .decode_all(input, &mut output)
+        .unwrap();
+    assert_eq!(written, expected.len(), "{what} room={room}");
+    assert!(output[..written] == *expected, "{what} room={room}");
+}
+
+/// A single-segment frame of 4 KiB has a block maximum equal to its content
+/// size, so the per-block write ceiling sits at the frame's end while its last
+/// sequence's wildcopy may overshoot into the caller's room past it. With two
+/// such frames back to back, the first frame's overshoot lands where the
+/// second frame's output goes and must be overwritten by it; the room past
+/// the last frame is scratch. Both orders, with and without room.
+#[test]
+fn decode_all_overwrites_the_overshoot_of_a_frame_ending_at_its_block_maximum() {
+    let a = cycled_lines(
+        &[
+            b"2026-11-11T08:00:00Z INFO request served path=/api/v1/items status=200\n",
+            b"2026-11-11T08:00:01Z WARN slow query table=orders elapsed_ms=812\n",
+            b"2026-11-11T08:00:02Z INFO cache refresh keys=4096 evicted=12\n",
+            b"2026-11-11T08:00:03Z DEBUG heartbeat peer=node-3 rtt_us=230\n",
+        ],
+        4096,
+    );
+    let b = cycled_lines(
+        &[
+            b"GET /static/app.js 200 18234 0.004\n",
+            b"POST /api/session 201 512 0.019\n",
+        ],
+        4096,
+    );
+    for level in [CompressionLevel::Fastest, CompressionLevel::Default] {
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            let mut input = compress_slice_to_vec(first, level);
+            // Frame header descriptor, bit 5: the frame is single-segment, so
+            // its window and block maximum are its content size.
+            assert_ne!(input[4] & 0x20, 0, "{level:?}: frame is not single-segment");
+            input.extend_from_slice(&compress_slice_to_vec(second, level));
+            let mut expected = first.clone();
+            expected.extend_from_slice(second);
+            for room in [0, crate::WILDCOPY_OVERLENGTH] {
+                assert_decode_all_with_room(&input, &expected, room, &alloc::format!("{level:?}"));
+            }
+        }
+    }
+}
+
+/// Long matches of every short period, and of periods past the wildcopy
+/// strides, run to the frame's end; the decoded bytes must not depend on the
+/// room past them.
+#[test]
+fn decode_all_repeats_long_matches_of_every_period() {
+    let periods = (1..=40).chain([47, 63, 64, 65, 100, 255, 380]);
+    for period in periods {
+        let unit = generate_data(period as u64, period);
+        let data: Vec<u8> = unit.iter().copied().cycle().take(4096).collect();
+        for level in [CompressionLevel::Fastest, CompressionLevel::Default] {
+            let input = compress_slice_to_vec(&data, level);
+            for room in [0, crate::WILDCOPY_OVERLENGTH] {
+                assert_decode_all_with_room(
+                    &input,
+                    &data,
+                    room,
+                    &alloc::format!("period={period} {level:?}"),
+                );
+            }
+        }
+    }
+}

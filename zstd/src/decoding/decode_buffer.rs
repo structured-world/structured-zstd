@@ -63,6 +63,12 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// soon as the caller has room for it, as upstream copies each decoded
     /// block out of its window buffer (`zstd_decompress.c`, `zdss_flush`).
     delivered: usize,
+    /// Whether long matches from far back may go by `rep movsb`, see
+    /// [`crate::cpu_kernel::detect_fast_string_moves`]. Set by whoever builds
+    /// the buffer and kept across `reset`; read only on the rare long match
+    /// path, so it is never a live value in the sequence loop.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    fast_string_moves: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -128,6 +134,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            fast_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -159,6 +167,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            fast_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -206,9 +216,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// cold growth path instead of growing the ring to gigabytes (a
     /// decompression-bomb OOM) before the post-block validity check runs.
     /// Called once per block by the sequence decoder, before the sequence
-    /// loop. The growable backends (`RingBuffer`, `FlatBuf`) enforce it in
-    /// `try_reserve`; fixed-capacity backends (`UserSliceBackend`) are already
-    /// bounded and take the trait's no-op default.
+    /// loop. Every backend enforces it in `try_reserve`; `UserSliceBackend`
+    /// also bounds its sequence writes by it, while letting a wildcopy's
+    /// overshoot run to the slice's end.
     #[inline]
     pub(crate) fn set_block_output_ceiling(&mut self, max_block_output: usize) {
         // Plain add (not saturating): `len()` is the bytes decoded so far and
@@ -236,6 +246,20 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline]
     pub(crate) fn set_block_limit(&mut self, limit: usize) {
         self.block_limit = limit.min(crate::common::MAX_BLOCK_SIZE as usize);
+    }
+
+    /// Apply the decoder's answer to [`crate::cpu_kernel::detect_fast_string_moves`].
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn set_fast_string_moves(&mut self, fast: bool) {
+        self.fast_string_moves = fast;
+    }
+
+    /// Whether long matches from far back may go by `rep movsb`.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn fast_string_moves(&self) -> bool {
+        self.fast_string_moves
     }
 
     /// What the frame says it will produce in total, when it says so. The
@@ -374,26 +398,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // than a `checked_add` quietly costing a value on every sequence.
         debug_assert!(self.buffer.len().checked_add(lit_length).is_some());
         let after_literals = self.buffer.len() + lit_length;
-        // Reaches back no further than the output holds: not a dictionary
-        // match at all, and the inline executor's own source covers it.
-        if offset <= after_literals {
+        if lit_length > self.dict_window_room()? {
             return None;
         }
-        let bytes_from_dict = offset - after_literals;
+        dict_match_slice(dict_content, after_literals, offset, match_length)
+    }
 
+    /// How much more output the window lets a dictionary match follow: the
+    /// window less everything decoded so far, `None` once the dictionary has
+    /// left the window. A match's literals count against it, as the cold path
+    /// counts them after pushing them.
+    #[inline(always)]
+    pub(crate) fn dict_window_room(&self) -> Option<usize> {
         let total_output = self.total_output_counter.max(self.buffer.len() as u64);
-        if total_output + lit_length as u64 > self.window_size as u64 {
-            return None;
-        }
-
-        // Starts before the dictionary does, or runs out of it into the
-        // output. Both are the cold path's to resolve.
-        if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
-            return None;
-        }
-
-        let low = dict_content.len() - bytes_from_dict;
-        Some(&dict_content[low..])
+        // At most `window_size`, so it fits `usize`.
+        (self.window_size as u64)
+            .checked_sub(total_output)
+            .map(|room| room as usize)
     }
 
     /// Return the last `n` bytes of the visible buffer as two
@@ -1402,6 +1423,28 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             self.delivered -= release;
         }
     }
+}
+
+/// The dictionary from a match's first byte to its end, when the match lies
+/// wholly inside `dict_content`; `after_literals` is the output the match is
+/// measured back from, literals included (upstream's `oLitEnd`). `None` when
+/// the match reaches back no further than the output (or its offset is zero),
+/// starts before the dictionary, or runs out of it into the output.
+#[inline(always)]
+pub(crate) fn dict_match_slice(
+    dict_content: &[u8],
+    after_literals: usize,
+    offset: usize,
+    match_length: usize,
+) -> Option<&[u8]> {
+    if offset <= after_literals {
+        return None;
+    }
+    let bytes_from_dict = offset - after_literals;
+    if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
+        return None;
+    }
+    Some(&dict_content[dict_content.len() - bytes_from_dict..])
 }
 
 /// Like Write::write_all but returns partial write length even on error

@@ -5,7 +5,6 @@ rust-version = "1.92"
 authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 edition = "2024"
 license = "Apache-2.0"
-homepage = "https://github.com/structured-world/structured-zstd"
 repository = "https://github.com/structured-world/structured-zstd"
 description = "C ABI (libzstd-compatible) front end for the structured-zstd pure-Rust codec."
 # The cdylib is consumed as a system library (drop-in for libzstd.so.1), not

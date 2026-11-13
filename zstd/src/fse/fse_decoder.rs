@@ -67,47 +67,52 @@ impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
 impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
+    // A call: inlined into the Huffman weight decode, which builds a table
+    // around it, it cost that body more than the call it saved.
+    #[inline(never)]
     pub fn init_state<K: CpuKernel>(
         &mut self,
         bits: &mut BitReaderReversed<'_, K>,
     ) -> Result<(), FSEDecoderError> {
-        // Uninitialised = no decode entries. (Previously this checked
-        // `accuracy_log == 0`, but a valid RLE table has accuracy_log 0
-        // with a single entry — upstream zstd's RLE DTable. An empty `decode`
-        // vec is the real "never built" signal; the `InvalidTableShape`
-        // check below still enforces `decode.len() == 1 << accuracy_log`,
-        // which holds for the 1-entry RLE table since `1 << 0 == 1`.)
+        self.init_state_inline(bits)
+    }
+
+    /// [`Self::init_state`], inlined into the sequence-section setup, which
+    /// runs it once per axis per block, as upstream's `ZSTD_initFseState` is.
+    /// Forced inline only in optimized builds, as the sequence executor is: at
+    /// `-O0` each of the three copies keeps its own stack slots, which grew the
+    /// setup's debug frame from 1,584 B to 3,184 B (x86_64).
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline)]
+    pub(crate) fn init_state_inline<K: CpuKernel>(
+        &mut self,
+        bits: &mut BitReaderReversed<'_, K>,
+    ) -> Result<(), FSEDecoderError> {
+        // Uninitialised = no decode entries: a Repeat-mode section with no
+        // table before it, which malformed input can declare. (A valid RLE
+        // table has accuracy_log 0 with a single entry, so `decode_len`, not
+        // the log, is the "never built" signal.)
         if self.table.decode_len == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
-        // Defense-in-depth internal-invariant guard: in normal builds
-        // `crate::fse` is not externally reachable, but malformed
-        // tables can still arise from internal misuse, future
-        // `feature = "fuzz-exports"`. Validate up-front that
-        // `decode.len() == 1 << accuracy_log` and surface a typed
-        // `InvalidTableShape` error (distinct from
-        // `TableIsUninitialized` to keep error triage unambiguous).
-        // Without this, `read_entry`'s unchecked indexing (the
-        // `cfg(not(fuzz-exports))` arm) could hit UB on a malformed
-        // table in release builds. `checked_shl` covers the
-        // pathological case where `accuracy_log >= usize::BITS`.
-        // Branch cost is a single per-call check; the per-sequence
-        // hot path (`update_state_fast`) is unaffected.
+        // Every table this crate builds holds exactly `1 << accuracy_log`
+        // entries, which is what lets `read_entry` index without a bounds
+        // check. Only `fuzz-exports` lets a caller hand in a table built
+        // elsewhere, so there it is checked and reported.
         let accuracy_log = self.table.accuracy_log;
         let decode_len = self.table.decode_len;
-        let expected =
-            1usize
-                .checked_shl(accuracy_log.into())
-                .ok_or(FSEDecoderError::InvalidTableShape {
-                    decode_len,
-                    accuracy_log,
-                })?;
-        if decode_len != expected {
+        #[cfg(feature = "fuzz-exports")]
+        if 1usize.checked_shl(accuracy_log.into()) != Some(decode_len) {
             return Err(FSEDecoderError::InvalidTableShape {
                 decode_len,
                 accuracy_log,
             });
         }
+        debug_assert_eq!(
+            1usize.checked_shl(accuracy_log.into()),
+            Some(decode_len),
+            "FSE table holds 1 << accuracy_log entries"
+        );
         let new_state = bits.get_bits(self.table.accuracy_log);
         // SAFETY: `accuracy_log` bits read from the bitstream produce
         // `new_state < (1 << accuracy_log) = table_size = decode.len()`.
@@ -330,8 +335,16 @@ pub type FSETable = FSETableImpl<Entry, 64>;
 pub type SeqFSETable = FSETableImpl<SeqSymbol, 512>;
 
 impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
+    /// The build's spread scratch is sized for `MAX_SPREAD` states, so a table
+    /// type with more capacity than that does not compile.
+    const CAP_FITS_SPREAD: () = assert!(
+        CAP <= MAX_SPREAD,
+        "an FSE table holds at most MAX_SPREAD states"
+    );
+
     /// Initialize a new empty Finite State Entropy decoding table.
     pub fn new(max_symbol: u8) -> Self {
+        let () = Self::CAP_FITS_SPREAD;
         FSETableImpl {
             max_symbol,
             // Lazy: the first `read_probabilities` grows it. Pre-reserving 256
@@ -510,7 +523,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         meta: SeqMeta<'_>,
     ) -> Result<usize, FSETableError> {
         let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
+        // The description parse stores the new log before validating it; with
+        // the decode length cleared, a failed parse leaves the table unbuilt
+        // instead of pairing that log with the previous table's length, which
+        // the state init trusts outside debug builds.
         self.accuracy_log = 0;
+        self.decode_len = 0;
 
         let bytes_read = self.read_probabilities(source, max_log)?;
         self.build_decoding_table_meta(meta)?;
@@ -697,7 +715,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
         let table_size = 1 << accuracy_log;
         // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
-        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
+        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both
+        // (`CAP <= MAX_SPREAD` is checked when the table type is compiled).
         // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
         // `build_from_probabilities` accepts acc_log up to
         // `ENTRY_MAX_ACCURACY_LOG` (16) and is reachable from fuzz, so reject an
@@ -729,7 +748,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // (256-symbol alphabet bounded by `u8`); zero-init covers
         // every slot. `u16` as upstream's `symbolNext`: a counter never
         // passes `2 * table_size - 1`, and `table_size <= CAP <= 512`.
-        let mut symbol_next = [0u16; 256];
+        //
+        // Only the counters of this table's alphabet are set, not all 256: the
+        // spread holds only symbols below `nb_symbols`, so no other counter is
+        // read, and a table build no longer clears 512 bytes it never uses.
+        let mut symbol_next = [core::mem::MaybeUninit::<u16>::uninit(); 256];
+        for counter in &mut symbol_next[..nb_symbols] {
+            counter.write(0);
+        }
 
         // Pass 1: place -1 probability symbols at the top of the
         // table AND initialise `symbol_next` for them. Upstream zstd:
@@ -747,7 +773,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             if prob == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
-                symbol_next[symbol] = 1;
+                symbol_next[symbol].write(1);
             }
         }
 
@@ -763,28 +789,39 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // when there are no -1 symbols: both place the k-th in-order symbol at
         // `next_position`-walk step k.
         if negative_idx == table_size {
-            let mut in_order = [0u8; FSE_FAST_SPREAD_BUF];
+            // Not cleared: the lay-down below writes `[0, table_size)` in full
+            // (the probabilities sum to `table_size`), and only those
+            // positions are read.
+            let mut in_order = [core::mem::MaybeUninit::<u8>::uninit(); FSE_FAST_SPREAD_BUF];
             let mut pos = 0usize;
             for symbol in 0..nb_symbols {
                 let prob = probs[symbol];
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u16;
+                symbol_next[symbol].write(prob as u16);
                 let n = prob as usize;
                 // 8 copies of the symbol byte; lay down 8 at a time (counts are
                 // mostly <= 8 on small table-logs, so the inner loop rarely runs).
-                let bytes = ((symbol as u8) as u64)
-                    .wrapping_mul(0x0101_0101_0101_0101)
-                    .to_le_bytes();
-                in_order[pos..pos + 8].copy_from_slice(&bytes);
-                let mut i = 8;
-                while i < n {
-                    in_order[pos + i..pos + i + 8].copy_from_slice(&bytes);
-                    i += 8;
+                let word = ((symbol as u8) as u64).wrapping_mul(0x0101_0101_0101_0101);
+                // The probabilities sum to `table_size <= CAP <= MAX_SPREAD`, so
+                // `pos + n` stays within it and each 8-byte write within the 8
+                // bytes of slack past it.
+                assert!(pos + n <= table_size, "FSE lay-down past the table");
+                let lay = in_order.as_mut_ptr().cast::<u8>();
+                // SAFETY: `pos + i + 8 <= pos + n + 8 <= table_size + 8 <=
+                // MAX_SPREAD + 8 == FSE_FAST_SPREAD_BUF` for every write below.
+                unsafe {
+                    lay.add(pos).cast::<u64>().write_unaligned(word);
+                    let mut i = 8;
+                    while i < n {
+                        lay.add(pos + i).cast::<u64>().write_unaligned(word);
+                        i += 8;
+                    }
                 }
                 pos += n;
             }
+            debug_assert_eq!(pos, table_size, "lay-down covers the table");
             let table_mask = table_size - 1;
             let step = (table_size >> 1) + (table_size >> 3) + 3;
             let spread_live = &mut spread[..table_size];
@@ -795,10 +832,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 debug_assert!(position <= table_mask);
                 // SAFETY: both positions are masked by `table_mask = table_size
                 // - 1` (`position` starts at 0 and is re-masked every step), so
-                // each is below `table_size == spread_live.len()`.
+                // each is below `table_size == spread_live.len()`; `s + 1 <
+                // table_size`, which the lay-down wrote in full.
                 unsafe {
-                    *spread_live.get_unchecked_mut(position) = in_order[s];
-                    *spread_live.get_unchecked_mut(paired) = in_order[s + 1];
+                    *spread_live.get_unchecked_mut(position) = in_order[s].assume_init();
+                    *spread_live.get_unchecked_mut(paired) = in_order[s + 1].assume_init();
                 }
                 position = (position + 2 * step) & table_mask;
                 s += 2;
@@ -810,7 +848,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol] = prob as u16;
+                symbol_next[symbol].write(prob as u16);
                 let symbol_u8 = symbol as u8;
                 for _ in 0..prob {
                     spread[position] = symbol_u8;
@@ -1312,12 +1350,12 @@ fn mismatch_diagnostic(_probs: &[i32]) -> Vec<i32> {
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
 /// In-order spread scratch for the fast `build_decoding_table_inner` path:
-/// the largest table reaching it is `1 << 9 = 512` entries (the
-/// `table_size <= CAP` guard in `build_decoding_table_inner` rejects anything
-/// larger before the spread runs), plus 8 bytes of slack so the 8-byte symbol
-/// lay-down can over-write past the last symbol without bounds-checking each
-/// tail write.
-const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
+/// the largest table reaching it is `MAX_SPREAD` entries (no table type has
+/// more capacity, and the `table_size <= CAP` guard in
+/// `build_decoding_table_inner` rejects anything larger before the spread
+/// runs), plus 8 bytes of slack so the 8-byte symbol lay-down can over-write
+/// past the last symbol without bounds-checking each tail write.
+const FSE_FAST_SPREAD_BUF: usize = MAX_SPREAD + 8;
 
 /// The per-state pass of a table build (upstream zstd `ZSTD_buildFSETable_body`):
 /// each state takes the next count of the symbol spread there, which gives its
@@ -1328,10 +1366,13 @@ const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
 /// (at least 1) and stays below `2 * table_size`; the bit count is then within
 /// the accuracy log by construction, asserted rather than tested per state.
 #[inline(always)]
+///
+/// `symbol_next` holds a counter for every symbol below the alphabet size the
+/// spread was built from; the spread holds no other symbol.
 fn fill_decode_entries<E: FseEntry>(
     decode: &mut [core::mem::MaybeUninit<E>],
     spread: &[u8],
-    symbol_next: &mut [u16; 256],
+    symbol_next: &mut [core::mem::MaybeUninit<u16>; 256],
     accuracy_log: u8,
     with_meta: impl Fn(u8, E) -> E,
 ) {
@@ -1340,9 +1381,12 @@ fn fill_decode_entries<E: FseEntry>(
     //        = leading_zeros(next_state) - (31 - accuracy_log).
     let leading_zeros_at_no_bits = 31 - u32::from(accuracy_log);
     for (slot, &symbol) in decode.iter_mut().zip(spread) {
-        let next_state = u32::from(symbol_next[symbol as usize]);
+        let counter = &mut symbol_next[symbol as usize];
+        // SAFETY: the spread holds only symbols of the alphabet, whose
+        // counters the caller set before building the spread.
+        let next_state = u32::from(unsafe { counter.assume_init() });
         debug_assert!(next_state >= 1 && next_state < 2 * table_size);
-        symbol_next[symbol as usize] = (next_state + 1) as u16;
+        counter.write((next_state + 1) as u16);
         let nb = next_state.leading_zeros() - leading_zeros_at_no_bits;
         debug_assert!(nb <= u32::from(accuracy_log));
         // `next_state << nb` is in `[table_size, 2 * table_size)`, so the new

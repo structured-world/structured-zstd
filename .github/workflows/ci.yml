@@ -446,6 +446,39 @@ jobs:
           CARGO_PROFILE_RELEASE_PANIC: abort
         run: cargo run --release -p ffi-bench --example stack_budget -- 32
 
+  release-checks:
+    # The `#[ignore]`d tests: checks too slow for the debug suite (the deep
+    # height-limiter sweep, level 22 on 1 MiB inputs against the reference),
+    # run with the release profile the crate ships. Runs and skips like
+    # `test`, so `ci-result` can require it.
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      # The build runs third-party build scripts; nothing here needs Git
+      # credentials, so none are left in the checkout for them to read.
+      - uses: actions/checkout@v7.0.1
+        if: needs.changes.outputs.code == 'true'
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/mold
+        if: needs.changes.outputs.code == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
+      - uses: taiki-e/install-action@nextest
+        if: needs.changes.outputs.code == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          prefix-key: release-checks
+      - name: Ignored tests (codec)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run --profile ci --cargo-profile release -p structured-zstd --features hash,std,dict-builder --run-ignored only
+      - name: Ignored tests (against the reference)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run --profile ci --cargo-profile release -p ffi-bench --features bench-internals,dict-builder --run-ignored only
+
   conformance:
     # Upstream zstd's own command-line suites (tests/playTests.sh and
     # tests/cli-tests from the pinned release) against the release CLI. The
@@ -593,6 +626,10 @@ jobs:
       - name: Clippy (embedded — kernel-scalar only)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,hash -- -D warnings
+      # The x86 tiers' code without std, on the host, which can enable them.
+      - name: Clippy (no_std + x86 tiers)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel-avx2,hash -- -D warnings
       - name: Clippy (embedded_minimal — kernel-scalar + std)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,std,hash -- -D warnings
@@ -608,9 +645,10 @@ jobs:
       # float unit. A kernel target has neither (x86_64-unknown-none is
       # -sse,-sse2,...,+soft-float), so a vector type that
       # reaches codegen there fails only on that target, as an LLVM error
-      # rather than a type error. Build for it directly, with no SIMD tier and
-      # with the x86 tiers enabled (they must stay inert without the target
-      # feature), in both profiles since -O0 and -O3 lower differently.
+      # rather than a type error. Build for it directly, with no SIMD tier, in
+      # both profiles since -O0 and -O3 lower differently. The x86 tiers cannot
+      # be enabled on it, and asking for them is refused with a message that
+      # says so.
       - name: Install bare-metal target
         run: rustup target add x86_64-unknown-none
       - name: Build (x86_64-unknown-none)
@@ -618,10 +656,17 @@ jobs:
         run: |
           for profile in dev release; do
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features hash
-            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features caller-workspace,hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features legacy,hash
           done
+      - name: Refuse the x86 tiers (x86_64-unknown-none)
+        working-directory: zstd
+        run: |
+          if cargo build -p structured-zstd --lib --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash 2> refused.log; then
+            echo "the x86 tiers built on a soft-float target" >&2
+            exit 1
+          fi
+          grep -q "the x86 kernel tiers" refused.log
 
   wasm:
     # #347 / #348: the wasm32 simd128 kernel tier + the npm package
@@ -1094,7 +1139,7 @@ jobs:
     # expected outcome. The bench jobs are left out: they never run on pull
     # requests.
     name: CI result
-    needs: [changes, lint, c-abi, test, conformance, reverse-deps, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
+    needs: [changes, lint, c-abi, test, release-checks, conformance, reverse-deps, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
@@ -1170,6 +1215,11 @@ jobs:
           # published gh-pages snapshot keeps full coverage for the
           # dashboard + tagged baselines (#164).
           EVENT_NAME: ${{ github.event_name }}
+        # `runtime_setup` installs what a shard needs to RUN the prebuilt
+        # binary, nothing for building it: the i686 binary needs only the
+        # 32-bit loader and libgcc_s (libc6-i386, lib32gcc-s1), which the
+        # runner image already carries, so its shards fetch nothing and a
+        # package-mirror outage cannot fail them.
         run: |
           cat > targets.json <<'EOF'
           [
@@ -1184,7 +1234,7 @@ jobs:
               "id": "i686-gnu",
               "target_triple": "i686-unknown-linux-gnu",
               "build_setup": "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386",
-              "runtime_setup": "sudo apt-get update && sudo apt-get install -y libc6-dev-i386",
+              "runtime_setup": "",
               "timeout_minutes": 120
             },
             {

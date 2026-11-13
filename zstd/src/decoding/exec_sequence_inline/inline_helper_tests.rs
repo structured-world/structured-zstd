@@ -1,5 +1,220 @@
 use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
 
+/// The doubling copy of a match writes what a byte-by-byte copy writes, for
+/// short and long offsets, a match no longer than its offset, lengths around each
+/// doubled piece and past the distance limit, and every alignment of the
+/// write, and stays within its 31-byte overshoot.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for skew in 0..32usize {
+        let prefix: alloc::vec::Vec<u8> = (0..(400 + skew) as u32)
+            .map(|b| (b as u8).wrapping_mul(37) ^ 0x5a)
+            .collect();
+        for offset in (1..=40usize).chain([63, 64, 100, 380]) {
+            for length in [
+                offset - 1,
+                offset,
+                offset + 1,
+                2 * offset - 1,
+                2 * offset,
+                2 * offset + 1,
+                3 * offset,
+                4 * offset + 7,
+                7 * offset,
+                3700,
+                20000,
+            ] {
+                let mut expected = prefix.clone();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                let mut out = prefix.clone();
+                out.resize(prefix.len() + length + 31 + 16, 0xee);
+                let dst = prefix.len();
+                // SAFETY: `offset <= 400` bytes precede the match, the buffer
+                // holds it plus its 31-byte overshoot, and the CPU has AVX2.
+                unsafe {
+                    super::x86::match_copy_doubling_avx2(
+                        out.as_mut_ptr().add(dst),
+                        offset,
+                        length,
+                        crate::cpu_kernel::detect_fast_string_moves(),
+                    )
+                };
+                assert_eq!(
+                    out[..expected.len()],
+                    expected[..],
+                    "skew {skew} offset {offset} length {length}"
+                );
+                assert!(
+                    out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                    "skew {skew} offset {offset} length {length} wrote past its overshoot",
+                );
+            }
+        }
+    }
+}
+
+/// A match from 4 KiB or more back goes, on a CPU with fast string moves, by a
+/// vector head up to a 64-byte destination boundary and `rep movsb` for the
+/// rest; it writes what a byte-by-byte copy writes for every destination
+/// alignment, lengths around the 4 KiB threshold, and stays within its
+/// overshoot. Without fast string moves the same cases run the vector loop.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 9000;
+    let erms = std::arch::is_x86_feature_detected!("ermsb");
+    for fast_string_moves in [false, erms] {
+        for skew in 0..64usize {
+            let prefix: alloc::vec::Vec<u8> = (0..(PREFIX + skew) as u32)
+                .map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            for offset in [4096usize, 5000, 8191] {
+                for length in [256usize, 4095, 4096, 4097, 4096 + 64 + 7, 20000] {
+                    let mut expected = prefix.clone();
+                    for _ in 0..length {
+                        expected.push(expected[expected.len() - offset]);
+                    }
+                    let mut out = prefix.clone();
+                    out.resize(prefix.len() + length + 31 + 16, 0xee);
+                    let dst = prefix.len();
+                    // SAFETY: `offset < PREFIX` bytes precede the match, the
+                    // buffer holds it plus its 31-byte overshoot, the CPU has
+                    // AVX2, and has fast string moves when they are asked for.
+                    unsafe {
+                        super::x86::match_copy_doubling_avx2(
+                            out.as_mut_ptr().add(dst),
+                            offset,
+                            length,
+                            fast_string_moves,
+                        )
+                    };
+                    let what = alloc::format!(
+                        "string moves {fast_string_moves} skew {skew} offset {offset} length {length}"
+                    );
+                    assert_eq!(out[..expected.len()], expected[..], "{what}");
+                    assert!(
+                        out[dst + length + 31..].iter().all(|&b| b == 0xee),
+                        "{what} wrote past its overshoot",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A sequence at the very end of an output, its overshoot end `cap_w` 1 to 31
+/// bytes before the sequence's own end, writes what a byte-by-byte copy
+/// writes, whether its match takes the split copy (offset 32 or more) or the
+/// exact one, and writes nothing past the memory the overshoot may use.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn tight_tail_writes_the_sequence_like_a_byte_copy() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 5000;
+    let prefix: alloc::vec::Vec<u8> = (0..PREFIX as u32)
+        .map(|b| (b.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    let literals: alloc::vec::Vec<u8> = (0..64u8).map(|b| b ^ 0xa5).collect();
+    for offset in [1usize, 7, 16, 31, 32, 33, 100, 380, 4096] {
+        for lit_length in [0usize, 1, 17] {
+            for match_length in [3usize, 40, 255, 256, 300, 3600] {
+                for short in 1..32usize {
+                    let end = PREFIX + lit_length + match_length;
+                    let Some(cap_w) = end.checked_sub(short) else {
+                        continue;
+                    };
+                    if cap_w < PREFIX {
+                        continue;
+                    }
+                    let mut expected = prefix.clone();
+                    expected.extend_from_slice(&literals[..lit_length]);
+                    for _ in 0..match_length {
+                        expected.push(expected[expected.len() - offset]);
+                    }
+                    let mut out = prefix.clone();
+                    out.resize(cap_w + 31 + 16, 0xee);
+                    // SAFETY: the buffer holds the sequence (`end <= cap_w + 31`)
+                    // and the overshoot end; the literals hold 16 bytes past
+                    // their length; `offset <= PREFIX` bytes precede the match;
+                    // the host has AVX2.
+                    unsafe {
+                        super::x86::exec_tight_tail_avx2(
+                            out.as_mut_ptr(),
+                            PREFIX,
+                            cap_w,
+                            literals.as_ptr(),
+                            lit_length,
+                            offset,
+                            match_length,
+                            crate::cpu_kernel::detect_fast_string_moves(),
+                        )
+                    };
+                    let what = alloc::format!(
+                        "offset {offset} lit {lit_length} match {match_length} short {short}"
+                    );
+                    assert_eq!(out[..end], expected[..], "{what}");
+                    assert!(
+                        out[cap_w + 31..].iter().all(|&b| b == 0xee),
+                        "{what} wrote past the overshoot end"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The doubling copy reads only bytes already written: a destination grown
+/// in place leaves the bytes past the write uninitialised (`FlatBuf`'s spare
+/// capacity), and a load that reaches into them reads uninitialised memory
+/// even when no such byte reaches the output. The match is written into
+/// uninitialised capacity, so an interpreter that tracks initialisation
+/// (Miri) rejects any such load; the output is checked as well.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn match_copy_doubling_reads_only_written_bytes() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    const PREFIX: usize = 128;
+    for offset in [1usize, 5, 16, 31, 32, 40, 100] {
+        for length in [offset + 1, 3 * offset + 5, 300] {
+            let mut expected: alloc::vec::Vec<u8> = (0..PREFIX as u32)
+                .map(|b| (b as u8).wrapping_mul(37) ^ 0x5a)
+                .collect();
+            let mut out = expected.clone();
+            out.reserve_exact(length + 31);
+            for _ in 0..length {
+                expected.push(expected[expected.len() - offset]);
+            }
+            // SAFETY: `offset <= PREFIX` initialised bytes precede the match,
+            // the capacity holds it plus its 31-byte overshoot, and the CPU
+            // has AVX2.
+            unsafe {
+                super::x86::match_copy_doubling_avx2(
+                    out.as_mut_ptr().add(PREFIX),
+                    offset,
+                    length,
+                    crate::cpu_kernel::detect_fast_string_moves(),
+                )
+            };
+            // SAFETY: the copy wrote every byte of the match.
+            let written = unsafe { core::slice::from_raw_parts(out.as_ptr(), PREFIX + length) };
+            assert_eq!(written, &expected[..], "offset {offset} length {length}");
+        }
+    }
+}
+
 /// The shuffle copy expanded in an SSSE3 scope, as the executor expands it.
 ///
 /// # Safety

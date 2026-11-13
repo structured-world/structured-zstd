@@ -1198,7 +1198,9 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
 
     /// AVX2-tier override — 32-byte ymm match-copy for `offset >= 32`. Same
     /// contiguity contract; mirrors `FlatBuf::exec_sequence_inline_avx2`.
-    #[cfg(target_arch = "x86_64")]
+    // A soft-float x86_64 target (no SSE2 in its baseline) cannot enable AVX2;
+    // it keeps the trait's default.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn exec_sequence_inline_avx2(
