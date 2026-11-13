@@ -292,6 +292,21 @@ impl RowTables {
     }
 }
 
+/// Writes `live` from a dictionary index's slots of the same length: `empty`
+/// stays `empty`, every other position moves up by `shift`. One straight pass
+/// over both, so it compiles to a vector compare, add and select.
+#[inline]
+fn lift_slots(live: &mut [u32], index: &[u32], shift: u32, empty: u32) {
+    debug_assert_eq!(live.len(), index.len());
+    for (slot, &position) in live.iter_mut().zip(index) {
+        *slot = if position == empty {
+            empty
+        } else {
+            position + shift
+        };
+    }
+}
+
 /// Upstream `ZSTD_row_nextIndex` (zstd_lazy.c:798): slot 0 holds the cursor, so
 /// it cycles over `1..=row_mask`. The wrap is arithmetic because it falls on an
 /// unpredictable insert of each row, and written as a branch it was the search's
@@ -4675,13 +4690,12 @@ impl RowMatchGenerator {
                 let rows_len = self.rows_len;
                 let row_log = self.row_log;
                 debug_assert!(index.positions.len() == rows_len && index.tags.len() == rows_len);
-                for (live, &concat) in self.tables[..rows_len].iter_mut().zip(&index.positions) {
-                    *live = if concat == ROW_EMPTY_SLOT {
-                        ROW_EMPTY_SLOT
-                    } else {
-                        concat + shift
-                    };
-                }
+                lift_slots(
+                    &mut self.tables[..rows_len],
+                    &index.positions,
+                    shift,
+                    ROW_EMPTY_SLOT,
+                );
                 // SAFETY: the tag region is `tags_len == rows_len` bytes at
                 // the tail base (the layout `ensure_tables` established), and
                 // `tables` is borrowed exclusively through `self`.
@@ -4703,20 +4717,13 @@ impl RowMatchGenerator {
                 debug_assert!(
                     index.hc_hash.len() == hash.len() && index.hc_chain.len() == chain.len()
                 );
-                let lift = |concat: u32| {
-                    if concat == ROW_EMPTY_SLOT {
-                        ROW_EMPTY_SLOT
-                    } else {
-                        concat + shift
-                    }
-                };
-                for (live, &concat) in hash.iter_mut().zip(&index.hc_hash) {
-                    *live = lift(concat);
-                }
-                let mask = chain.len() - 1;
-                for (slot, &concat) in index.hc_chain.iter().enumerate() {
-                    chain[(slot + floor) & mask] = lift(concat);
-                }
+                lift_slots(hash, &index.hc_hash, shift, ROW_EMPTY_SLOT);
+                // The link of position `p` sits at `p & mask`: moved up by the
+                // floor, the table is the index's turned round by it.
+                let turn = floor & (chain.len() - 1);
+                let (head, tail) = index.hc_chain.split_at(chain.len() - turn);
+                lift_slots(&mut chain[turn..], head, shift, ROW_EMPTY_SLOT);
+                lift_slots(&mut chain[..turn], tail, shift, ROW_EMPTY_SLOT);
             }
             LazyFinder::Tree => {
                 let (hash, tree) = self.tables.split_at_mut(self.hc_split);
@@ -4725,16 +4732,13 @@ impl RowMatchGenerator {
                 );
                 // 0 is the tree's "none"; every real index is at least
                 // `BT_IDX_BASE`.
-                let lift = |node: u32| if node == 0 { 0 } else { node + shift };
-                for (live, &node) in hash.iter_mut().zip(&index.hc_hash) {
-                    *live = lift(node);
-                }
-                let mask = tree.len() / 2 - 1;
-                for (pair, links) in index.hc_chain.as_chunks::<2>().0.iter().enumerate() {
-                    let at = 2 * ((pair + floor) & mask);
-                    tree[at] = lift(links[0]);
-                    tree[at + 1] = lift(links[1]);
-                }
+                lift_slots(hash, &index.hc_hash, shift, 0);
+                // A node's two links sit at twice its index's low bits, so the
+                // table turns round by twice the floor's.
+                let turn = 2 * (floor & (tree.len() / 2 - 1));
+                let (head, tail) = index.hc_chain.split_at(tree.len() - turn);
+                lift_slots(&mut tree[turn..], head, shift, 0);
+                lift_slots(&mut tree[..turn], tail, shift, 0);
             }
         }
     }

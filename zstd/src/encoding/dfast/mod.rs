@@ -1270,34 +1270,24 @@ impl DfastMatchGenerator {
             return;
         }
         debug_assert_eq!(self.history_start, 0, "a dictionary is primed at the front");
-        // May rebase, so the bias is read after it.
-        self.ensure_room_for(self.history_abs_start + region - 1);
-        let bias = u32::try_from(self.history_abs_start - self.position_base)
-            .expect("ensure_room_for keeps the dictionary within a slot's range");
+        // Every slot is rewritten, so nothing holds the old base: it restarts
+        // at the dictionary's first byte, where a slot's packed position is
+        // the index's own. A tagged table is then the index word for word,
+        // and a bare one the index without its tags.
+        self.position_base = self.history_abs_start;
+        debug_assert!(region <= self.max_rel());
         let tagged = self.tagged;
         let long_len = self.long_len();
         let Some(index) = self.dict.table() else {
             return;
         };
         let (long, short) = self.tables.split_at_mut(long_len);
-        debug_assert!(index.long.len() == long.len() && index.short.len() == short.len());
         let fill = |live: &mut [u32], index: &[u32]| {
             if tagged {
-                let bias = bias << DFAST_TAG_BITS;
-                for (slot, &word) in live.iter_mut().zip(index) {
-                    *slot = if word == DFAST_EMPTY_SLOT {
-                        DFAST_EMPTY_SLOT
-                    } else {
-                        word + bias
-                    };
-                }
+                live.copy_from_slice(index);
             } else {
                 for (slot, &word) in live.iter_mut().zip(index) {
-                    *slot = if word == DFAST_EMPTY_SLOT {
-                        DFAST_EMPTY_SLOT
-                    } else {
-                        (word >> DFAST_TAG_BITS) + bias
-                    };
+                    *slot = word >> DFAST_TAG_BITS;
                 }
             }
         };
