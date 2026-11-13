@@ -1072,6 +1072,12 @@ impl MatchGeneratorDriver {
         self.dfast_matcher().dict_table_builds
     }
 
+    /// Whether a snapshot of a primed dictionary's tables is held. Test-only.
+    #[cfg(test)]
+    pub(crate) fn holds_primed_snapshot(&self) -> bool {
+        self.primed.is_some()
+    }
+
     /// The row backend's dict index builds started and how many allocated.
     /// Test-only.
     #[cfg(test)]
@@ -1229,6 +1235,19 @@ impl MatchGeneratorDriver {
             .is_some_and(crate::encoding::levels::config::DictUse::attaches)
     }
 
+    /// Whether the dfast backend fills this frame's tables from the index of
+    /// its `dict_len`-byte dictionary rather than hashing the dictionary into
+    /// them: a frame that copies the dictionary, whose tables have the
+    /// index's geometry. A dictionary loaded into tables resolved for the
+    /// frame's source is hashed into them, as upstream loads it per frame.
+    fn dfast_copies_dict_index(&self, dict_len: usize) -> bool {
+        self.reset_dict_use == Some(crate::encoding::levels::config::DictUse::Copy)
+            && matches!(
+                &self.storage,
+                MatcherStorage::Dfast(dfast) if dfast.dict_index_serves_copy(dict_len)
+            )
+    }
+
     fn skip_matching_for_dictionary_priming<K: EncodeTier>(&mut self, dict_len: usize) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
@@ -1254,8 +1273,13 @@ impl MatchGeneratorDriver {
                 // `skip_matching_for_dict_attach` self-gates on `use_fast_loop`
                 // (only fast-loop levels carry the dual-probe; general-path
                 // levels fall back to the dense copy).
+                // A copied dictionary of the CDict's geometry goes into the
+                // same index, and the live tables are filled from it once the
+                // whole dictionary is in (`finish_dict_copy`).
                 if self.dict_attached() {
                     self.dfast_matcher_mut().skip_matching_for_dict_attach();
+                } else if self.dfast_copies_dict_index(dict_len) {
+                    self.dfast_matcher_mut().skip_matching_for_dict_copy();
                 } else {
                     self.dfast_matcher_mut().park_dict_cache();
                     self.dfast_matcher_mut().skip_matching_dense();

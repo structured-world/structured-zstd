@@ -1110,6 +1110,44 @@ fn dict_tables_survive_copied_frames_and_dictionary_changes() {
     }
 }
 
+/// A dfast compressor whose first frames copy the dictionary builds the
+/// dictionary's index once all the same: the copying frames fill their
+/// tables from it, and the attaching frame that follows searches it. Every
+/// frame is byte-identical to a fresh compressor's.
+#[test]
+fn copied_frames_build_the_dictionary_index_an_attached_frame_searches() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let small: Vec<u8> = dict_raw[1000..3000].to_vec();
+    let large: Vec<u8> = dict_raw[..40 * 1024].iter().rev().copied().collect();
+    let prepare =
+        |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
+    let level = super::CompressionLevel::from_level(3);
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    compressor
+        .set_encoder_dictionary(prepare(dict_raw))
+        .unwrap();
+    for input in [&large, &large, &small, &large, &small, &small] {
+        let frame = compressor.compress_independent_frame(input);
+        let mut fresh: FrameCompressor = FrameCompressor::new(level);
+        fresh.set_encoder_dictionary(prepare(dict_raw)).unwrap();
+        assert_eq!(
+            frame,
+            fresh.compress_independent_frame(input),
+            "a {}-byte frame",
+            input.len()
+        );
+    }
+    assert_eq!(
+        compressor.state.matcher.dfast_dict_table_builds(),
+        (1, 1),
+        "index builds started, of them allocating"
+    );
+    assert!(
+        !compressor.state.matcher.holds_primed_snapshot(),
+        "the index is the dictionary's only copy of its tables"
+    );
+}
+
 /// A dictionary index a small frame built does not stand in for a larger
 /// frame's. How much of the dictionary the index covers is the dictionary's
 /// own (upstream builds it once into the CDict), not the frame's: a tiny

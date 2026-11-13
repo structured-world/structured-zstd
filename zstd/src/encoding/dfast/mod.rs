@@ -199,6 +199,11 @@ pub(crate) struct DfastMatchGenerator {
     /// (the CDict's `hashLog` / `chainLog`), set by the driver; `None` uses
     /// the live widths.
     dict_table_bits: Option<(usize, usize)>,
+    /// Whether this frame's tables were filled from the dictionary's index
+    /// ([`Self::finish_dict_copy`]): the next frame fills its own the same
+    /// way, so the driver keeps no snapshot of them. Cleared by
+    /// [`Self::reset`].
+    dict_copied_from_index: bool,
     /// Borrowed one-shot input window, registered once per frame:
     /// `(input_base_ptr, total_len)`. When `Some`, the fast loop sources
     /// bytes from the caller's in-place input slice with absolute input
@@ -468,6 +473,7 @@ impl DfastMatchGenerator {
             #[cfg(test)]
             dict_table_builds: (0, 0),
             dict_table_bits: None,
+            dict_copied_from_index: false,
             borrowed_input: None,
             borrowed_block: None,
             borrowed_dict: false,
@@ -841,6 +847,7 @@ impl DfastMatchGenerator {
             kept: reborrow_region,
         } = self.retired.take().unwrap_or_else(|| self.retire());
         self.offset_hist = [1, 4, 8];
+        self.dict_copied_from_index = false;
         if let Some(region) = reborrow_region {
             self.window_size = region;
             self.window_blocks.clear();
@@ -1206,6 +1213,96 @@ impl DfastMatchGenerator {
     ///
     pub(crate) fn mark_dict_primed(&mut self) {
         self.dict.mark_primed();
+    }
+
+    /// Whether a frame that copies a dictionary of `dict_len` bytes can take
+    /// its live tables from the dictionary's index instead of hashing the
+    /// dictionary into them: the index has the live tables' widths (a copied
+    /// dictionary gives the frame its own, upstream
+    /// `ZSTD_resetCCtx_byCopyingCDict`), and every position of the dictionary
+    /// fits beside a tag in an index slot.
+    pub(crate) fn dict_index_serves_copy(&self, dict_len: usize) -> bool {
+        self.dict_table_bits == Some((self.long_hash_bits, self.short_hash_bits))
+            && dict_len < (1usize << (u32::BITS - DFAST_TAG_BITS)) - 1
+    }
+
+    /// [`Self::skip_matching_for_dict_attach`] for a frame that copies the
+    /// dictionary: the block goes into the dictionary's index, built once per
+    /// dictionary, and the live tables are left for
+    /// [`Self::finish_dict_copy`] to fill from it.
+    pub(crate) fn skip_matching_for_dict_copy(&mut self) {
+        self.ensure_hash_tables();
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            return;
+        }
+        let end_concat = self.window_size;
+        self.prime_dict_tables_for_range(end_concat - current_len, end_concat);
+    }
+
+    /// Ends the prime of a copied dictionary: the live tables take every slot
+    /// of the dictionary's index (upstream `ZSTD_copyCDictTableIntoCCtx`), and
+    /// the index is set aside for the next frame of this dictionary, attached
+    /// or copied.
+    pub(crate) fn finish_dict_copy(&mut self) {
+        self.dict.mark_primed();
+        self.copy_dict_index_into_live();
+        self.dict_keep.park(&mut self.dict);
+        self.dict_copied_from_index = true;
+    }
+
+    /// Whether [`Self::finish_dict_copy`] filled this frame's tables.
+    pub(crate) fn dict_copied_from_index(&self) -> bool {
+        self.dict_copied_from_index
+    }
+
+    /// Writes every live slot from the dictionary index's slot of the same
+    /// hash: an index slot holds a position counted from the dictionary's
+    /// start above its tag, and the live slot holds that position counted
+    /// from `position_base`, with the tag when the live format is tagged. The
+    /// result is what hashing the dictionary into the live tables leaves: the
+    /// same keys in the same order, the last position of each slot winning.
+    fn copy_dict_index_into_live(&mut self) {
+        let region = self.dict.region_len();
+        if self.dict.table().is_none() || region == 0 {
+            // A dictionary too short to index: nothing of it is searchable,
+            // and what earlier frames left in the tables lies below the floor.
+            return;
+        }
+        debug_assert_eq!(self.history_start, 0, "a dictionary is primed at the front");
+        // May rebase, so the bias is read after it.
+        self.ensure_room_for(self.history_abs_start + region - 1);
+        let bias = u32::try_from(self.history_abs_start - self.position_base)
+            .expect("ensure_room_for keeps the dictionary within a slot's range");
+        let tagged = self.tagged;
+        let long_len = self.long_len();
+        let Some(index) = self.dict.table() else {
+            return;
+        };
+        let (long, short) = self.tables.split_at_mut(long_len);
+        debug_assert!(index.long.len() == long.len() && index.short.len() == short.len());
+        let fill = |live: &mut [u32], index: &[u32]| {
+            if tagged {
+                let bias = bias << DFAST_TAG_BITS;
+                for (slot, &word) in live.iter_mut().zip(index) {
+                    *slot = if word == DFAST_EMPTY_SLOT {
+                        DFAST_EMPTY_SLOT
+                    } else {
+                        word + bias
+                    };
+                }
+            } else {
+                for (slot, &word) in live.iter_mut().zip(index) {
+                    *slot = if word == DFAST_EMPTY_SLOT {
+                        DFAST_EMPTY_SLOT
+                    } else {
+                        (word >> DFAST_TAG_BITS) + bias
+                    };
+                }
+            }
+        };
+        fill(long, &index.long);
+        fill(short, &index.short);
     }
 
     /// Let go of the cached dict tables: the dictionary changed. Their
