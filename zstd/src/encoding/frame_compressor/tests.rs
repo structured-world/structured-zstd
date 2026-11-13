@@ -1110,42 +1110,64 @@ fn dict_tables_survive_copied_frames_and_dictionary_changes() {
     }
 }
 
-/// A dfast compressor whose first frames copy the dictionary builds the
+/// A compressor whose first frames copy the dictionary builds the
 /// dictionary's index once all the same: the copying frames fill their
-/// tables from it, and the attaching frame that follows searches it. Every
-/// frame is byte-identical to a fresh compressor's.
+/// tables from it, and the attaching frame that follows searches it, with no
+/// snapshot of the tables kept beside it. On the dfast backend (level 3) and
+/// the lazy backend's three finders: rows (levels 5 and 9), the hash chain (a
+/// dictionary small enough for a 2^14 window) and the binary tree (level 12
+/// at this dictionary's size). Every frame is byte-identical to a fresh
+/// compressor's.
 #[test]
 fn copied_frames_build_the_dictionary_index_an_attached_frame_searches() {
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let short_dict = &dict_raw[4096..7096];
     let small: Vec<u8> = dict_raw[1000..3000].to_vec();
     let large: Vec<u8> = dict_raw[..40 * 1024].iter().rev().copied().collect();
     let prepare =
         |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
-    let level = super::CompressionLevel::from_level(3);
-    let mut compressor: FrameCompressor = FrameCompressor::new(level);
-    compressor
-        .set_encoder_dictionary(prepare(dict_raw))
-        .unwrap();
-    for input in [&large, &large, &small, &large, &small, &small] {
-        let frame = compressor.compress_independent_frame(input);
-        let mut fresh: FrameCompressor = FrameCompressor::new(level);
-        fresh.set_encoder_dictionary(prepare(dict_raw)).unwrap();
+    let cases: [(i32, &[u8]); 5] = [
+        (3, dict_raw),
+        (5, dict_raw),
+        (9, dict_raw),
+        (12, dict_raw),
+        (5, short_dict),
+    ];
+    for (number, dictionary) in cases {
+        let level = super::CompressionLevel::from_level(number);
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        compressor
+            .set_encoder_dictionary(prepare(dictionary))
+            .unwrap();
+        for input in [&large, &large, &small, &large, &small, &small] {
+            let frame = compressor.compress_independent_frame(input);
+            let mut fresh: FrameCompressor = FrameCompressor::new(level);
+            fresh.set_encoder_dictionary(prepare(dictionary)).unwrap();
+            assert_eq!(
+                frame,
+                fresh.compress_independent_frame(input),
+                "level {number}, a {}-byte dictionary, a {}-byte frame",
+                dictionary.len(),
+                input.len()
+            );
+        }
+        let builds = if number == 3 {
+            compressor.state.matcher.dfast_dict_table_builds()
+        } else {
+            compressor.state.matcher.row_dict_index_builds()
+        };
         assert_eq!(
-            frame,
-            fresh.compress_independent_frame(input),
-            "a {}-byte frame",
-            input.len()
+            builds,
+            (1, 1),
+            "level {number}, a {}-byte dictionary: index builds started, of them allocating",
+            dictionary.len()
+        );
+        assert!(
+            !compressor.state.matcher.holds_primed_snapshot(),
+            "level {number}, a {}-byte dictionary: the index is the only copy of its tables",
+            dictionary.len()
         );
     }
-    assert_eq!(
-        compressor.state.matcher.dfast_dict_table_builds(),
-        (1, 1),
-        "index builds started, of them allocating"
-    );
-    assert!(
-        !compressor.state.matcher.holds_primed_snapshot(),
-        "the index is the dictionary's only copy of its tables"
-    );
 }
 
 /// A dictionary index a small frame built does not stand in for a larger

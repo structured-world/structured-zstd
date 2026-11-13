@@ -481,7 +481,12 @@ impl MatchGeneratorDriver {
         // Tables filled from the dictionary's index are filled from it again
         // by the next frame (upstream copies the CDict's tables per frame);
         // a snapshot would be a second copy of them and of the dictionary.
-        if matches!(&self.storage, MatcherStorage::Dfast(dfast) if dfast.dict_copied_from_index()) {
+        let from_index = match &self.storage {
+            MatcherStorage::Dfast(dfast) => dfast.dict_copied_from_index(),
+            MatcherStorage::Row(row) => row.dict_copied_from_index(),
+            _ => false,
+        };
+        if from_index {
             return;
         }
         let key = PrimedKey {
