@@ -64,9 +64,9 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// block out of its window buffer (`zstd_decompress.c`, `zdss_flush`).
     delivered: usize,
     /// Whether long matches from far back may go by `rep movsb`, see
-    /// [`crate::cpu_kernel::detect_fast_string_moves`]. A decoder setting the
-    /// frame layer applies as each frame starts; read only on the rare long
-    /// match path, so it is never a live value in the sequence loop.
+    /// [`crate::cpu_kernel::detect_fast_string_moves`]. Set by whoever builds
+    /// the buffer and kept across `reset`; read only on the rare long match
+    /// path, so it is never a live value in the sequence loop.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     fast_string_moves: bool,
 }

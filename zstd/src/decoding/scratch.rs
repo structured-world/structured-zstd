@@ -222,6 +222,15 @@ impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
 
 impl<B: BufferBackend> DecoderScratch<B> {
     pub fn new(window_size: usize) -> DecoderScratch<B> {
+        #[cfg_attr(
+            not(all(target_arch = "x86_64", feature = "kernel-avx2")),
+            allow(unused_mut)
+        )]
+        let mut buffer = DecodeBuffer::new(window_size);
+        // Answered here, where the scratch is built, and kept across frame
+        // resets: a frame pays nothing for it.
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        buffer.set_fast_string_moves(crate::cpu_kernel::detect_fast_string_moves());
         DecoderScratch {
             #[cfg(not(feature = "caller-workspace"))]
             huf: HuffmanScratch {
@@ -243,7 +252,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 of_source: SeqTableSource::Local,
                 ml_source: SeqTableSource::Local,
             }),
-            buffer: DecodeBuffer::new(window_size),
+            buffer,
             offset_hist: [1, 4, 8],
 
             block_content_buffer: Vec::new(),
