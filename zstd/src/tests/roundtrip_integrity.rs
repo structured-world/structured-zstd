@@ -341,6 +341,43 @@ fn small_repetitive_compresses_on_borrowed_hashchain_band() {
     }
 }
 
+/// A slice past 16 MiB compressed in place at level 3 keeps tagged slots and
+/// rebases them three times on the way (at 16, 24 and 32 MiB): the frame must
+/// decode to the input, and the words it is made of must still be found past
+/// every rebase.
+#[test]
+fn a_long_slice_in_place_survives_its_table_rebases() {
+    const LEN: usize = 34 << 20;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Text of 4096 eight-letter words drawn at random: twelve bits a word,
+    // found only by matching.
+    let words: Vec<[u8; 8]> = (0..4096)
+        .map(|_| next().to_le_bytes().map(|byte| b'a' + byte % 26))
+        .collect();
+    let mut data = Vec::with_capacity(LEN);
+    while data.len() < LEN {
+        data.extend_from_slice(&words[(next() % 4096) as usize]);
+    }
+    let compressed = compress_slice_to_vec(&data[..], CompressionLevel::Level(3));
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
+    let mut roundtrip = Vec::new();
+    decoder.read_to_end(&mut roundtrip).unwrap();
+    assert!(data == roundtrip, "the frame does not decode to the input");
+    // Each megabyte is coded on its own merits, so a megabyte whose tables a
+    // rebase had emptied or misplaced shows as literals.
+    assert!(
+        compressed.len() < LEN / 3,
+        "{} bytes: the words were not found across the rebases",
+        compressed.len()
+    );
+}
+
 /// Multi-block data exercises FSE table reuse across blocks and offset history
 /// persistence across block boundaries.
 #[test]

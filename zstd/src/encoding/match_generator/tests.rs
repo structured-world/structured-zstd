@@ -5703,12 +5703,12 @@ fn a_frame_after_a_stream_lays_out_only_what_its_reset_keeps() {
     }
 }
 
-/// A slice scanned in place numbers its positions across the whole input, so
-/// one longer than a tagged slot holds is laid out untagged from the start,
-/// whatever its window: choosing tagged tables from the window alone had the
-/// borrowed scan empty them a second time before its first block.
+/// A slice scanned in place is tagged by its window alone, as a staged stream
+/// is: one longer than a tagged slot's position range rebases its tables at
+/// the block that would pass the range. Left untagged for its length, an input
+/// past 16 MiB read every colliding candidate's bytes.
 #[test]
-fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
+fn a_borrowed_slice_past_the_tagged_range_keeps_its_tags() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let len = crate::encoding::dfast::DFAST_TAGGED_MAX_REL + 1;
     let level = CompressionLevel::Level(3);
@@ -5725,7 +5725,7 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
         driver.dfast_matcher().max_window_size <= crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT,
         "fixture: the window alone would allow tagged slots"
     );
-    assert!(!driver.dfast_matcher().tagged);
+    assert!(driver.dfast_matcher().tagged);
 }
 
 /// A short-cache tag pays only when a probe tends to land on a slot another

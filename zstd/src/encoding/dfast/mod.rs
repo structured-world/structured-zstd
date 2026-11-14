@@ -1560,13 +1560,6 @@ impl DfastMatchGenerator {
     /// (or [`Self::reset`]) — the matcher stores a raw pointer into it and
     /// dereferences it during every staged block scan.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // A borrowed scan packs absolute input positions, so the layout left a
-        // slice longer than a tagged slot holds untagged.
-        assert!(
-            !self.tagged || buffer.len() <= DFAST_TAGGED_MAX_REL,
-            "a borrowed input of {} bytes needs untagged tables",
-            buffer.len()
-        );
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
         self.borrowed_block = None;
         // Positions continue from earlier frames, so their slots fall below

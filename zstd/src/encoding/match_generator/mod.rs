@@ -1876,17 +1876,11 @@ impl Matcher for MatchGeneratorDriver {
                 // Tagged slots unless the dictionary is attached (its loop reads
                 // the live tables bare) or the window, dictionary included, is
                 // past what a tagged slot's position range keeps across a rebase.
-                // A slice scanned in place numbers its positions from its start
-                // and never rebases, so its whole length has to fit as well.
+                // A slice scanned in place rebases as a staged stream does, at
+                // the start of the block that would pass the range, so its
+                // length does not enter.
                 let dict_len = dict_hint.map_or(0, |sizes| sizes.content);
-                let in_place_fits = !self.frame_in_place
-                    || matches!(
-                        workspace.ingest(),
-                        crate::encoding::workspace::IngestPlan::Slice(len)
-                            if len <= crate::encoding::dfast::DFAST_TAGGED_MAX_REL
-                    );
                 let tagged = !dict_attaches
-                    && in_place_fits
                     && max_window_size.checked_add(dict_len).is_some_and(|window| {
                         (crate::encoding::dfast::DFAST_TAGGED_WINDOW_FLOOR
                             ..=crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT)

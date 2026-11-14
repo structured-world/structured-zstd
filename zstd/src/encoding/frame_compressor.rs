@@ -1770,9 +1770,9 @@ pub(crate) fn block_ceiling(target: Option<u32>, max: Option<u32>) -> usize {
 ///
 /// The slice impl exists so the slice entry points
 /// (`compress_independent_frame_into`, `compress_oneshot_*` fallbacks)
-/// append with one `extend_from_slice` — the generic reader impl must
-/// `resize` an initialized target region before `Read::read` can fill it,
-/// which costs a zero-fill memset of the whole block on every frame.
+/// append with one `extend_from_slice`. The generic reader impl must hand
+/// `Read::read` an initialized target region, which a room not written
+/// before has to be zeroed for.
 ///
 /// `buf` is the matcher's history on the in-place path and a staging `Vec`
 /// otherwise.
@@ -1883,9 +1883,10 @@ impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
             // read against the full block window.
             None => block_capacity,
         };
-        if buf.len() < initial_target {
-            buf.resize(initial_target, 0);
-        }
+        // The read overwrites what it fills and the rest is truncated below,
+        // so the room is only made readable, not cleared: a history zeroes
+        // what it has not held before and nothing else.
+        buf.grow_for_read(initial_target);
         loop {
             if reached_eof || filled == block_capacity {
                 break;
@@ -1898,7 +1899,7 @@ impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
                 // here (the `== block_capacity` break fired otherwise), so
                 // `filled + 1 <= block_capacity`.
                 let grow_to = (buf.len() * 2).clamp(filled + 1, block_capacity);
-                buf.resize(grow_to, 0);
+                buf.grow_for_read(grow_to);
             }
             let read_end = buf.len();
             let new_bytes = self.reader.read(&mut buf[filled..read_end]).unwrap();
