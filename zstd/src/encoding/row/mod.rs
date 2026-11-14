@@ -292,6 +292,21 @@ impl RowTables {
     }
 }
 
+/// Writes `live` from a dictionary index's slots of the same length: `empty`
+/// stays `empty`, every other position moves up by `shift`. One straight pass
+/// over both, so it compiles to a vector compare, add and select.
+#[inline]
+fn lift_slots(live: &mut [u32], index: &[u32], shift: u32, empty: u32) {
+    debug_assert_eq!(live.len(), index.len());
+    for (slot, &position) in live.iter_mut().zip(index) {
+        *slot = if position == empty {
+            empty
+        } else {
+            position + shift
+        };
+    }
+}
+
 /// Upstream `ZSTD_row_nextIndex` (zstd_lazy.c:798): slot 0 holds the cursor, so
 /// it cycles over `1..=row_mask`. The wrap is arithmetic because it falls on an
 /// unpredictable insert of each row, and written as a branch it was the search's
@@ -2636,6 +2651,9 @@ pub(crate) struct RowMatchGenerator {
     /// While a dictionary is primed: how far into it the tables start
     /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
     dict_index_floor: usize,
+    /// Whether this frame's tables were filled from the dictionary's index
+    /// ([`Self::mark_dict_primed`]). Cleared by [`Self::reset`].
+    dict_copied_from_index: bool,
     pub(crate) lazy_depth: u8,
     /// Single backing allocation for every `u32` index table this matcher
     /// owns (the cwksp analog the dfast backend already uses for its long /
@@ -2754,6 +2772,7 @@ impl RowMatchGenerator {
             lazy_next_to_update: 0,
             lazy_reps: None,
             dict_index_floor: 0,
+            dict_copied_from_index: false,
             lazy_depth: 1,
             rows_len: 0,
             tags_len: 0,
@@ -3027,6 +3046,7 @@ impl RowMatchGenerator {
             kept: resident_dict,
         } = self.retired.take().unwrap_or_else(|| self.retire());
         self.offset_hist = [1, 4, 8];
+        self.dict_copied_from_index = false;
         // Re-borrow, the shape the dfast and Fast backends already have: a
         // dictionary frame keeps its bytes resident at the front of history
         // (`[0, region)`) together with the cached dict index, so the next
@@ -4598,8 +4618,9 @@ impl RowMatchGenerator {
     pub(crate) fn mark_dict_primed(&mut self) {
         if let Some(plan) = self.dict_plan {
             let concat_len = self.history.len() - self.history_start;
+            let from_index = self.dict_index_serves_copy(plan);
             if self.finder == LazyFinder::Tree {
-                if plan.attach {
+                if plan.attach || from_index {
                     self.prime_dict_tree(plan, concat_len);
                 } else {
                     self.build_live_dict_tree(concat_len);
@@ -4608,8 +4629,118 @@ impl RowMatchGenerator {
             if !plan.attach {
                 self.lazy_next_to_update = self.history_abs_start + concat_len;
             }
+            if from_index {
+                // The live tables take the index (upstream copies the CDict's
+                // tables, `ZSTD_resetCCtx_byCopyingCDict`), which is then set
+                // aside for the next frame of this dictionary, attached or
+                // copied. The dictionary stays the frame's `extDict` segment.
+                self.dict.mark_primed();
+                self.copy_dict_index_into_live();
+                self.dict_keep.park(&mut self.dict);
+                self.dict.set_region_len(concat_len);
+                self.dict_copied_from_index = true;
+                return;
+            }
         }
         self.dict.mark_primed();
+    }
+
+    /// Whether a frame planned by `plan` copies its dictionary by filling the
+    /// live tables from the dictionary's index rather than indexing the
+    /// dictionary into them: the live tables have the index's form, geometry,
+    /// key width and salt, which a copied dictionary gives the frame unless a
+    /// bound of ours narrowed them.
+    fn dict_index_serves_copy(&self, plan: RowDictPlan) -> bool {
+        let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
+        !plan.attach
+            && self.hash_salt == 0
+            && shape.hash_log == self.row_hash_log + self.row_log
+            && shape.mls == self.row_hash_mls
+            && match self.finder {
+                LazyFinder::Rows => shape.use_row && shape.row_log == self.row_log,
+                LazyFinder::Chain => !shape.use_row && shape.chain_log == self.hc_chain_log,
+                LazyFinder::Tree => {
+                    shape.chain_log == self.hc_chain_log && shape.nb_compares == self.search_depth
+                }
+            }
+    }
+
+    /// Whether [`Self::mark_dict_primed`] filled this frame's tables from the
+    /// dictionary's index, so the driver keeps no snapshot of them.
+    pub(crate) fn dict_copied_from_index(&self) -> bool {
+        self.dict_copied_from_index
+    }
+
+    /// Writes the live tables from the dictionary's index, slot for slot. The
+    /// index counts positions from the dictionary's start and the live tables
+    /// from the frame's floor, so every position moves up by the floor, and
+    /// the chain and tree links, which sit at their position's low bits, move
+    /// round by it as well. The result is what indexing the dictionary into
+    /// empty live tables leaves.
+    fn copy_dict_index_into_live(&mut self) {
+        self.ensure_tables();
+        let floor = self.history_abs_start;
+        let shift = u32::try_from(floor).expect("a row frame's positions fit a slot");
+        let Some(index) = self.dict.table() else {
+            // A dictionary too short to index: the tables hold nothing of it.
+            return;
+        };
+        match self.finder {
+            LazyFinder::Rows => {
+                let rows_len = self.rows_len;
+                let row_log = self.row_log;
+                debug_assert!(index.positions.len() == rows_len && index.tags.len() == rows_len);
+                lift_slots(
+                    &mut self.tables[..rows_len],
+                    &index.positions,
+                    shift,
+                    ROW_EMPTY_SLOT,
+                );
+                // SAFETY: the tag region is `tags_len == rows_len` bytes at
+                // the tail base (the layout `ensure_tables` established), and
+                // `tables` is borrowed exclusively through `self`.
+                let tags = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        self.tables.as_mut_ptr().add(rows_len).cast::<u8>(),
+                        rows_len,
+                    )
+                };
+                tags.copy_from_slice(&index.tags);
+                // Slot 0 of a live row is its cursor; the index keeps its
+                // cursors apart.
+                for (row, &head) in index.heads.iter().enumerate() {
+                    tags[row << row_log] = head;
+                }
+            }
+            LazyFinder::Chain => {
+                let (hash, chain) = self.tables.split_at_mut(self.hc_split);
+                debug_assert!(
+                    index.hc_hash.len() == hash.len() && index.hc_chain.len() == chain.len()
+                );
+                lift_slots(hash, &index.hc_hash, shift, ROW_EMPTY_SLOT);
+                // The link of position `p` sits at `p & mask`: moved up by the
+                // floor, the table is the index's turned round by it.
+                let turn = floor & (chain.len() - 1);
+                let (head, tail) = index.hc_chain.split_at(chain.len() - turn);
+                lift_slots(&mut chain[turn..], head, shift, ROW_EMPTY_SLOT);
+                lift_slots(&mut chain[..turn], tail, shift, ROW_EMPTY_SLOT);
+            }
+            LazyFinder::Tree => {
+                let (hash, tree) = self.tables.split_at_mut(self.hc_split);
+                debug_assert!(
+                    index.hc_hash.len() == hash.len() && index.hc_chain.len() == tree.len()
+                );
+                // 0 is the tree's "none"; every real index is at least
+                // `BT_IDX_BASE`.
+                lift_slots(hash, &index.hc_hash, shift, 0);
+                // A node's two links sit at twice its index's low bits, so the
+                // table turns round by twice the floor's.
+                let turn = 2 * (floor & (tree.len() / 2 - 1));
+                let (head, tail) = index.hc_chain.split_at(tree.len() - turn);
+                lift_slots(&mut tree[turn..], head, shift, 0);
+                lift_slots(&mut tree[..turn], tail, shift, 0);
+            }
+        }
     }
 
     /// Upstream zstd `ZSTD_insertBt1`: insert the position at `content[pos]`
@@ -4878,7 +5009,11 @@ impl RowMatchGenerator {
     /// through [`Self::invalidate_dict_cache`]), so the index is what a
     /// rebuild would produce. Returns whether it was.
     pub(crate) fn revive_dict_cache(&mut self, dict_len: usize) -> bool {
-        let Some(plan) = self.dict_plan.filter(|plan| plan.attach) else {
+        // A frame that copies the dictionary from its index takes it as well.
+        let Some(plan) = self
+            .dict_plan
+            .filter(|plan| plan.attach || self.dict_index_serves_copy(*plan))
+        else {
             return false;
         };
         let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
@@ -4930,6 +5065,13 @@ impl RowMatchGenerator {
         }
         if plan.attach {
             self.prime_dict_tables(plan, concat_len, indexable_end);
+        } else if self.dict_index_serves_copy(plan) {
+            // COPY from the dictionary's index: the slice goes into the
+            // index, and `mark_dict_primed` fills the live tables from it.
+            self.prime_dict_tables(plan, concat_len, indexable_end);
+            let from =
+                (self.lazy_next_to_update.max(hist_start) - hist_start).max(self.dict_index_floor);
+            self.lazy_next_to_update = hist_start + indexable_end.max(from);
         } else {
             // COPY: the dictionary is the frame's `extDict` segment
             // (`prefixStart` = its end) even though it lives in the live

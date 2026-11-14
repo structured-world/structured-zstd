@@ -111,3 +111,64 @@ fn changing_the_slot_format_empties_the_tables() {
     assert!(!matcher.tagged);
     assert!(matcher.tables.iter().all(|&slot| slot == DFAST_EMPTY_SLOT));
 }
+
+/// Live tables filled from a dictionary's index are the tables hashing the
+/// dictionary into them leaves, in either slot format: the same slots, the
+/// last position of each key winning, counted from the same base.
+#[test]
+fn a_copied_dictionary_index_fills_the_tables_as_hashing_the_dictionary_does() {
+    // Short repeating phrases, so many positions share a key and a slot keeps
+    // only the last of them.
+    let mut state = 0x2545_F491u32;
+    let dict: alloc::vec::Vec<u8> = (0..3000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 30) as u8
+        })
+        .collect();
+    for tagged in [false, true] {
+        let mut hashed_workspace = Workspace::new();
+        let mut hashed = bound(&mut hashed_workspace, tagged);
+        hashed.commit_input(&dict);
+        hashed.skip_matching_dense();
+
+        let mut copied_workspace = Workspace::new();
+        let mut copied = bound(&mut copied_workspace, tagged);
+        copied.commit_input(&dict);
+        copied.skip_matching_for_dict_copy();
+        copied.finish_dict_copy();
+
+        assert!(copied.dict_copied_from_index());
+        assert_eq!(
+            copied.position_base, hashed.position_base,
+            "tagged {tagged}"
+        );
+        assert!(
+            copied.tables.iter().any(|&slot| slot != DFAST_EMPTY_SLOT),
+            "tagged {tagged}: the dictionary is indexed"
+        );
+        assert!(
+            copied.tables.iter().eq(hashed.tables.iter()),
+            "tagged {tagged}: the copied tables differ from the hashed ones"
+        );
+    }
+}
+
+/// A copy with no dictionary block committed indexes nothing and leaves the
+/// live tables and their base as they were.
+#[test]
+fn a_dictionary_copy_without_a_block_leaves_the_tables_alone() {
+    let mut workspace = Workspace::new();
+    let mut matcher = bound(&mut workspace, false);
+    matcher.tables.as_mut_slice()[5] = 0x77;
+    let base = matcher.position_base;
+
+    matcher.skip_matching_for_dict_copy();
+    matcher.finish_dict_copy();
+
+    assert!(matcher.dict.table().is_none());
+    assert_eq!(matcher.tables[5], 0x77);
+    assert_eq!(matcher.position_base, base);
+}

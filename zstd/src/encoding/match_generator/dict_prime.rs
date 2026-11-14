@@ -123,8 +123,13 @@ impl MatchGeneratorDriver {
         // A dictionary attached again after frames that copied it takes back
         // the tables built for it, so a compressor alternating small and large
         // frames builds them once per dictionary, as upstream builds a CDict.
+        // A frame that copies the dictionary takes the same tables, to fill
+        // its own from them.
+        let dfast_copies_index = self.dfast_copies_dict_index(dict_content.len());
         match self.active_backend() {
-            super::super::strategy::BackendTag::Dfast if self.dict_attached() => {
+            super::super::strategy::BackendTag::Dfast
+                if self.dict_attached() || dfast_copies_index =>
+            {
                 self.dfast_matcher_mut()
                     .revive_dict_cache(dict_content.len());
             }
@@ -352,6 +357,9 @@ impl MatchGeneratorDriver {
         // sub-8-byte dict) — `mark_dict_primed` self-guards on table presence.
         match self.active_backend() {
             super::super::strategy::BackendTag::Simple => self.simple_mut().mark_dict_primed(),
+            super::super::strategy::BackendTag::Dfast if dfast_copies_index => {
+                self.dfast_matcher_mut().finish_dict_copy()
+            }
             super::super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().mark_dict_primed()
             }
@@ -470,6 +478,17 @@ impl MatchGeneratorDriver {
         let Some((params, table_bits, fast_attach, fast_tagged)) = self.reset_shape else {
             return;
         };
+        // Tables filled from the dictionary's index are filled from it again
+        // by the next frame (upstream copies the CDict's tables per frame);
+        // a snapshot would be a second copy of them and of the dictionary.
+        let from_index = match &self.storage {
+            MatcherStorage::Dfast(dfast) => dfast.dict_copied_from_index(),
+            MatcherStorage::Row(row) => row.dict_copied_from_index(),
+            _ => false,
+        };
+        if from_index {
+            return;
+        }
         let key = PrimedKey {
             level,
             params,

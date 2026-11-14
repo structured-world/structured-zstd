@@ -199,6 +199,9 @@ pub(crate) struct DmsDictTables {
     /// the live cParams `minMatch` (upstream zstd `ZSTD_dictMatchState` uses the same
     /// `mls` as the live search), so probe hashing matches the build.
     pub(crate) mls: usize,
+    /// Compares each insert of the build was allowed (`1 << searchLog`): the
+    /// tree's shape depends on it, so it is part of the reuse key.
+    pub(crate) nb_compares: usize,
 }
 
 /// Storage of the optimal parsers' binary-tree search: the contiguous history
@@ -409,7 +412,8 @@ pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
 /// build-only widths come from the caller's surrounding locals.
 macro_rules! build_dms {
     (
-        $self:ident, $region_len:expr, $layout:expr, $mls:expr, $min_region:expr, $per_pos:expr,
+        $self:ident, $region_len:expr, $layout:expr, $mls:expr, $compares:expr, $min_region:expr,
+        $per_pos:expr,
         |$concat:ident, $ht:ident, $ct:ident, $hlog:ident, $region:ident| $build:block
     ) => {{
         let region = $region_len.min($self.live_history().len());
@@ -423,15 +427,18 @@ macro_rules! build_dms {
             $crate::encoding::match_table::storage::dms_hash_log(region, $self.hash_log);
         // CDict cache: the tables depend only on the dict bytes (re-committed
         // identically to the front of history every frame) and the
-        // (region, mls, hash_log) shape, so a primed same-shape table is valid
-        // as-is. A dictionary swap drops the cache via the invalidate path; a
-        // level change lands here with a different shape and rebuilds.
+        // (region, mls, hash_log, compare budget) shape, so a primed
+        // same-shape table is valid as-is. A dictionary swap drops the cache
+        // via the invalidate path; a level change lands here with a different
+        // shape and rebuilds.
         if $self.dms.is_primed()
             && $self.dms.region_len() == region
-            && $self
-                .dms
-                .table()
-                .is_some_and(|t| t.layout == $layout && t.mls == $mls && t.hash_log == dms_hash_log)
+            && $self.dms.table().is_some_and(|t| {
+                t.layout == $layout
+                    && t.mls == $mls
+                    && t.hash_log == dms_hash_log
+                    && t.nb_compares == $compares
+            })
         {
             return;
         }
@@ -468,6 +475,7 @@ macro_rules! build_dms {
         tables.chain_table = chain_table;
         tables.hash_log = dms_hash_log;
         tables.mls = $mls;
+        tables.nb_compares = $compares;
         $self.dms.set_region_len(region);
         $self.dms.mark_primed();
     }};
@@ -889,11 +897,12 @@ impl MatchTable {
         // at a loss. The dms's value is being a SEPARATE structure (the dict is
         // not in the live tree), not a lower minMatch.
         let mls = self.search_mls;
+        // Compares per insert, as upstream sorts a CDict's tree
+        // (`ZSTD_insertBt1`: `1 << searchLog` of the dictionary's cParams,
+        // which an attached frame runs under as well). A fixed 512 here cost
+        // eight times upstream's build at the levels whose `searchLog` is 5.
+        let nb_compares = self.search_depth.max(1);
         let read = if mls >= 5 { 8 } else { 4 };
-        // Build-pass compare budget: the dict is bounded (<= window), so a
-        // generous fixed depth keeps the tree well-ordered without the live
-        // searchLog cap. Mirrors upstream zstd `ZSTD_insertBt1` nbCompares.
-        const DMS_BUILD_DEPTH: usize = 1 << 9;
         let floor = self.dict_index_floor;
         // 2 children per dict position: [smaller, larger].
         build_dms!(
@@ -901,9 +910,17 @@ impl MatchTable {
             region_len,
             DmsDictLayout::Bt,
             mls,
+            nb_compares,
             read,
             2,
             |concat, hash_table, chain_table, dms_hash_log, region| {
+                use crate::encoding::fastpath::scalar::common_prefix_len_ptr;
+                // Every position a key can be read at goes into the tree.
+                // Upstream steps past what a long match covers
+                // (`ZSTD_updateTree`); the positions it leaves out are ones a
+                // frame's search would have matched, and leaving them out
+                // cost level 22 more per frame than the build saved.
+                let base = concat.as_ptr();
                 let mut current = floor;
                 while current + read <= region {
                     let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
@@ -915,7 +932,7 @@ impl MatchTable {
                     let mut larger_slot = 2 * current + 1;
                     let mut common_smaller = 0usize;
                     let mut common_larger = 0usize;
-                    let mut compares = DMS_BUILD_DEPTH;
+                    let mut compares = nb_compares;
                     while compares > 0 && match_packed != 0 {
                         let cand = (match_packed - 1) as usize;
                         // Tree holds only earlier positions; `cand < current` always.
@@ -928,9 +945,16 @@ impl MatchTable {
                         // Common prefix bounded by the dict tail from `current`
                         // (`cand < current`, so `current` is the binding limit).
                         let limit = region - current;
-                        while ml < limit && concat[cand + ml] == concat[current + ml] {
-                            ml += 1;
-                        }
+                        // SAFETY: `cand < current` and `current + limit ==
+                        // region <= concat.len()`, so both runs of `limit - ml`
+                        // bytes lie inside `concat`.
+                        ml += unsafe {
+                            common_prefix_len_ptr(
+                                base.add(cand + ml),
+                                base.add(current + ml),
+                                limit - ml,
+                            )
+                        };
                         if current + ml >= region {
                             // Reached the dict end: can't order this pair, stop
                             // (upstream zstd `ip+matchLength == iend` break).
@@ -1364,11 +1388,12 @@ impl MatchTable {
         // fully resident at concat `[0, region)` with no drain (`history_start
         // == 0`). Pinned at abs `[0, region)` (concat-keyed dms is abs-invariant).
         //
-        // mls consistency: `dms.is_primed()` here is sufficient because the dms is
-        // keyed by `(region, layout, mls, hash_log)` and `configure()` invalidates
-        // it whenever `search_mls` changes (a level switch). So a primed dms is
-        // always one built with the CURRENT `search_mls`; the reborrow can never
-        // reuse a dms whose tables were built under a stale mls.
+        // Shape consistency: `dms.is_primed()` here is sufficient because the
+        // dms is keyed by `(region, layout, mls, hash_log, compare budget)` and
+        // `configure()` invalidates it whenever `search_mls`, the table widths
+        // or the search depth change (a level switch). So a primed dms is
+        // always one built for the CURRENT search; the reborrow can never
+        // reuse a dms whose tree was built under a stale mls or budget.
         let kept = if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
             // `checked_sub`, not `-`: after the dict chunk is evicted,
             // `compact_history` can reset `history_start` to 0 while

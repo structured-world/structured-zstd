@@ -2589,13 +2589,17 @@ fn choose_table_from_counts<'a>(
             // dictionary's table covering every symbol its stream can carry
             // (`FSE_repeat_valid`); a table a block built is only `check`,
             // which this band never repeats. The coverage holds by
-            // construction, and the cost probe checks it anyway: a repeat can
-            // never produce an invalid stream.
+            // construction and is checked anyway, so a repeat can never
+            // produce an invalid stream: a table with a state for every code
+            // up to the highest one used covers the block, which is one read
+            // per code; only a table with a gap below it is priced to see
+            // whether the block uses the gap.
             if total < 1000
                 && let Some(prev) = previous
                 && prev.is_valid()
                 && let Some(table) = prev.as_table(default_table)
-                && fse_bit_cost(counts, max_symbol, table).is_some()
+                && ((0..=max_symbol).all(|code| table.symbol_probability(code as u8) != 0)
+                    || fse_bit_cost(counts, max_symbol, table).is_some())
             {
                 return FseTableMode::RepeatLast(prev);
             }
