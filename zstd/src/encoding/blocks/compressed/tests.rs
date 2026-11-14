@@ -253,7 +253,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
-            Some(&prev),
+            super::previous_table_stream_bytes(Some(&prev), &skewed_counts),
             new_desc,
             &skewed_literals,
             &skewed_counts,
@@ -306,7 +306,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
-            Some(&prev),
+            super::previous_table_stream_bytes(Some(&prev), &counts_of(&big_skewed)),
             new_desc,
             &big_skewed,
             &counts_of(&big_skewed),
@@ -751,8 +751,19 @@ fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
     let wide: Vec<u8> = (0..78).map(|_| draw(95)).collect();
     // 128 bytes of 16 symbols: half a byte each under a table.
     let narrow: Vec<u8> = (0..128).map(|_| draw(16)).collect();
-    let strategy = StrategyTag::Dfast;
-    for (literals, ends_raw) in [(&wide, true), (&narrow, false)] {
+    // Outside the band that repeats a previous table before building one, so
+    // a previous table reaches the refusal and the size comparison.
+    let strategy = StrategyTag::Lazy;
+    // A previous table with no code for these literals, and one that codes
+    // every byte at eight bits: the first leaves the refusal standing, the
+    // second withdraws it and loses the size comparison to a table that pays.
+    let foreign = huff0_encoder::HuffmanTable::build_from_data(&[200, 200, 201, 202, 203, 203]);
+    let every_byte: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
+    let every_byte = huff0_encoder::HuffmanTable::build_from_data(&every_byte);
+    let cases = [(&wide, true), (&narrow, false)]
+        .into_iter()
+        .flat_map(|section| [None, Some(&foreign), Some(&every_byte)].map(|prev| (section, prev)));
+    for ((literals, ends_raw), previous) in cases {
         let emitted = |verify_refusals: bool| {
             let mut out = Vec::new();
             let mut writer = BitWriter::from(&mut out);
@@ -761,7 +772,7 @@ fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
                 crate::encoding::fastpath::select_kernel(),
                 K => compress_literals::<K>(
                     literals,
-                    None,
+                    previous,
                     false,
                     &mut writer,
                     strategy,
@@ -779,7 +790,7 @@ fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
             let mut scratch = huff0_encoder::WeightScratch::default();
             let (bytes, outcome) = estimate_literals_section_bytes(
                 literals,
-                None,
+                previous,
                 false,
                 &mut counts,
                 strategy,
@@ -791,6 +802,16 @@ fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
             );
             (bytes, matches!(outcome, HuffOutcome::New(_)))
         };
+        // Only a table with a code for every symbol present is one to repeat.
+        assert_eq!(
+            super::previous_table_stream_bytes(previous, &{
+                let mut counts = [0usize; 256];
+                crate::histogram::count_bytes(literals, &mut counts);
+                counts
+            })
+            .is_some(),
+            previous.is_some_and(|table| core::ptr::eq(table, &every_byte)),
+        );
         // The section is one the code lengths refuse, or one they leave to
         // its table: otherwise the two modes below would not differ.
         let mut counts = [0usize; 256];
