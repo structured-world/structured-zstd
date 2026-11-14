@@ -726,16 +726,13 @@ impl HuffmanTable {
             let table_log = cheap_huf_table_log(counts, total);
             build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
             if scratch.leaves.len() > 1 && limit_leaves_in_place(&mut scratch.leaves, table_log) {
-                if refuse(&CodeShape::of(&scratch.leaves, counts.len())) {
-                    return None;
-                }
-                let spare = scratch.spare_table.take();
-                return Some(Self::build_from_limited_leaves(
+                return Self::build_from_limited_leaves(
                     &scratch.leaves,
                     counts.len(),
                     table_log,
-                    spare,
-                ));
+                    &mut scratch.spare_table,
+                    refuse,
+                );
             }
             // A single symbol, or a code the limiter could not complete, takes
             // the weight route and its fallback.
@@ -1186,17 +1183,31 @@ impl HuffmanTable {
         leaves: &[HuffNode],
         alphabet_len: usize,
         table_log: usize,
-        spare: Option<Self>,
-    ) -> Self {
+        spare: &mut Option<Self>,
+        refuse: impl FnOnce(&CodeShape) -> bool,
+    ) -> Option<Self> {
         debug_assert!(leaves.len() > 1 && alphabet_len <= MAX_HUFFMAN_ALPHABET);
         let mut nb_bits_of = [0u8; MAX_HUFFMAN_ALPHABET];
         let mut per_nb_bits = [0u16; 13];
+        // What the code costs is read in the pass that lays the lengths out,
+        // so asking whether to go on adds one product a leaf to it.
+        let mut payload_bits = 0usize;
         for leaf in leaves {
             debug_assert!((1..=table_log).contains(&(leaf.nb_bits as usize)));
             nb_bits_of[leaf.symbol as usize] = leaf.nb_bits;
             per_nb_bits[leaf.nb_bits as usize] += 1;
+            payload_bits += leaf.count as usize * leaf.nb_bits as usize;
         }
-        let mut table = Self::emptied(spare, alphabet_len, table_log);
+        if refuse(&CodeShape {
+            payload_bits,
+            per_nb_bits,
+            last_nb_bits: nb_bits_of[alphabet_len - 1],
+            described: alphabet_len - 1,
+        }) {
+            // The spare table stays where it is, for the next build.
+            return None;
+        }
+        let mut table = Self::emptied(spare.take(), alphabet_len, table_log);
         let mut val_per_rank = [0u16; 13];
         let mut min = 0u16;
         for nb_bits in (1..=table_log).rev() {
@@ -1222,7 +1233,7 @@ impl HuffmanTable {
                         (value as u32, nb_bits)
                     }),
             );
-        table
+        Some(table)
     }
 
     /// `spare`'s buffers, or new ones, emptied for a table of `alphabet_len`
@@ -1857,37 +1868,36 @@ fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
 pub(crate) struct CodeShape {
     /// Bits the counted symbols take under the code.
     pub(crate) payload_bits: usize,
-    /// How many described symbols carry each weight, absent ones under 0. A
-    /// table description lists a weight for every symbol below the last.
-    pub(crate) weights: [u16; 13],
+    /// How many symbols take each code length.
+    per_nb_bits: [u16; 13],
+    /// The code length of the alphabet's last symbol, 0 when it does not
+    /// occur. A description lists a weight for every symbol below it.
+    last_nb_bits: u8,
     /// Symbols the description lists: all below the last.
     pub(crate) described: usize,
 }
 
 impl CodeShape {
-    /// The shape of the code `leaves` hold for an alphabet of `alphabet_len`
-    /// symbols whose last symbol occurs.
-    fn of(leaves: &[HuffNode], alphabet_len: usize) -> Self {
-        let last = alphabet_len - 1;
-        let longest = leaves
+    /// How many described symbols carry each weight, absent ones under 0, as
+    /// the table's description would list them: a weight is the longest code's
+    /// length plus one, less the symbol's own.
+    pub(crate) fn weight_counts(&self) -> [u16; 13] {
+        let longest = self
+            .per_nb_bits
             .iter()
-            .fold(0u8, |longest, leaf| longest.max(leaf.nb_bits));
+            .rposition(|&symbols| symbols != 0)
+            .unwrap_or(0);
         let mut weights = [0u16; 13];
-        let mut payload_bits = 0usize;
         let mut coded = 0u16;
-        for leaf in leaves {
-            payload_bits += leaf.count as usize * leaf.nb_bits as usize;
+        for nb_bits in 1..=longest {
             // The last symbol's weight is implied, not written.
-            let listed = u16::from(leaf.symbol as usize != last);
-            weights[(longest + 1 - leaf.nb_bits) as usize] += listed;
-            coded += listed;
+            let symbols =
+                self.per_nb_bits[nb_bits] - u16::from(nb_bits == self.last_nb_bits as usize);
+            weights[longest + 1 - nb_bits] = symbols;
+            coded += symbols;
         }
-        weights[0] = last as u16 - coded;
-        Self {
-            payload_bits,
-            weights,
-            described: last,
-        }
+        weights[0] = self.described as u16 - coded;
+        weights
     }
 
     /// Bytes the counted symbols take as one stream under the code: what

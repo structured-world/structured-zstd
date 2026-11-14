@@ -215,7 +215,7 @@ fn new_table_cannot_pay(
     }
     let (described_log, _) = log2_bounds_256(shape.described.max(1));
     let weight_bits_256: usize = shape
-        .weights
+        .weight_counts()
         .iter()
         .filter(|&&symbols| symbols != 0)
         .map(|&symbols| {

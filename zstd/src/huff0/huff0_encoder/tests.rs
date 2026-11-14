@@ -862,13 +862,37 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
         for leaf in &leaves_scratch.leaves {
             weights[leaf.symbol as usize] = table_log + 1 - leaf.nb_bits as usize;
         }
+        // What the build reports about the code before it lays the table out:
+        // the bits the histogram takes, and a weight per symbol below the last.
+        let mut shape_seen = None;
         let from_leaves = HuffmanTable::build_from_limited_leaves(
             &leaves_scratch.leaves,
             alphabet,
             table_log,
-            spare_leaves.take(),
-        );
+            &mut spare_leaves,
+            |shape| {
+                shape_seen = Some((shape.payload_bits, shape.weight_counts(), shape.described));
+                false
+            },
+        )
+        .expect("nothing refused the build");
         let from_weights = HuffmanTable::build_from_weights_reusing(&weights, spare_weights.take());
+        let (payload_bits, weight_counts, described) = shape_seen.expect("the build was asked");
+        assert_eq!(
+            payload_bits,
+            counts
+                .iter()
+                .zip(&from_weights.codes)
+                .map(|(&count, &(_, nb_bits))| count * nb_bits as usize)
+                .sum::<usize>(),
+            "case {case}"
+        );
+        assert_eq!(described, alphabet - 1, "case {case}");
+        let mut listed = [0u16; 13];
+        for &weight in &from_weights.weights()[..alphabet - 1] {
+            listed[weight as usize] += 1;
+        }
+        assert_eq!(weight_counts, listed, "case {case}");
         assert_eq!(from_leaves.codes, from_weights.codes, "case {case}");
         assert_eq!(
             from_leaves.packed_codes, from_weights.packed_codes,
