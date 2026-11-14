@@ -257,6 +257,7 @@ pub fn find_decompressed_size(src: &[u8]) -> Result<FrameContentSize, Decompress
             Err(err) => return Err(DecompressedSizeError::Header(err)),
         }
         let consumed = find_frame_compressed_size(rest).map_err(DecompressedSizeError::Frame)?;
+        debug_assert!(consumed > 0 && consumed <= rest.len());
         rest = &rest[consumed..];
     }
     Ok(FrameContentSize::Known(total))
@@ -384,7 +385,9 @@ pub fn decompressed_bound(src: &[u8]) -> Result<u64, DecompressedSizeError> {
         total = total
             .checked_add(bound)
             .ok_or(DecompressedSizeError::Overflow)?;
-        // A frame is at least its header, so the walk always advances.
+        // A frame is at least its header and ends inside the buffer, so the
+        // walk always advances and never steps past the end.
+        debug_assert!(consumed > 0 && consumed <= rest.len());
         rest = &rest[consumed..];
     }
     Ok(total)
