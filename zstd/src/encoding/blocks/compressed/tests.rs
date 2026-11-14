@@ -253,6 +253,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
+            &mut None,
             super::previous_table_stream_bytes(Some(&prev), &skewed_counts),
             new_desc,
             &skewed_literals,
@@ -306,6 +307,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
+            &mut None,
             super::previous_table_stream_bytes(Some(&prev), &counts_of(&big_skewed)),
             new_desc,
             &big_skewed,
@@ -314,6 +316,49 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
         HuffChoice::New,
     );
     assert_eq!(section(&big_skewed, StrategyTag::Fast), (true, 2));
+
+    // The new table's stream size is summed at most once: a comparison that
+    // had to sum it leaves it for the caller, one handed a size reads that
+    // size and no other, and a description that eats the section settles on
+    // the previous table without it.
+    let previous_stream = super::previous_table_stream_bytes(Some(&prev), &skewed_counts);
+    let exact = new_tbl.estimate_compressed_size_from_counts(&skewed_counts);
+    let mut summed = None;
+    decide_huff_reuse_like_encoder(
+        &new_tbl,
+        &mut summed,
+        previous_stream,
+        new_desc,
+        &skewed_literals,
+        &skewed_counts,
+    );
+    assert_eq!(summed, Some(exact));
+    let mut handed = Some(skewed_literals.len() * 2);
+    assert_eq!(
+        decide_huff_reuse_like_encoder(
+            &new_tbl,
+            &mut handed,
+            previous_stream,
+            new_desc,
+            &skewed_literals,
+            &skewed_counts,
+        ),
+        HuffChoice::Repeat(previous_stream.expect("the uniform table codes every byte")),
+        "a new stream handed in at twice the section must lose to the previous table"
+    );
+    let mut untouched = None;
+    assert_eq!(
+        decide_huff_reuse_like_encoder(
+            &new_tbl,
+            &mut untouched,
+            previous_stream,
+            skewed_literals.len(),
+            &skewed_literals,
+            &skewed_counts,
+        ),
+        HuffChoice::Repeat(previous_stream.expect("the uniform table codes every byte")),
+    );
+    assert_eq!(untouched, None);
 }
 
 #[test]
