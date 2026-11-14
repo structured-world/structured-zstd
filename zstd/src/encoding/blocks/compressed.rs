@@ -156,30 +156,16 @@ const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     37, 36, 34, 33, 31, 30, 28, 26, 25, 23, 22, 20, 19, 17, 16, 14, 13, 11, 10, 8, 7, 5, 4, 2, 1,
 ];
 
-/// `log2(x)` in 1/256ths of a bit, as a pair `(not above, not below)` the true
-/// value, for `x >= 1`. The eight leading bits of `x` index
-/// [`INVERSE_PROBABILITY_LOG_256`], so the two ends are at most 1/128 of the
-/// mantissa apart.
+/// `log2(x)` in 1/256ths of a bit for a symbol count `x` in `1..=255`, as a
+/// pair `(not above, not below)` the true value, read off
+/// [`INVERSE_PROBABILITY_LOG_256`]: `log2(x) * 256` lies in
+/// `(2048 - table[x] - 1, 2048 - table[x]]`, and only a power of two sits on
+/// the upper end.
 #[inline]
 fn log2_bounds_256(x: usize) -> (usize, usize) {
-    debug_assert!(x >= 1);
-    let exponent = x.ilog2() as usize;
-    let scale = exponent.saturating_sub(7);
-    // 128..=255 once `x` has eight bits, `x` itself below that.
-    let mantissa = x >> scale;
-    // `log2(m) * 256` lies in `(2048 - table[m] - 1, 2048 - table[m]]`, and
-    // only a power of two sits on the upper end.
-    let not_below_mantissa = 2048 - INVERSE_PROBABILITY_LOG_256[mantissa];
-    let not_above = not_below_mantissa - usize::from(!mantissa.is_power_of_two());
-    let not_below = if x == mantissa << scale {
-        not_below_mantissa
-    } else if mantissa == 255 {
-        // The next mantissa is 256: eight whole bits.
-        2048
-    } else {
-        2048 - INVERSE_PROBABILITY_LOG_256[mantissa + 1]
-    };
-    (not_above + scale * 256, not_below + scale * 256)
+    debug_assert!((1..256).contains(&x));
+    let not_below = 2048 - INVERSE_PROBABILITY_LOG_256[x];
+    (not_below - usize::from(!x.is_power_of_two()), not_below)
 }
 
 /// Whether a literals section coded with a new table of this shape ends raw,
@@ -204,32 +190,38 @@ fn new_table_cannot_pay(
 ) -> bool {
     let allowed = len.saturating_sub(min_gain(len, strategy));
     let payload = shape.one_stream_bytes() + if single_stream { 0 } else { 6 };
-    let direct = (shape.described <= 128).then(|| 1 + shape.described.div_ceil(2));
+    // The direct form lists up to 128 weights.
+    let has_direct = shape.described <= 128;
+    let direct = 1 + shape.described.div_ceil(2);
     // The description is never longer than its direct form: a table that pays
     // with that one pays, and most tables kept are settled here.
-    if let Some(direct) = direct
-        && payload + direct < allowed
-        && direct + 12 < len
-    {
+    if has_direct && payload + direct < allowed && direct + 12 < len {
         return false;
     }
-    let (described_log, _) = log2_bounds_256(shape.described.max(1));
-    let weight_bits_256: usize = shape
-        .weight_counts()
-        .iter()
-        .filter(|&&symbols| symbols != 0)
-        .map(|&symbols| {
+    let (described_log, _) = log2_bounds_256(shape.described);
+    let mut weight_bits_256 = 0usize;
+    for symbols in shape.weight_counts() {
+        if symbols != 0 {
             let (_, symbols_log) = log2_bounds_256(usize::from(symbols));
             // Saturating on purpose: this is a floor, and the two logs are
             // rounded apart, so a weight every symbol carries can come out a
             // hair below the zero bits it really costs.
-            usize::from(symbols) * described_log.saturating_sub(symbols_log)
-        })
-        .sum();
+            weight_bits_256 += usize::from(symbols) * described_log.saturating_sub(symbols_log);
+        }
+    }
     let compressed = 1 + weight_bits_256 / (256 * 8);
-    let description = direct.map_or(compressed, |direct| direct.min(compressed));
+    let description = if has_direct && direct < compressed {
+        direct
+    } else {
+        compressed
+    };
     payload + description >= allowed || description + 12 >= len
 }
+
+/// Whether a refused literals section still gets its table built, so the
+/// outcome can be asserted to be the raw section the refusal stands for. A
+/// debug build does; a release build takes the refusal and builds nothing.
+const VERIFY_REFUSALS: bool = cfg!(debug_assertions);
 
 /// Whether a section with these counts has no previous table to repeat: none
 /// at all, or one with no code for a symbol that occurs.
@@ -1102,6 +1094,7 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
             state.huf_optimal_search,
             &mut state.huff_weights,
             literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
+            VERIFY_REFUSALS,
         ) {
             Some(table) => HuffOutcome::New(table),
             None => HuffOutcome::Keep,
@@ -1430,6 +1423,7 @@ fn estimate_block_parts_size_with<M: Matcher>(
         state.literal_compression_disabled,
         &mut state.huff_weights,
         literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
+        VERIFY_REFUSALS,
     );
 
     // A section without sequences writes no tables, so every axis keeps its own.
@@ -1465,6 +1459,7 @@ fn estimate_literals_section_bytes(
     lit_disabled: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
+    verify_refusals: bool,
 ) -> (usize, HuffOutcome) {
     let raw = || {
         (
@@ -1558,7 +1553,7 @@ fn estimate_literals_section_bytes(
         |shape| {
             refused = new_table_cannot_pay(shape, literals.len(), strategy, single_stream)
                 && no_previous_table_codes(last_huff, counts);
-            refused && !cfg!(debug_assertions)
+            refused && !verify_refusals
         },
     ) else {
         return raw();
@@ -1584,7 +1579,7 @@ fn estimate_literals_section_bytes(
                 return raw();
             }
             HuffChoice::New => true,
-            HuffChoice::Repeat => false,
+            HuffChoice::Repeat(_) => false,
         };
     // The four-stream layout carries a 6-byte jumptable and per-stream padding,
     // which a single-stream estimate would undercount by ~6–10 bytes and bias
@@ -1618,11 +1613,7 @@ fn estimate_literals_section_bytes(
         weight_scratch.recycle(new_table);
         return raw();
     }
-    debug_assert!(
-        !refused,
-        "the code lengths refused a {}-byte section priced at {huf_section_size}",
-        literals.len()
-    );
+    debug_assert!(!refused, "a refused section is priced as coded");
 
     if use_new {
         (total, HuffOutcome::New(new_table))
@@ -1884,8 +1875,10 @@ fn prefer_repeat_eligible(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HuffChoice {
     /// The previous table: it costs no more than the new one with its
-    /// description, or the description alone eats the section.
-    Repeat,
+    /// description, or the description alone eats the section. Carries the
+    /// bytes the section takes as one stream under that table, which the
+    /// comparison already summed.
+    Repeat(usize),
     /// The table just built.
     New,
     /// Neither: with no usable previous table, the description plus the
@@ -1938,7 +1931,7 @@ fn decide_huff_reuse_like_encoder(
         .estimate_compressed_size_from_counts_checked(counts)
         .unwrap_or(literals.len());
     if old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len() {
-        HuffChoice::Repeat
+        HuffChoice::Repeat(old_estimate)
     } else {
         HuffChoice::New
     }
@@ -3673,6 +3666,7 @@ fn compress_literals<K: EncodeTier>(
     huf_search: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
+    verify_refusals: bool,
 ) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
     let single_stream = single_literal_stream(literals.len(), repeat_valid);
@@ -3745,7 +3739,7 @@ fn compress_literals<K: EncodeTier>(
             new_table_payload = Some(shape.one_stream_bytes());
             refused = new_table_cannot_pay(shape, literals.len(), strategy, single_stream)
                 && no_previous_table_codes(last_table, counts);
-            refused && !cfg!(debug_assertions)
+            refused && !verify_refusals
         },
     ) else {
         raw_literals(literals, writer);
@@ -3770,41 +3764,45 @@ fn compress_literals<K: EncodeTier>(
         literals,
         counts,
     );
-    let new_table = match choice {
+    // The table chosen, with the bytes the section takes as one stream under
+    // it: the code lengths summed over the counts, which the build gave for a
+    // new table and the comparison for the previous one. Only a searched
+    // build, which reports no lengths, is summed here.
+    let (new_table, one_stream) = match choice {
         HuffChoice::Raw => {
             raw_literals(literals, writer);
             weight_scratch.recycle(new_encoder_table);
             return None;
         }
-        HuffChoice::New => true,
-        HuffChoice::Repeat => false,
+        HuffChoice::New => match new_table_payload {
+            Some(bytes) => (true, bytes),
+            None => (
+                true,
+                new_encoder_table.estimate_compressed_size_from_counts(counts),
+            ),
+        },
+        HuffChoice::Repeat(bytes) => (false, bytes),
     };
     let encoder_table = if new_table {
         &new_encoder_table
     } else {
         last_table.expect("reuse path implies prior table exists")
     };
+    debug_assert_eq!(
+        one_stream,
+        encoder_table.estimate_compressed_size_from_counts(counts),
+        "the stream size carried here is not the chosen table's"
+    );
 
     // The raw fallback at the end, answered before the section is encoded
-    // where the histogram already settles it: one stream's size is exactly its
-    // code lengths summed over the counts, and four streams are never shorter
-    // than one with their six-byte jump table. A section refused here is one
-    // the fallback would refuse after writing and unwinding it.
+    // where the histogram already settles it: one stream's size is exact, and
+    // four streams are never shorter than one with their six-byte jump table.
+    // A section refused here is one the fallback would refuse after writing
+    // and unwinding it.
     let description = if new_table {
         new_table_description_size
     } else {
         0
-    };
-    let one_stream = match new_table_payload {
-        Some(bytes) if new_table => {
-            debug_assert_eq!(
-                bytes,
-                encoder_table.estimate_compressed_size_from_counts(counts),
-                "the table's lengths are not the ones it was built from"
-            );
-            bytes
-        }
-        _ => encoder_table.estimate_compressed_size_from_counts(counts),
     };
     let payload_floor = one_stream + if single_stream { 0 } else { 6 };
     if use_raw_literal_fallback(description + payload_floor, literals.len(), strategy) {
@@ -3812,12 +3810,7 @@ fn compress_literals<K: EncodeTier>(
         weight_scratch.recycle(new_encoder_table);
         return None;
     }
-    debug_assert!(
-        !refused,
-        "the code lengths refused a {}-byte section that codes in {} bytes or more",
-        literals.len(),
-        description + payload_floor
-    );
+    debug_assert!(!refused, "a refused section codes under the fallback");
 
     if new_table {
         writer.write_bits(2u8, 2); // compressed literals type

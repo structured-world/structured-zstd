@@ -275,6 +275,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
             false,
             &mut huff0_encoder::WeightScratch::default(),
             false,
+            super::VERIFY_REFUSALS,
         );
         writer.flush();
         (built.is_some(), out[0] & 0b11)
@@ -730,6 +731,91 @@ fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
         refused * 2 > raw && sections > 4 * raw,
         "{refused} refused of {raw} raw among {sections} sections"
     );
+}
+
+/// A refused section written raw without its table is, byte for byte and at
+/// the same price, the section the built table falls back to; a section whose
+/// table pays is coded either way. The first mode is the one a release build
+/// runs, the second the one a debug build checks it with.
+#[test]
+fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
+    use super::{BitWriter, HuffOutcome, compress_literals, estimate_literals_section_bytes};
+    let mut state = 0x9E37_79B9u32;
+    let mut draw = move |alphabet: u32| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (b' ' as u32 + state % alphabet) as u8
+    };
+    // 78 bytes of the 95 printable characters: nearly every symbol once.
+    let wide: Vec<u8> = (0..78).map(|_| draw(95)).collect();
+    // 128 bytes of 16 symbols: half a byte each under a table.
+    let narrow: Vec<u8> = (0..128).map(|_| draw(16)).collect();
+    let strategy = StrategyTag::Dfast;
+    for (literals, ends_raw) in [(&wide, true), (&narrow, false)] {
+        let emitted = |verify_refusals: bool| {
+            let mut out = Vec::new();
+            let mut writer = BitWriter::from(&mut out);
+            let mut scratch = huff0_encoder::WeightScratch::default();
+            let table = crate::encoding::fastpath::with_encode_tier!(
+                crate::encoding::fastpath::select_kernel(),
+                K => compress_literals::<K>(
+                    literals,
+                    None,
+                    false,
+                    &mut writer,
+                    strategy,
+                    false,
+                    &mut scratch,
+                    false,
+                    verify_refusals,
+                )
+            );
+            writer.flush();
+            (out, table.is_some())
+        };
+        let priced = |verify_refusals: bool| {
+            let mut counts = [0usize; 256];
+            let mut scratch = huff0_encoder::WeightScratch::default();
+            let (bytes, outcome) = estimate_literals_section_bytes(
+                literals,
+                None,
+                false,
+                &mut counts,
+                strategy,
+                false,
+                false,
+                &mut scratch,
+                false,
+                verify_refusals,
+            );
+            (bytes, matches!(outcome, HuffOutcome::New(_)))
+        };
+        // The section is one the code lengths refuse, or one they leave to
+        // its table: otherwise the two modes below would not differ.
+        let mut counts = [0usize; 256];
+        let (max_symbol, _) = crate::histogram::count_bytes(literals, &mut counts);
+        let mut refused = false;
+        huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
+            &counts[..=max_symbol],
+            literals.len(),
+            false,
+            &mut huff0_encoder::WeightScratch::default(),
+            |shape| {
+                refused = super::new_table_cannot_pay(shape, literals.len(), strategy, true);
+                false
+            },
+        );
+        assert_eq!(refused, ends_raw, "{} bytes", literals.len());
+        let (taken, taken_table) = emitted(false);
+        let (verified, verified_table) = emitted(true);
+        assert_eq!(taken, verified, "{} bytes", literals.len());
+        assert_eq!(taken_table, verified_table, "{} bytes", literals.len());
+        assert_eq!(taken_table, !ends_raw, "{} bytes", literals.len());
+        assert_eq!(taken.len() > literals.len(), ends_raw);
+        assert_eq!(priced(false), priced(true), "{} bytes", literals.len());
+        assert_eq!(priced(false), (taken.len(), !ends_raw));
+    }
 }
 
 #[test]
