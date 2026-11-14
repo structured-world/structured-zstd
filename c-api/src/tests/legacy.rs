@@ -112,6 +112,29 @@ fn frame_queries_read_these_frames() {
     assert_eq!(size("z000000.v06.l1.zst"), 128 * 1024);
 }
 
+/// The bound of a run that ends in one of these frames stops at the largest
+/// value `ZSTD_decompressBound` returns: a frame ahead of it that brings the
+/// total to that value is the last accepted, one byte more is an error.
+#[test]
+fn a_bound_ending_in_these_frames_stops_below_the_sentinels() {
+    const ERROR: u64 = u64::MAX - 1;
+    for fixture in fixtures() {
+        let tail = &fixture.frame;
+        let tail_bound = unsafe { ZSTD_decompressBound(tail.as_ptr(), tail.len()) };
+        assert!(tail_bound < ERROR, "{}", fixture.name);
+        for (past, expected) in [(0, ERROR - 1), (1, ERROR)] {
+            let mut frames = super::frame_declaring(ERROR - 1 - tail_bound + past);
+            frames.extend_from_slice(tail);
+            assert_eq!(
+                unsafe { ZSTD_decompressBound(frames.as_ptr(), frames.len()) },
+                expected,
+                "{}: {past} past the largest bound",
+                fixture.name
+            );
+        }
+    }
+}
+
 /// `ZSTD_decompress` decodes a frame that needs no dictionary;
 /// `ZSTD_decompress_usingDict` one that does, with the dictionary file as
 /// that version's command line trained it; one byte short is too small.

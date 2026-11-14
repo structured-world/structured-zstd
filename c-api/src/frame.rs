@@ -6,9 +6,9 @@ use core::ffi::{c_uint, c_ulonglong};
 
 use codec::decoding::errors::ReadFrameHeaderError;
 use codec::decoding::{
-    FrameContentSize, FrameMagic, FrameSizeError, decompression_margin, find_decompressed_size,
-    find_frame_compressed_size, frame_decompressed_bound, frame_header_size, frame_magic, is_frame,
-    min_decoding_buffer_size, read_frame_header_info,
+    FrameContentSize, FrameMagic, FrameSizeError, decompressed_bound, decompression_margin,
+    find_decompressed_size, frame_header_size, frame_magic, is_frame, min_decoding_buffer_size,
+    read_frame_header_info,
 };
 use codec::skippable::{
     SkippableFrameError, SkippableSliceError, parse_skippable_frame, write_skippable_frame,
@@ -366,28 +366,19 @@ pub extern "C" fn ZSTD_decodingBufferSize_min(
 /// an upper bound on the total decompressed size of every frame in `src`.
 ///
 /// Always returns a bound (exact when sizes are declared, otherwise a loose
-/// per-block bound) or `ZSTD_CONTENTSIZE_ERROR` on a malformed frame.
+/// per-block bound) or `ZSTD_CONTENTSIZE_ERROR`: on a malformed frame, and on
+/// a bound the result cannot carry. The largest bound returned is
+/// `ZSTD_CONTENTSIZE_ERROR - 1`, so the result never reads as
+/// `ZSTD_CONTENTSIZE_UNKNOWN`.
 ///
 /// # Safety
 /// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_decompressBound(src: *const u8, src_size: usize) -> c_ulonglong {
-    let mut rest = unsafe { in_slice(src, src_size) };
-    let mut total: u64 = 0;
-    while !rest.is_empty() {
-        match frame_decompressed_bound(rest) {
-            // checked_add, not saturating: a saturated u64::MAX would alias the
-            // CONTENTSIZE_UNKNOWN sentinel and mask the overflow.
-            Ok(bound) => match total.checked_add(bound) {
-                Some(sum) => total = sum,
-                None => return CONTENTSIZE_ERROR,
-            },
-            Err(_) => return CONTENTSIZE_ERROR,
-        }
-        match find_frame_compressed_size(rest) {
-            Ok(consumed) if consumed > 0 && consumed <= rest.len() => rest = &rest[consumed..],
-            _ => return CONTENTSIZE_ERROR,
-        }
+    match decompressed_bound(unsafe { in_slice(src, src_size) }) {
+        // The two values from `ZSTD_CONTENTSIZE_ERROR` up are this ABI's
+        // sentinels, not sizes.
+        Ok(total) if total < CONTENTSIZE_ERROR => total,
+        _ => CONTENTSIZE_ERROR,
     }
-    total
 }
