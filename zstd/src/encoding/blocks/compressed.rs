@@ -228,19 +228,8 @@ fn new_table_cannot_pay(
         .sum();
     let compressed = 1 + weight_bits_256 / (256 * 8);
     let description = direct.map_or(compressed, |direct| direct.min(compressed));
-    let cannot_pay = payload + description >= allowed || description + 12 >= len;
-    #[cfg(test)]
-    if cannot_pay {
-        NEW_TABLES_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-    cannot_pay
+    payload + description >= allowed || description + 12 >= len
 }
-
-/// How many times [`new_table_cannot_pay`] answered yes, for a test to see
-/// that it fires.
-#[cfg(test)]
-pub(crate) static NEW_TABLES_REFUSED: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
 
 /// Whether a section with these counts has no previous table to repeat: none
 /// at all, or one with no code for a symbol that occurs.

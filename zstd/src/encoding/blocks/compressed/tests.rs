@@ -610,10 +610,10 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
 #[test]
 fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
     use super::{
-        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, NEW_TABLES_REFUSED,
-        encode_block_parts, estimate_block_parts_size,
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size, min_literals_to_compress, new_table_cannot_pay,
+        single_literal_stream,
     };
-    use core::sync::atomic::Ordering;
     let mut state = 0x1234_5678u32;
     let mut next = move || {
         state ^= state << 13;
@@ -669,7 +669,6 @@ fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
                         estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
                     let mut emit_state = make_state();
                     let mut emitted: Vec<u8> = Vec::new();
-                    let refused_before = NEW_TABLES_REFUSED.load(Ordering::Relaxed);
                     crate::encoding::fastpath::with_encode_tier!(
                         emit_state.copy_kernel,
                         K => encode_block_parts::<_, K>(
@@ -685,16 +684,40 @@ fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
                         "{strategy:?}, {alphabet} symbols, {len} bytes, {draws} draws"
                     );
                     sections += 1;
-                    let was_refused = NEW_TABLES_REFUSED.load(Ordering::Relaxed) != refused_before;
-                    refused += usize::from(was_refused);
                     // A raw section costs more than its bytes; a coded one less.
                     let is_raw = emitted.len() > len;
-                    // Only a section past the flat-histogram gate reaches the
-                    // tree at all.
+                    // Only a section long enough and past the flat-histogram
+                    // gate reaches the tree at all.
                     let mut counts = [0usize; 256];
-                    let (_, largest) = crate::histogram::count_bytes(&literals, &mut counts);
-                    let reaches_tree = largest > (len >> 7) + 4 && largest < len;
+                    let (max_symbol, largest) =
+                        crate::histogram::count_bytes(&literals, &mut counts);
+                    let reaches_tree = len >= min_literals_to_compress(strategy, false)
+                        && largest > (len >> 7) + 4
+                        && largest < len;
                     raw += usize::from(is_raw && reaches_tree);
+                    // The refusal as the emitter asks it of this section, put
+                    // to the same build here: nothing shared with another
+                    // test's sections.
+                    let mut was_refused = false;
+                    if reaches_tree {
+                        let mut scratch = huff0_encoder::WeightScratch::default();
+                        huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
+                            &counts[..=max_symbol],
+                            len,
+                            false,
+                            &mut scratch,
+                            |shape| {
+                                was_refused = new_table_cannot_pay(
+                                    shape,
+                                    len,
+                                    strategy,
+                                    single_literal_stream(len, false),
+                                );
+                                false
+                            },
+                        );
+                    }
+                    refused += usize::from(was_refused);
                     assert!(
                         !was_refused || is_raw,
                         "{strategy:?}, {alphabet} symbols, {len} bytes: refused, yet coded"
