@@ -105,6 +105,53 @@ fn find_decompressed_size_sums_what_the_frames_declare() {
     ));
 }
 
+/// The bounds add up across frames whether a frame declares its size or
+/// not, a skippable frame counting zero; the whole of `u64` is a bound, a sum
+/// past it is an overflow, and a damaged frame or a stray byte after the last
+/// one is that frame's error.
+#[test]
+fn decompressed_bound_sums_the_bound_of_every_frame() {
+    use super::decompressed_bound;
+    assert_eq!(decompressed_bound(&[]).unwrap(), 0);
+
+    let mut frames = frame(&[1u8; 300]);
+    frames.extend(skippable_frame(b"skip"));
+    frames.extend(no_fcs_frame());
+    frames.extend(frame(&[2u8; 200]));
+    assert_eq!(decompressed_bound(&frames).unwrap(), 300 + 1024 + 200);
+
+    // The running total is what overflows, not any one frame.
+    let first = u64::MAX - 0x100;
+    let three = |last: u64| {
+        let mut frames = frame_declaring(first);
+        frames.extend(frame_declaring(0x80));
+        frames.extend(frame_declaring(last));
+        frames
+    };
+    assert_eq!(decompressed_bound(&three(0x80)).unwrap(), u64::MAX);
+    assert!(matches!(
+        decompressed_bound(&three(0x81)),
+        Err(DecompressedSizeError::Overflow)
+    ));
+    assert_eq!(
+        decompressed_bound(&frame_declaring(u64::MAX)).unwrap(),
+        u64::MAX
+    );
+
+    let mut cut = frame(&[3u8; 300]);
+    cut.pop();
+    assert!(matches!(
+        decompressed_bound(&cut),
+        Err(DecompressedSizeError::Frame(FrameSizeError::Truncated))
+    ));
+    let mut trailing = frame(&[3u8; 300]);
+    trailing.push(0);
+    assert!(matches!(
+        decompressed_bound(&trailing),
+        Err(DecompressedSizeError::Frame(FrameSizeError::Header(_)))
+    ));
+}
+
 /// A header read in pieces asks for the bytes that hold the descriptor, then
 /// for the header's own length, and eight for a skippable frame; a prefix of
 /// no known magic number is refused at once, however short (upstream

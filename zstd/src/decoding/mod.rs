@@ -153,41 +153,67 @@ pub enum FrameSizeError {
 /// assert_eq!(find_frame_compressed_size(&frame).unwrap(), frame.len());
 /// ```
 pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
+    frame_extent(src).map(|(len, _)| len)
+}
+
+/// On-disk length of the FIRST frame in `src` and the bound on what it
+/// decompresses to, from one walk of its blocks: the two answers
+/// [`find_frame_compressed_size`] and [`frame_decompressed_bound`] give.
+fn frame_extent(src: &[u8]) -> Result<(usize, u64), FrameSizeError> {
     #[cfg(feature = "legacy")]
     if let Some(version) = LegacyVersion::of(src) {
-        return legacy::frame_size(version, src).map(|(size, _)| size);
+        return legacy::frame_size(version, src);
     }
     let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
         Ok(parsed) => parsed,
-        // Skippable frame: magic (4) + Frame_Size field (4) + payload.
+        // Skippable frame: magic (4) + Frame_Size field (4) + payload, all of
+        // which must be present, and nothing regenerated.
         Err(errors::ReadFrameHeaderError::SkipFrame { length, .. }) => {
             return 8usize
                 .checked_add(length as usize)
                 .filter(|end| *end <= src.len())
+                .map(|end| (end, 0))
                 .ok_or(FrameSizeError::Truncated);
         }
         Err(e) => return Err(FrameSizeError::Header(e)),
     };
 
-    let walk = walk_blocks(src, header_len as usize, frame_block_size_max(&header))?;
-    if header.descriptor.content_checksum_flag() {
+    // The blocks are walked (and the checksum trailer counted) whether or not
+    // the header declares a size, so a truncated frame is refused either way.
+    // The per-frame block maximum both bounds the walk and scales the bound of
+    // a frame that declares no size.
+    let block_size_max = frame_block_size_max(&header);
+    let walk = walk_blocks(src, header_len as usize, block_size_max)?;
+    let end = if header.descriptor.content_checksum_flag() {
         walk.end
             .checked_add(4)
             .filter(|end| *end <= src.len())
-            .ok_or(FrameSizeError::Truncated)
+            .ok_or(FrameSizeError::Truncated)?
     } else {
-        Ok(walk.end)
-    }
+        walk.end
+    };
+    let bound = if header.fcs_declared() {
+        header.frame_content_size()
+    } else {
+        // Saturating is intentional here: this is an UPPER bound, so capping
+        // at the maximum representable value is the correct ceiling for a
+        // pathologically large frame, not a masked arithmetic bug. Each of
+        // `walk.count` blocks regenerates at most `block_size_max` bytes
+        // (enforced by `walk_blocks`, so an oversized block header cannot
+        // undercut the bound).
+        walk.count.saturating_mul(block_size_max as u64)
+    };
+    Ok((end, bound))
 }
 
-/// Error from [`find_decompressed_size`].
+/// Error from [`find_decompressed_size`] and [`decompressed_bound`].
 #[derive(Debug)]
 pub enum DecompressedSizeError {
     /// A frame header could not be parsed.
     Header(errors::ReadFrameHeaderError),
     /// A frame's blocks could not be walked to the start of the next one.
     Frame(FrameSizeError),
-    /// The declared sizes add up past `u64::MAX`.
+    /// The sizes add up past `u64::MAX`.
     Overflow,
 }
 
@@ -329,46 +355,39 @@ fn walk_blocks(
 /// # Errors
 /// [`FrameSizeError`] on an unreadable header, truncation, or a reserved block.
 pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
-    #[cfg(feature = "legacy")]
-    if let Some(version) = LegacyVersion::of(src) {
-        return legacy::frame_size(version, src).map(|(_, bound)| bound);
-    }
-    let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
-        Ok(parsed) => parsed,
-        // Skippable frame contributes 0, but its full payload must be present:
-        // truncation is an error per this function's contract.
-        Err(errors::ReadFrameHeaderError::SkipFrame { length, .. }) => {
-            return 8usize
-                .checked_add(length as usize)
-                .filter(|end| *end <= src.len())
-                .map(|_| 0)
-                .ok_or(FrameSizeError::Truncated);
-        }
-        Err(e) => return Err(FrameSizeError::Header(e)),
-    };
+    frame_extent(src).map(|(_, bound)| bound)
+}
 
-    // Walk the blocks (and the optional checksum trailer) so a truncated frame
-    // is rejected even when Frame_Content_Size is declared — without this the
-    // declared-FCS path would return a bound for an incomplete buffer. The
-    // per-frame block maximum both bounds the walk and scales the no-FCS bound.
-    let block_size_max = frame_block_size_max(&header);
-    let walk = walk_blocks(src, header_len as usize, block_size_max)?;
-    if header.descriptor.content_checksum_flag() {
-        walk.end
-            .checked_add(4)
-            .filter(|end| *end <= src.len())
-            .ok_or(FrameSizeError::Truncated)?;
+/// Upper bound on the decompressed size of every frame in `src` together,
+/// without decoding any of them: the sum of each frame's
+/// [`frame_decompressed_bound`], skippable frames counting zero. Use it to
+/// size an output buffer for a run of concatenated frames. Backs the C
+/// `ZSTD_decompressBound`.
+///
+/// # Errors
+/// [`DecompressedSizeError::Frame`] when a frame is malformed or truncated,
+/// which includes bytes after the last frame that are no frame, and
+/// [`DecompressedSizeError::Overflow`] when the bounds add up past `u64::MAX`.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::decompressed_bound;
+/// let mut frames = compress_slice_to_vec(&[1u8; 300], CompressionLevel::Default);
+/// frames.extend(compress_slice_to_vec(&[2u8; 200], CompressionLevel::Default));
+/// assert_eq!(decompressed_bound(&frames).unwrap(), 500);
+/// ```
+pub fn decompressed_bound(src: &[u8]) -> Result<u64, DecompressedSizeError> {
+    let mut rest = src;
+    let mut total: u64 = 0;
+    while !rest.is_empty() {
+        let (consumed, bound) = frame_extent(rest).map_err(DecompressedSizeError::Frame)?;
+        total = total
+            .checked_add(bound)
+            .ok_or(DecompressedSizeError::Overflow)?;
+        // A frame is at least its header, so the walk always advances.
+        rest = &rest[consumed..];
     }
-
-    if header.fcs_declared() {
-        return Ok(header.frame_content_size());
-    }
-    // Saturating is intentional here: this is an UPPER bound, so capping at the
-    // maximum representable value is the correct ceiling for a pathologically
-    // large frame, not a masked arithmetic bug. Each of `walk.count` blocks
-    // regenerates at most `block_size_max` bytes (now enforced by `walk_blocks`,
-    // so the bound can no longer be undercut by an oversized block header).
-    Ok(walk.count.saturating_mul(block_size_max as u64))
+    Ok(total)
 }
 
 /// What the first four bytes of a buffer announce, read by [`frame_magic`].

@@ -296,6 +296,88 @@ fn decompressed_size_queries_span_multiple_frames() {
     assert!(bound >= 4096 + 1000, "bound must not undercount");
 }
 
+/// A single-segment frame declaring `size` in an 8-byte Frame_Content_Size
+/// field over one empty last raw block. The size queries read the header and
+/// walk the block; nothing is decoded.
+fn frame_declaring(size: u64) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
+    frame.extend_from_slice(&size.to_le_bytes());
+    frame.extend_from_slice(&[0x01, 0x00, 0x00]);
+    frame
+}
+
+/// `ZSTD_decompressBound` returns a number or `ZSTD_CONTENTSIZE_ERROR`: the
+/// largest bound it can return is one below that sentinel, and a total at or
+/// past it, wrapped or not, is an error rather than a value that reads as
+/// `ZSTD_CONTENTSIZE_UNKNOWN` (the boundary upstream's
+/// `test_decompressBoundOverflow` walks).
+#[test]
+fn decompress_bound_is_a_number_below_the_sentinels_or_an_error() {
+    const ERROR: u64 = u64::MAX - 1;
+    const UNKNOWN: u64 = u64::MAX;
+    const LARGEST: u64 = ERROR - 1;
+    let bound = |frames: &[u8]| unsafe { ZSTD_decompressBound(frames.as_ptr(), frames.len()) };
+    let joined = |frames: &[&[u8]]| frames.concat();
+    let skippable = [0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+    // A window descriptor and no content size: one block of a 1 KiB window.
+    let undeclared = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x01, 0x00, 0x00];
+    let first = 0xFFFF_FFFF_FFFF_FF00u64;
+
+    assert_eq!(bound(&[]), 0);
+    assert_eq!(bound(&frame_declaring(LARGEST)), LARGEST);
+    assert_eq!(bound(&frame_declaring(ERROR)), ERROR);
+    assert_ne!(bound(&frame_declaring(UNKNOWN)), UNKNOWN);
+    assert_eq!(bound(&frame_declaring(first)), first);
+
+    for tail in [0u64, 1, 0xFC, 0xFD, 0xFE, 0xFF, 0x100, 0x110] {
+        let expected = if tail <= LARGEST - first {
+            first + tail
+        } else {
+            ERROR
+        };
+        let frames = joined(&[&frame_declaring(first), &frame_declaring(tail)]);
+        assert_eq!(bound(&frames), expected, "a tail of {tail:#x}");
+    }
+
+    // The third addition is checked against the running total.
+    let three = |last: u64| {
+        joined(&[
+            &frame_declaring(first),
+            &frame_declaring(0x80),
+            &frame_declaring(last),
+        ])
+    };
+    assert_eq!(bound(&three(0x7D)), LARGEST);
+    assert_eq!(bound(&three(0x7E)), ERROR);
+
+    // A skippable frame adds nothing, at the largest result as well.
+    let around_skippable =
+        |last: u64| joined(&[&frame_declaring(first), &skippable, &frame_declaring(last)]);
+    assert_eq!(bound(&around_skippable(LARGEST - first)), LARGEST);
+    assert_eq!(bound(&around_skippable(0x100)), ERROR);
+    assert_eq!(bound(&skippable), 0);
+
+    // A frame declaring no size counts its blocks: a number, never UNKNOWN.
+    assert_eq!(bound(&undeclared), 1024);
+    assert_eq!(
+        bound(&joined(&[&frame_declaring(LARGEST - 1024), &undeclared])),
+        LARGEST
+    );
+    assert_eq!(
+        bound(&joined(&[&frame_declaring(LARGEST - 1023), &undeclared])),
+        ERROR
+    );
+
+    // Empty frames are valid; a cut frame or a stray byte after one is not.
+    let empty_then_skippable = joined(&[&frame_declaring(0), &skippable]);
+    assert_eq!(bound(&empty_then_skippable), 0);
+    assert_eq!(
+        bound(&empty_then_skippable[..empty_then_skippable.len() - 1]),
+        ERROR
+    );
+    assert_eq!(bound(&joined(&[&empty_then_skippable, &[0]])), ERROR);
+}
+
 #[test]
 fn level_bounds_match_crate() {
     assert_eq!(ZSTD_minCLevel(), -131072);
