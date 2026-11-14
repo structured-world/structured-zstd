@@ -602,6 +602,113 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
     );
 }
 
+/// A literals section refused from its code lengths is one the built table
+/// leaves raw. Across alphabets, lengths, distributions and strategies the
+/// emitter and the estimator build the table anyway in this (debug) build and
+/// assert the outcome, and their sizes agree. The refusal catches most of the
+/// sections that end raw, and leaves alone the ones a table pays for.
+#[test]
+fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, NEW_TABLES_REFUSED,
+        encode_block_parts, estimate_block_parts_size,
+    };
+    use core::sync::atomic::Ordering;
+    let mut state = 0x1234_5678u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let (mut sections, mut raw, mut refused) = (0usize, 0usize, 0usize);
+    for strategy in [
+        StrategyTag::Fast,
+        StrategyTag::Dfast,
+        StrategyTag::Lazy,
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra2,
+    ] {
+        for alphabet in [2usize, 4, 10, 16, 40, 64, 95, 128, 200, 256] {
+            for len in [64usize, 78, 100, 128, 200, 256, 500, 1023, 1024, 2000, 5000] {
+                // Uniform, leaning to the low symbols, and leaning hard.
+                for draws in 1..=3 {
+                    let base = (next() as usize) % (257 - alphabet);
+                    let literals: Vec<u8> = (0..len)
+                        .map(|_| {
+                            let symbol = (0..draws)
+                                .map(|_| next() as usize % alphabet)
+                                .min()
+                                .unwrap();
+                            (base + symbol) as u8
+                        })
+                        .collect();
+                    let make_state = || CompressState::<EntropyOnlyMatcher> {
+                        matcher: EntropyOnlyMatcher,
+                        sequence_capture: None,
+                        copy_kernel: crate::encoding::fastpath::select_kernel(),
+                        last_huff_table: None,
+                        huf_repeat_valid: false,
+                        huff_table_spare: None,
+                        huff_weights: Default::default(),
+                        seen_content: Default::default(),
+                        fse_tables: FseTables::new(),
+                        block_scratch: CompressedBlockScratch::new(),
+                        workspace: Workspace::new(),
+                        offset_hist: [1, 4, 8],
+                        strategy_tag: strategy,
+                        split_strategy: strategy,
+                        pre_split: None,
+                        huf_optimal_search: false,
+                        literal_compression_disabled: false,
+                        post_split_allowed: true,
+                    };
+                    let mut est_state = make_state();
+                    let mut workspace = EstimatorWorkspace::default();
+                    let est =
+                        estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+                    let mut emit_state = make_state();
+                    let mut emitted: Vec<u8> = Vec::new();
+                    let refused_before = NEW_TABLES_REFUSED.load(Ordering::Relaxed);
+                    crate::encoding::fastpath::with_encode_tier!(
+                        emit_state.copy_kernel,
+                        K => encode_block_parts::<_, K>(
+                            &mut emit_state,
+                            &literals,
+                            &mut [],
+                            &mut emitted,
+                        )
+                    );
+                    assert_eq!(
+                        est,
+                        emitted.len(),
+                        "{strategy:?}, {alphabet} symbols, {len} bytes, {draws} draws"
+                    );
+                    sections += 1;
+                    let was_refused = NEW_TABLES_REFUSED.load(Ordering::Relaxed) != refused_before;
+                    refused += usize::from(was_refused);
+                    // A raw section costs more than its bytes; a coded one less.
+                    let is_raw = emitted.len() > len;
+                    // Only a section past the flat-histogram gate reaches the
+                    // tree at all.
+                    let mut counts = [0usize; 256];
+                    let (_, largest) = crate::histogram::count_bytes(&literals, &mut counts);
+                    let reaches_tree = largest > (len >> 7) + 4 && largest < len;
+                    raw += usize::from(is_raw && reaches_tree);
+                    assert!(
+                        !was_refused || is_raw,
+                        "{strategy:?}, {alphabet} symbols, {len} bytes: refused, yet coded"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        refused * 2 > raw && sections > 4 * raw,
+        "{refused} refused of {raw} raw among {sections} sections"
+    );
+}
+
 #[test]
 fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     use super::{

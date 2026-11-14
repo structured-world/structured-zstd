@@ -123,9 +123,18 @@ fn main() {
         Ok(other) => panic!("ATTACH={other}: expected attach, copy or load"),
         Err(_) => None,
     };
-    if raw_skip_off || attach.is_some() {
+    // `LITERALS=raw` writes every literals section raw, the floor a frame
+    // reaches with no time spent on its Huffman table.
+    let raw_literals = env::var("LITERALS").is_ok_and(|v| v == "raw");
+    if raw_skip_off || attach.is_some() || raw_literals {
+        let literal_mode = if raw_literals {
+            structured_zstd::encoding::LiteralCompressionMode::Disable
+        } else {
+            structured_zstd::encoding::LiteralCompressionMode::default()
+        };
         let params = CompressionParameters::builder(compression_level)
             .raw_skip(!raw_skip_off)
+            .literal_compression(literal_mode)
             .dictionary_attach(attach.unwrap_or_default())
             .build()
             .expect("a level, the raw skip and the attach mode are always valid parameters");
