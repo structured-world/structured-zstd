@@ -1770,7 +1770,7 @@ pub(crate) fn block_ceiling(target: Option<u32>, max: Option<u32>) -> usize {
 ///
 /// The slice impl exists so the slice entry points
 /// (`compress_independent_frame_into`, `compress_oneshot_*` fallbacks)
-/// append with one `extend_from_slice` — the generic reader impl must hand
+/// append with one `extend_from_slice`. The generic reader impl must hand
 /// `Read::read` an initialized target region, which a room not written
 /// before has to be zeroed for.
 ///
