@@ -156,6 +156,105 @@ const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     37, 36, 34, 33, 31, 30, 28, 26, 25, 23, 22, 20, 19, 17, 16, 14, 13, 11, 10, 8, 7, 5, 4, 2, 1,
 ];
 
+/// `log2(x)` in 1/256ths of a bit, as a pair `(not above, not below)` the true
+/// value, for `x >= 1`. The eight leading bits of `x` index
+/// [`INVERSE_PROBABILITY_LOG_256`], so the two ends are at most 1/128 of the
+/// mantissa apart.
+#[inline]
+fn log2_bounds_256(x: usize) -> (usize, usize) {
+    debug_assert!(x >= 1);
+    let exponent = x.ilog2() as usize;
+    let scale = exponent.saturating_sub(7);
+    // 128..=255 once `x` has eight bits, `x` itself below that.
+    let mantissa = x >> scale;
+    // `log2(m) * 256` lies in `(2048 - table[m] - 1, 2048 - table[m]]`, and
+    // only a power of two sits on the upper end.
+    let not_below_mantissa = 2048 - INVERSE_PROBABILITY_LOG_256[mantissa];
+    let not_above = not_below_mantissa - usize::from(!mantissa.is_power_of_two());
+    let not_below = if x == mantissa << scale {
+        not_below_mantissa
+    } else if mantissa == 255 {
+        // The next mantissa is 256: eight whole bits.
+        2048
+    } else {
+        2048 - INVERSE_PROBABILITY_LOG_256[mantissa + 1]
+    };
+    (not_above + scale * 256, not_below + scale * 256)
+}
+
+/// Whether a literals section coded with a new table of this shape ends raw,
+/// told from the code lengths before the table and its description are built.
+///
+/// The payload is exact for one stream (the lengths summed over the counts,
+/// and the end mark) and a floor for four, which add a six-byte jump table.
+/// The description is the smaller of its two forms: the direct one, a nibble
+/// a weight, whose size is exact, and the FSE one, taken at the entropy of the
+/// weights it codes, which that stream does not come in under. With both in
+/// hand the section is refused by the tests the built table would meet: the
+/// raw fallback (`cLitSize >= srcSize - minGain`) and upstream's
+/// `hSize + 12 >= srcSize`.
+///
+/// Only a new table is judged here: a caller with a previous table that codes
+/// the section must not refuse on this.
+fn new_table_cannot_pay(
+    shape: &huff0_encoder::CodeShape,
+    len: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+    single_stream: bool,
+) -> bool {
+    let allowed = len.saturating_sub(min_gain(len, strategy));
+    let payload = shape.one_stream_bytes() + if single_stream { 0 } else { 6 };
+    let direct = (shape.described <= 128).then(|| 1 + shape.described.div_ceil(2));
+    // The description is never longer than its direct form: a table that pays
+    // with that one pays, and most tables kept are settled here.
+    if let Some(direct) = direct
+        && payload + direct < allowed
+        && direct + 12 < len
+    {
+        return false;
+    }
+    let (described_log, _) = log2_bounds_256(shape.described.max(1));
+    let weight_bits_256: usize = shape
+        .weights
+        .iter()
+        .filter(|&&symbols| symbols != 0)
+        .map(|&symbols| {
+            let (_, symbols_log) = log2_bounds_256(usize::from(symbols));
+            // Saturating on purpose: this is a floor, and the two logs are
+            // rounded apart, so a weight every symbol carries can come out a
+            // hair below the zero bits it really costs.
+            usize::from(symbols) * described_log.saturating_sub(symbols_log)
+        })
+        .sum();
+    let compressed = 1 + weight_bits_256 / (256 * 8);
+    let description = direct.map_or(compressed, |direct| direct.min(compressed));
+    let cannot_pay = payload + description >= allowed || description + 12 >= len;
+    #[cfg(test)]
+    if cannot_pay {
+        NEW_TABLES_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    cannot_pay
+}
+
+/// How many times [`new_table_cannot_pay`] answered yes, for a test to see
+/// that it fires.
+#[cfg(test)]
+pub(crate) static NEW_TABLES_REFUSED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a section with these counts has no previous table to repeat: none
+/// at all, or one with no code for a symbol that occurs.
+fn no_previous_table_codes(
+    previous: Option<&huff0_encoder::HuffmanTable>,
+    counts: &[usize; 256],
+) -> bool {
+    previous.is_none_or(|table| {
+        table
+            .estimate_compressed_size_from_counts_checked(counts)
+            .is_none()
+    })
+}
+
 /// Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit size format.
 const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 
@@ -1457,14 +1556,24 @@ fn estimate_literals_section_bytes(
     {
         return repeat(prev);
     }
+    // The emitter's refusal from the code lengths, in the same position and
+    // checked the same way in a debug build.
+    let mut refused = false;
     // Mutable because the size query is what encodes the weight description
     // into the table's own buffer, so the emitter that follows reads it.
-    let mut new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    let Some(mut new_table) = huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
         &counts[..=max_sym],
         literals.len(),
         huf_search,
         weight_scratch,
-    );
+        |shape| {
+            refused = new_table_cannot_pay(shape, literals.len(), strategy, single_stream)
+                && no_previous_table_codes(last_huff, counts);
+            refused && !cfg!(debug_assertions)
+        },
+    ) else {
+        return raw();
+    };
 
     let Some(new_desc) =
         new_table.writeable_table_description_size(weight_scratch.weight_fse_table())
@@ -1520,6 +1629,11 @@ fn estimate_literals_section_bytes(
         weight_scratch.recycle(new_table);
         return raw();
     }
+    debug_assert!(
+        !refused,
+        "the code lengths refused a {}-byte section priced at {huf_section_size}",
+        literals.len()
+    );
 
     if use_new {
         (total, HuffOutcome::New(new_table))
@@ -3622,15 +3736,32 @@ fn compress_literals<K: EncodeTier>(
         return None;
     }
 
+    // With no previous table to fall back on, a section whose new table
+    // cannot pay goes out raw as soon as its code lengths say so, before the
+    // table and its description are built. A debug build builds them anyway
+    // and asserts below that the section does end raw, so every test that
+    // compresses checks the refusal against what it stands in for.
+    let mut refused = false;
+    // What the new table's one stream takes, where its code lengths gave it.
+    let mut new_table_payload = None;
     // Mutable because the size query encodes the weight description into the
     // table's buffer; `write_table` below then reads it rather than repeating
     // the encode.
-    let mut new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    let Some(mut new_encoder_table) = huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
         &counts[..=max_symbol],
         literals.len(),
         huf_search,
         weight_scratch,
-    );
+        |shape| {
+            new_table_payload = Some(shape.one_stream_bytes());
+            refused = new_table_cannot_pay(shape, literals.len(), strategy, single_stream)
+                && no_previous_table_codes(last_table, counts);
+            refused && !cfg!(debug_assertions)
+        },
+    ) else {
+        raw_literals(literals, writer);
+        return None;
+    };
 
     let Some(new_table_description_size) =
         new_encoder_table.writeable_table_description_size(weight_scratch.weight_fse_table())
@@ -3664,6 +3795,33 @@ fn compress_literals<K: EncodeTier>(
     } else {
         last_table.expect("reuse path implies prior table exists")
     };
+
+    // The raw fallback at the end, answered before the section is encoded
+    // where the histogram already settles it: one stream's size is exactly its
+    // code lengths summed over the counts, and four streams are never shorter
+    // than one with their six-byte jump table. A section refused here is one
+    // the fallback would refuse after writing and unwinding it.
+    let description = if new_table {
+        new_table_description_size
+    } else {
+        0
+    };
+    let one_stream = match new_table_payload {
+        Some(bytes) if new_table => bytes,
+        _ => encoder_table.estimate_compressed_size_from_counts(counts),
+    };
+    let payload_floor = one_stream + if single_stream { 0 } else { 6 };
+    if use_raw_literal_fallback(description + payload_floor, literals.len(), strategy) {
+        raw_literals(literals, writer);
+        weight_scratch.recycle(new_encoder_table);
+        return None;
+    }
+    debug_assert!(
+        !refused,
+        "the code lengths refused a {}-byte section that codes in {} bytes or more",
+        literals.len(),
+        description + payload_floor
+    );
 
     if new_table {
         writer.write_bits(2u8, 2); // compressed literals type

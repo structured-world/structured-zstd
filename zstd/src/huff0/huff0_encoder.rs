@@ -694,11 +694,27 @@ impl HuffmanTable {
         use_search: bool,
         scratch: &mut WeightScratch,
     ) -> Self {
+        Self::build_from_counts_gated_unless(counts, total, use_search, scratch, |_| false)
+            .expect("a build nothing refuses returns its table")
+    }
+
+    /// [`Self::build_from_counts_gated_with`] that stops once the code lengths
+    /// are known when `refuse` says so, before the table and its description
+    /// are built: `None` then. `refuse` sees what the code costs
+    /// ([`CodeShape`]); it is not asked on the searched path or where the
+    /// limiter falls back, which build as before.
+    pub(crate) fn build_from_counts_gated_unless(
+        counts: &[usize],
+        total: usize,
+        use_search: bool,
+        scratch: &mut WeightScratch,
+        refuse: impl FnOnce(&CodeShape) -> bool,
+    ) -> Option<Self> {
         if use_search {
             // Validated by the delegate, which is an entry point of its own.
             // Checking here as well would walk the histogram a second time on
             // every searched build, including each splitter candidate.
-            Self::build_from_counts(counts)
+            Some(Self::build_from_counts(counts))
         } else {
             // A section of a block is far under what a node holds, so this
             // histogram needs no walk to prove it.
@@ -709,19 +725,23 @@ impl HuffmanTable {
             // not the raw natural height (11) which can cost a few bytes vs C.
             let table_log = cheap_huf_table_log(counts, total);
             build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
-            let spare = scratch.spare_table.take();
             if scratch.leaves.len() > 1 && limit_leaves_in_place(&mut scratch.leaves, table_log) {
-                return Self::build_from_limited_leaves(
+                if refuse(&CodeShape::of(&scratch.leaves, counts.len())) {
+                    return None;
+                }
+                let spare = scratch.spare_table.take();
+                return Some(Self::build_from_limited_leaves(
                     &scratch.leaves,
                     counts.len(),
                     table_log,
                     spare,
-                );
+                ));
             }
             // A single symbol, or a code the limiter could not complete, takes
             // the weight route and its fallback.
+            let spare = scratch.spare_table.take();
             build_limited_weights_into(counts, table_log, scratch);
-            Self::build_from_weights_reusing(&scratch.weights, spare)
+            Some(Self::build_from_weights_reusing(&scratch.weights, spare))
         }
     }
 
@@ -1830,6 +1850,52 @@ fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
     let mut scratch = WeightScratch::default();
     build_limited_weights_into(counts, max_nb_bits, &mut scratch);
     core::mem::take(&mut scratch.weights)
+}
+
+/// What a length-limited code costs, read off its leaves before any table is
+/// built from them: enough to tell whether the table is worth building.
+pub(crate) struct CodeShape {
+    /// Bits the counted symbols take under the code.
+    pub(crate) payload_bits: usize,
+    /// How many described symbols carry each weight, absent ones under 0. A
+    /// table description lists a weight for every symbol below the last.
+    pub(crate) weights: [u16; 13],
+    /// Symbols the description lists: all below the last.
+    pub(crate) described: usize,
+}
+
+impl CodeShape {
+    /// The shape of the code `leaves` hold for an alphabet of `alphabet_len`
+    /// symbols whose last symbol occurs.
+    fn of(leaves: &[HuffNode], alphabet_len: usize) -> Self {
+        let last = alphabet_len - 1;
+        let longest = leaves
+            .iter()
+            .fold(0u8, |longest, leaf| longest.max(leaf.nb_bits));
+        let mut weights = [0u16; 13];
+        let mut payload_bits = 0usize;
+        let mut coded = 0u16;
+        for leaf in leaves {
+            payload_bits += leaf.count as usize * leaf.nb_bits as usize;
+            // The last symbol's weight is implied, not written.
+            let listed = u16::from(leaf.symbol as usize != last);
+            weights[(longest + 1 - leaf.nb_bits) as usize] += listed;
+            coded += listed;
+        }
+        weights[0] = last as u16 - coded;
+        Self {
+            payload_bits,
+            weights,
+            described: last,
+        }
+    }
+
+    /// Bytes the counted symbols take as one stream under the code: what
+    /// [`HuffmanTable::estimate_compressed_size_from_counts`] gives the built
+    /// table, the end mark included.
+    pub(crate) fn one_stream_bytes(&self) -> usize {
+        self.payload_bits.div_ceil(8) + usize::from(self.payload_bits.is_multiple_of(8))
+    }
 }
 
 /// The two buffers a weight build needs, owned by the caller so a compressor
