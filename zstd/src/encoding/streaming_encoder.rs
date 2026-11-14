@@ -434,6 +434,7 @@ impl<M: Matcher> CompressionContext<M> {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huf_repeat_valid: false,
+                huff_is_dictionary_seed: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),

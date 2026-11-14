@@ -690,6 +690,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             // `built_huff`; this slot stays empty.
             last_huff_table: None,
             huf_repeat_valid: false,
+            huff_is_dictionary_seed: false,
             huff_table_spare: None,
             // Lent, not created: the estimator builds a table per split
             // candidate, and a fresh scratch here would take its buffers again
@@ -1373,6 +1374,7 @@ fn estimate_block_parts_size<M: Matcher>(
         HuffOutcome::Keep => previous,
         HuffOutcome::New(table) => {
             state.huf_repeat_valid = false;
+            state.huff_is_dictionary_seed = false;
             Some(table)
         }
     };

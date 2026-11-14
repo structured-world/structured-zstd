@@ -1124,6 +1124,96 @@ fn a_copied_dictionary_frame_read_in_place_writes_the_owned_frame() {
     }
 }
 
+/// A frame start leaves an FSE slot that still holds the dictionary's table on
+/// that handle, giving it back the seed's form (the offset table a block turned
+/// custom is valid again), without touching the reference count; a slot
+/// holding another table takes the seed's handle.
+#[test]
+fn a_dictionary_fse_seed_still_in_its_slot_is_re_borrowed() {
+    use super::{PreviousFseTable, SharedFseTable, seed_previous_table};
+    let table = |symbol: u8| {
+        SharedFseTable::new(crate::fse::fse_encoder::build_table_from_data(
+            [symbol, symbol, 1, 2, 3].into_iter(),
+            5,
+            false,
+        ))
+    };
+    let dictionary = table(7);
+    let seed = Some(PreviousFseTable::Dictionary(dictionary.clone()));
+    let mut slot = Some(PreviousFseTable::Custom(dictionary.clone()));
+    let count = SharedFseTable::strong_count(&dictionary);
+    seed_previous_table(&mut slot, &seed);
+    assert!(
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        "the slot keeps the dictionary's handle, valid again"
+    );
+    assert_eq!(SharedFseTable::strong_count(&dictionary), count);
+
+    let mut slot = Some(PreviousFseTable::Custom(table(9)));
+    seed_previous_table(&mut slot, &seed);
+    assert!(
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        "a slot holding another table takes the seed"
+    );
+}
+
+/// A reused compressor keeps the dictionary's Huffman table in place from one
+/// frame to the next while no block replaces it, and seeds it again after a
+/// frame that built its own table or after the dictionary changed: every frame
+/// is the one a fresh compressor writes.
+#[test]
+fn a_dictionary_huffman_seed_left_in_place_writes_the_fresh_frame() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let raw_dict: Vec<u8> = b"tenant=demo table=orders region=eu-west ".repeat(40);
+    // Another dictionary that carries a Huffman table of its own.
+    let other_dict = include_bytes!("../../../dict_tests/huf12/dictionary");
+    // One of the files the dictionary was trained on: its literals are the
+    // ones the dictionary's table codes, so the block repeats that table.
+    let keeps = include_bytes!("../../../dict_tests/files/auditd.service");
+    // Literals the dictionary's table does not describe, so the block builds
+    // its own.
+    let builds: Vec<u8> = (0..6000u32)
+        .map(|n| b"qzxjvkqqzzxxjj"[(n * n % 14) as usize])
+        .collect();
+    let level = super::CompressionLevel::Level(1);
+    let fresh = |dict: &[u8], payload: &[u8]| {
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        compressor.set_dictionary_from_bytes(dict).unwrap();
+        compressor.compress_independent_frame(payload)
+    };
+    let mut reused: FrameCompressor = FrameCompressor::new(level);
+    let mut current: &[u8] = &[];
+    let mut saw_seed_kept = false;
+    let mut saw_seed_replaced = false;
+    for (dict, payload) in [
+        (&dict_raw[..], &keeps[..]),
+        (&dict_raw[..], &keeps[..]),
+        (&dict_raw[..], &builds[..]),
+        (&dict_raw[..], &keeps[..]),
+        (&other_dict[..], &keeps[..]),
+        (&dict_raw[..], &keeps[..]),
+        (&raw_dict[..], &keeps[..]),
+        (&dict_raw[..], &keeps[..]),
+    ] {
+        if current != dict {
+            reused.set_dictionary_from_bytes(dict).unwrap();
+            current = dict;
+        }
+        let frame = reused.compress_independent_frame(payload);
+        if reused.state.huff_is_dictionary_seed {
+            saw_seed_kept = true;
+        } else {
+            saw_seed_replaced = true;
+        }
+        assert!(
+            frame == fresh(dict, payload),
+            "a {}-byte frame differs from a fresh compressor's",
+            payload.len()
+        );
+    }
+    assert!(saw_seed_kept && saw_seed_replaced, "both paths ran");
+}
+
 /// A compressor that alternates frames under the attach cutoff with frames
 /// past it, and then takes another dictionary of the same shape, builds the
 /// attached dictionary tables once per dictionary and allocates them once in
