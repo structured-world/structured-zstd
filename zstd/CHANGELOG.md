@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/structured-world/structured-zstd/compare/v0.3.0...v0.4.0) - 2026-11-14
+
+### Added
+
+- *(decoding)* [**breaking**] hold dictionary content in the caller's buffer ([#649](https://github.com/structured-world/structured-zstd/pull/649))
+- *(encode)* let the caller choose how a frame uses a dictionary ([#641](https://github.com/structured-world/structured-zstd/pull/641))
+
+### Fixed
+
+- *(c-api)* refuse a decompression bound the result cannot carry ([#668](https://github.com/structured-world/structured-zstd/pull/668))
+
+### Performance
+
+- *(encode)* one dictionary index per dictionary for attached and copied frames ([#662](https://github.com/structured-world/structured-zstd/pull/662))
+- *(decoding)* decode small frames' long matches without libc memcpy ([#658](https://github.com/structured-world/structured-zstd/pull/658))
+- *(encode)* trim dfast tail seeding and the optimal parser's per-node work ([#656](https://github.com/structured-world/structured-zstd/pull/656))
+- *(encode)* one page fault per table page on a fresh workspace ([#655](https://github.com/structured-world/structured-zstd/pull/655))
+- *(decoding)* close the x86 decode gap to libzstd ([#652](https://github.com/structured-world/structured-zstd/pull/652))
+
+### Testing
+
+- *(bench)* measure ours with and without the raw skip ([#644](https://github.com/structured-world/structured-zstd/pull/644))
+
 ## [0.2.6](https://github.com/structured-world/structured-zstd/compare/v0.2.5...v0.2.6) - 2026-10-26
 
 ### Added
