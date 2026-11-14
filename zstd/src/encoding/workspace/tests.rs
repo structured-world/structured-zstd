@@ -609,6 +609,39 @@ fn a_history_behaves_like_the_vec_it_replaces() {
     assert_eq!(history.owned_bytes(), 0, "restored in place");
 }
 
+// Room made readable for a read is zeroed only where this history has not
+// written before: a long stream slides its window over the same room, and
+// clearing it for every block cost a fill the size of the whole input. Room
+// the history moves into is new, and is zeroed.
+#[test]
+fn a_history_grown_for_a_read_zeroes_only_room_it_never_wrote() {
+    let mut ws = opened(region_bytes::<u8>(16));
+    let mut history = HistoryBuf::new();
+    history.bind(&mut ws, 16);
+    // Fresh room is zeroed, whatever the workspace held there.
+    history.grow_for_read(8);
+    assert_eq!(&history[..], &[0u8; 8]);
+    history.copy_from_slice(b"abcdefgh");
+    // The window slides: the tail moves down and the room above it, written
+    // by the block before, is handed out as it stands.
+    history.drain_front(6);
+    assert_eq!(&history[..], b"gh");
+    history.grow_for_read(8);
+    assert_eq!(&history[..], b"ghcdefgh");
+    // Past what was ever written the room is zeroed.
+    history.grow_for_read(12);
+    assert_eq!(&history[..], b"ghcdefgh\0\0\0\0");
+    // A length already reached is left alone.
+    history.grow_for_read(4);
+    assert_eq!(history.len(), 12);
+    // Outgrowing the room moves into a new one, which holds nothing yet.
+    history.truncate(2);
+    history.grow_for_read(40);
+    assert!(history.owned_bytes() >= 40, "moved out of the workspace");
+    assert_eq!(&history[..2], b"gh");
+    assert!(history[2..].iter().all(|&byte| byte == 0));
+}
+
 // Region sizes round up to the alignment and refuse to overflow.
 #[test]
 fn region_bytes_rounds_to_the_alignment() {

@@ -890,6 +890,10 @@ pub struct HistoryBuf {
     ptr: NonNull<u8>,
     capacity: usize,
     len: usize,
+    /// Bytes from the room's start that have been written since it became this
+    /// buffer's, at least `len`: what [`Self::grow_for_read`] can hand out
+    /// again without writing it first.
+    written: usize,
     /// Backs the room when the buffer owns it: its length stays `0` and its
     /// capacity is the room, which this type manages.
     own: Vec<u8>,
@@ -908,6 +912,7 @@ impl HistoryBuf {
             ptr: NonNull::dangling(),
             capacity: 0,
             len: 0,
+            written: 0,
             own: Vec::new(),
         }
     }
@@ -936,6 +941,8 @@ impl HistoryBuf {
         }
         self.ptr = room.ptr;
         self.capacity = capacity;
+        // Only the bytes carried over are known written in the new layout.
+        self.written = self.len;
         self.own = Vec::new();
         workspace.release_retired();
     }
@@ -1021,6 +1028,7 @@ impl HistoryBuf {
             );
         }
         self.len += bytes.len();
+        self.written = self.written.max(self.len);
     }
 
     pub(crate) fn push(&mut self, byte: u8) {
@@ -1028,6 +1036,7 @@ impl HistoryBuf {
         // SAFETY: `reserve` left room for one more byte past `len`.
         unsafe { self.ptr.as_ptr().add(self.len).write(byte) };
         self.len += 1;
+        self.written = self.written.max(self.len);
     }
 
     /// Sets the length to `len`, writing `value` into any bytes it adds.
@@ -1039,6 +1048,27 @@ impl HistoryBuf {
                 core::ptr::write_bytes(self.ptr.as_ptr().add(self.len), value, len - self.len);
             }
         }
+        self.len = len;
+        self.written = self.written.max(self.len);
+    }
+
+    /// Sets the length to at least `len` for a read to fill, leaving the bytes
+    /// it adds as they are where the room was written before and zeroing only
+    /// the rest. The window slides over the same room block after block, so a
+    /// long stream zeroes the room once rather than every block it reads.
+    pub(crate) fn grow_for_read(&mut self, len: usize) {
+        if len <= self.len {
+            return;
+        }
+        self.reserve(len - self.len);
+        let fresh = self.written.max(self.len);
+        if len > fresh {
+            // SAFETY: `reserve` left room up to `len`.
+            unsafe { core::ptr::write_bytes(self.ptr.as_ptr().add(fresh), 0, len - fresh) };
+            self.written = len;
+        }
+        // Every byte below `len` is written: below `written` by an earlier
+        // append or fill of this room, the rest just now.
         self.len = len;
     }
 
@@ -1070,6 +1100,8 @@ impl HistoryBuf {
         // SAFETY: a `Vec`'s buffer pointer is never null.
         self.ptr = unsafe { NonNull::new_unchecked(own.as_mut_ptr()) };
         self.capacity = own.capacity();
+        // The new room holds the copied bytes and nothing else.
+        self.written = self.len;
         self.own = own;
     }
 }
@@ -1110,6 +1142,7 @@ impl From<Vec<u8>> for HistoryBuf {
             ptr: unsafe { NonNull::new_unchecked(bytes.as_mut_ptr()) },
             capacity: bytes.capacity(),
             len,
+            written: len,
             own: bytes,
         }
     }
@@ -1156,7 +1189,9 @@ pub(crate) struct RetiredHistory {
 /// output of an uncompressed frame, which carries its blocks raw.
 pub(crate) trait IngestBuffer: core::ops::DerefMut<Target = [u8]> {
     fn extend_from_slice(&mut self, bytes: &[u8]);
-    fn resize(&mut self, len: usize, value: u8);
+    /// Sets the length to at least `len` for a read to overwrite: the bytes
+    /// added are initialized and otherwise unspecified.
+    fn grow_for_read(&mut self, len: usize);
     fn truncate(&mut self, len: usize);
     fn push(&mut self, byte: u8);
 }
@@ -1166,8 +1201,10 @@ impl IngestBuffer for Vec<u8> {
         Vec::extend_from_slice(self, bytes);
     }
 
-    fn resize(&mut self, len: usize, value: u8) {
-        Vec::resize(self, len, value);
+    fn grow_for_read(&mut self, len: usize) {
+        if len > self.len() {
+            Vec::resize(self, len, 0);
+        }
     }
 
     fn truncate(&mut self, len: usize) {
@@ -1184,8 +1221,8 @@ impl IngestBuffer for HistoryBuf {
         HistoryBuf::extend_from_slice(self, bytes);
     }
 
-    fn resize(&mut self, len: usize, value: u8) {
-        HistoryBuf::resize(self, len, value);
+    fn grow_for_read(&mut self, len: usize) {
+        HistoryBuf::grow_for_read(self, len);
     }
 
     fn truncate(&mut self, len: usize) {
