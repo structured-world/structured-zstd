@@ -136,7 +136,17 @@ fn use_raw_literal_fallback(
     literals_len: usize,
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> bool {
-    huf_section_size >= literals_len.saturating_sub(min_gain(literals_len, strategy))
+    huf_section_size >= literal_bytes_allowed(literals_len, strategy)
+}
+
+/// `srcSize - minGain`: the size a coded literals section has to come in
+/// under. The margin is `(len >> minlog) + 2` with `minlog >= 6`, so it never
+/// exceeds a section of two bytes or more, and no section under six is coded.
+#[inline]
+fn literal_bytes_allowed(len: usize, strategy: crate::encoding::strategy::StrategyTag) -> usize {
+    let margin = min_gain(len, strategy);
+    debug_assert!(margin <= len, "a {len}-byte section is under its margin");
+    len - margin
 }
 
 /// Upstream zstd `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256).
@@ -155,6 +165,86 @@ const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     78, 76, 74, 73, 71, 69, 67, 66, 64, 62, 61, 59, 57, 55, 54, 52, 50, 49, 47, 46, 44, 42, 41, 39,
     37, 36, 34, 33, 31, 30, 28, 26, 25, 23, 22, 20, 19, 17, 16, 14, 13, 11, 10, 8, 7, 5, 4, 2, 1,
 ];
+
+/// `log2(x)` in 1/256ths of a bit for a symbol count `x` in `1..=255`, as a
+/// pair `(not above, not below)` the true value, read off
+/// [`INVERSE_PROBABILITY_LOG_256`]: `log2(x) * 256` lies in
+/// `(2048 - table[x] - 1, 2048 - table[x]]`, and only a power of two sits on
+/// the upper end.
+#[inline]
+fn log2_bounds_256(x: usize) -> (usize, usize) {
+    debug_assert!((1..256).contains(&x));
+    let not_below = 2048 - INVERSE_PROBABILITY_LOG_256[x];
+    (not_below - usize::from(!x.is_power_of_two()), not_below)
+}
+
+/// Whether a literals section coded with a new table of this shape ends raw,
+/// told from the code lengths before the table and its description are built.
+///
+/// The payload is exact for one stream (the lengths summed over the counts,
+/// and the end mark) and a floor for four, which add a six-byte jump table.
+/// The description is the smaller of its two forms: the direct one, a nibble
+/// a weight, whose size is exact, and the FSE one, taken at the entropy of the
+/// weights it codes, which that stream does not come in under. With both in
+/// hand the section is refused by the tests the built table would meet: the
+/// raw fallback (`cLitSize >= srcSize - minGain`) and upstream's
+/// `hSize + 12 >= srcSize`.
+///
+/// Only a new table is judged here: a caller with a previous table that codes
+/// the section must not refuse on this.
+fn new_table_cannot_pay(
+    shape: &huff0_encoder::CodeShape,
+    len: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+    single_stream: bool,
+) -> bool {
+    let allowed = literal_bytes_allowed(len, strategy);
+    let payload = shape.one_stream_bytes() + if single_stream { 0 } else { 6 };
+    // The direct form lists up to 128 weights.
+    let has_direct = shape.described <= 128;
+    let direct = 1 + shape.described.div_ceil(2);
+    // The description is never longer than its direct form: a table that pays
+    // with that one pays, and most tables kept are settled here.
+    if has_direct && payload + direct < allowed && direct + 12 < len {
+        return false;
+    }
+    let (described_log, _) = log2_bounds_256(shape.described);
+    let mut weight_bits_256 = 0usize;
+    for symbols in shape.weight_counts() {
+        if symbols != 0 {
+            let (_, symbols_log) = log2_bounds_256(usize::from(symbols));
+            // Saturating on purpose: this is a floor, and the two logs are
+            // rounded apart, so a weight every symbol carries can come out a
+            // hair below the zero bits it really costs.
+            weight_bits_256 += usize::from(symbols) * described_log.saturating_sub(symbols_log);
+        }
+    }
+    let compressed = 1 + weight_bits_256 / (256 * 8);
+    let description = if has_direct && direct < compressed {
+        direct
+    } else {
+        compressed
+    };
+    payload + description >= allowed || description + 12 >= len
+}
+
+/// Whether a refused literals section still gets its table built, so the
+/// outcome can be asserted to be the raw section the refusal stands for. A
+/// debug build does; a release build takes the refusal and builds nothing.
+const VERIFY_REFUSALS: bool = cfg!(debug_assertions);
+
+/// The bytes a section with these counts takes as one stream under the
+/// previous table, or `None` with no table to repeat: none at all, or one with
+/// no code for a symbol that occurs (upstream's `HUF_repeat_none` after
+/// `HUF_validateCTable`). Summed once a section; the repeat shortcut, the
+/// refusal and the table choice all read this one answer.
+#[inline]
+fn previous_table_stream_bytes(
+    previous: Option<&huff0_encoder::HuffmanTable>,
+    counts: &[usize; 256],
+) -> Option<usize> {
+    previous?.estimate_compressed_size_from_counts_checked(counts)
+}
 
 /// Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit size format.
 const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
@@ -1014,6 +1104,7 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
             state.huf_optimal_search,
             &mut state.huff_weights,
             literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
+            VERIFY_REFUSALS,
         ) {
             Some(table) => HuffOutcome::New(table),
             None => HuffOutcome::Keep,
@@ -1342,6 +1433,7 @@ fn estimate_block_parts_size_with<M: Matcher>(
         state.literal_compression_disabled,
         &mut state.huff_weights,
         literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
+        VERIFY_REFUSALS,
     );
 
     // A section without sequences writes no tables, so every axis keeps its own.
@@ -1377,6 +1469,7 @@ fn estimate_literals_section_bytes(
     lit_disabled: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
+    verify_refusals: bool,
 ) -> (usize, HuffOutcome) {
     let raw = || {
         (
@@ -1448,23 +1541,35 @@ fn estimate_literals_section_bytes(
         return raw();
     }
 
+    let previous_stream = previous_table_stream_bytes(last_huff, counts);
     // preferRepeat with a table that has to be checked, as the emitter.
     if prefer_repeat_eligible(strategy, literals.len())
+        && previous_stream.is_some()
         && let Some(prev) = last_huff
-        && prev
-            .estimate_compressed_size_from_counts_checked(counts)
-            .is_some()
     {
         return repeat(prev);
     }
+    // The emitter's refusal from the code lengths, in the same position and
+    // checked the same way in a debug build.
+    let mut refused = false;
+    // What the new table's one stream takes, where its code lengths gave it.
+    let mut new_stream = None;
     // Mutable because the size query is what encodes the weight description
     // into the table's own buffer, so the emitter that follows reads it.
-    let mut new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    let Some(mut new_table) = huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
         &counts[..=max_sym],
         literals.len(),
         huf_search,
         weight_scratch,
-    );
+        |shape| {
+            new_stream = Some(shape.one_stream_bytes());
+            refused = previous_stream.is_none()
+                && new_table_cannot_pay(shape, literals.len(), strategy, single_stream);
+            refused && !verify_refusals
+        },
+    ) else {
+        return raw();
+    };
 
     let Some(new_desc) =
         new_table.writeable_table_description_size(weight_scratch.weight_fse_table())
@@ -1479,26 +1584,45 @@ fn estimate_literals_section_bytes(
     // both new and old tables (see `compress_literals` below); the actual
     // wire output is the stream layout `single_stream` picks once the table is
     // chosen.
-    let use_new =
-        match decide_huff_reuse_like_encoder(&new_table, last_huff, new_desc, literals, counts) {
-            HuffChoice::Raw => {
-                weight_scratch.recycle(new_table);
-                return raw();
-            }
-            HuffChoice::New => true,
-            HuffChoice::Repeat => false,
-        };
-    // The four-stream layout carries a 6-byte jumptable and per-stream padding,
-    // which a single-stream estimate would undercount by ~6–10 bytes and bias
-    // the splitter's probes; each quarter is estimated on its own instead.
-    let payload: usize = if use_new {
-        estimate_huff_payload_bytes(&new_table, literals, counts, single_stream)
-    } else {
-        last_huff
-            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals, single_stream))
-            .unwrap_or(literals.len())
+    // The table chosen, with the section's one-stream size under it where the
+    // build or the comparison already summed it.
+    let (use_new, one_stream) = match decide_huff_reuse_like_encoder(
+        &new_table,
+        &mut new_stream,
+        previous_stream,
+        new_desc,
+        literals,
+        counts,
+    ) {
+        HuffChoice::Raw => {
+            weight_scratch.recycle(new_table);
+            return raw();
+        }
+        HuffChoice::New => (true, new_stream),
+        HuffChoice::Repeat(bytes) => (false, Some(bytes)),
     };
     let tree_desc = if use_new { new_desc } else { 0 };
+    // One stream is that size exactly. Four are never shorter than one with
+    // their six-byte jump table, so a section that floor already sends raw
+    // is priced raw before its quarters are walked, as the emitter writes it
+    // raw before encoding them.
+    let payload: usize = match one_stream {
+        Some(bytes) if single_stream => bytes,
+        Some(bytes)
+            if use_raw_literal_fallback(tree_desc + bytes + 6, literals.len(), strategy) =>
+        {
+            weight_scratch.recycle(new_table);
+            return raw();
+        }
+        // The four-stream layout carries a 6-byte jumptable and per-stream
+        // padding, which a single-stream estimate would undercount by ~6–10
+        // bytes and bias the splitter's probes; each quarter is estimated on
+        // its own instead.
+        _ if use_new => estimate_huff_payload_bytes(&new_table, literals, counts, single_stream),
+        _ => last_huff
+            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals, single_stream))
+            .unwrap_or(literals.len()),
+    };
     let compressed_header = compressed_literals_header_bytes(literals.len());
     let total = compressed_header + tree_desc + payload;
 
@@ -1520,6 +1644,7 @@ fn estimate_literals_section_bytes(
         weight_scratch.recycle(new_table);
         return raw();
     }
+    debug_assert!(!refused, "a refused section is priced as coded");
 
     if use_new {
         (total, HuffOutcome::New(new_table))
@@ -1781,8 +1906,10 @@ fn prefer_repeat_eligible(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HuffChoice {
     /// The previous table: it costs no more than the new one with its
-    /// description, or the description alone eats the section.
-    Repeat,
+    /// description, or the description alone eats the section. Carries the
+    /// bytes the section takes as one stream under that table, which the
+    /// comparison already summed.
+    Repeat(usize),
     /// The table just built.
     New,
     /// Neither: with no usable previous table, the description plus the
@@ -1790,22 +1917,19 @@ enum HuffChoice {
     Raw,
 }
 
+/// `previous_stream` is [`previous_table_stream_bytes`] for this section.
+/// `new_stream` is the same size under the new table where the build reported
+/// it; a build that did not (a searched one) has it summed here only if the
+/// comparison needs it, and left in place for the caller, so neither table's
+/// size is summed twice for a section.
 fn decide_huff_reuse_like_encoder(
     new_table: &huff0_encoder::HuffmanTable,
-    last_table: Option<&huff0_encoder::HuffmanTable>,
+    new_stream: &mut Option<usize>,
+    previous_stream: Option<usize>,
     new_desc: usize,
     literals: &[u8],
     counts: &[usize; 256],
 ) -> HuffChoice {
-    // `hSize + 12 >= srcSize`: the new table is not worth its description.
-    let new_or_raw = if new_desc + 12 >= literals.len() {
-        HuffChoice::Raw
-    } else {
-        HuffChoice::New
-    };
-    let Some(prev) = last_table else {
-        return new_or_raw;
-    };
     // Off the histogram, not the literals: the same sum over at most 256
     // symbols instead of over every byte of the section, which is where
     // upstream reads it from too (huf_compress.c:1416-1417). On a 4 KiB
@@ -1826,16 +1950,29 @@ fn decide_huff_reuse_like_encoder(
     // to 1.68x and from 1.90x to 1.36x. On input the literal stage writes off
     // as incompressible the decision never runs, and the change measures as
     // nothing there (instructions 4.8813 G against 4.8843 G) — as expected.
-    // A previous table that cannot code this section is upstream's
-    // `HUF_repeat_none` after `HUF_validateCTable`.
-    let Some(old_estimate) = prev.estimate_compressed_size_from_counts_checked(counts) else {
-        return new_or_raw;
+    // `hSize + 12 >= srcSize`: the new table is not worth its description,
+    // whatever its stream takes.
+    let description_eats_section = new_desc + 12 >= literals.len();
+    let Some(old_estimate) = previous_stream else {
+        return if description_eats_section {
+            HuffChoice::Raw
+        } else {
+            HuffChoice::New
+        };
     };
-    let new_estimate = new_table
-        .estimate_compressed_size_from_counts_checked(counts)
-        .unwrap_or(literals.len());
-    if old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len() {
-        HuffChoice::Repeat
+    if description_eats_section {
+        return HuffChoice::Repeat(old_estimate);
+    }
+    let new_estimate = match *new_stream {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = new_table.estimate_compressed_size_from_counts(counts);
+            *new_stream = Some(bytes);
+            bytes
+        }
+    };
+    if old_estimate <= new_desc + new_estimate {
+        HuffChoice::Repeat(old_estimate)
     } else {
         HuffChoice::New
     }
@@ -3570,6 +3707,7 @@ fn compress_literals<K: EncodeTier>(
     huf_search: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
+    verify_refusals: bool,
 ) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
     let single_stream = single_literal_stream(literals.len(), repeat_valid);
@@ -3612,25 +3750,41 @@ fn compress_literals<K: EncodeTier>(
 
     // preferRepeat with a table that has to be checked (`huf_compress.c:1389-1398`):
     // repeat it when it codes this section, before any tree build.
+    let previous_stream = previous_table_stream_bytes(last_table, counts);
     if prefer_repeat_eligible(strategy, literals.len())
+        && previous_stream.is_some()
         && let Some(prev) = last_table
-        && prev
-            .estimate_compressed_size_from_counts_checked(counts)
-            .is_some()
     {
         emit_reuse_literals::<K>(literals, prev, single_stream, writer, reset_idx, strategy);
         return None;
     }
 
+    // With no previous table to fall back on, a section whose new table
+    // cannot pay goes out raw as soon as its code lengths say so, before the
+    // table and its description are built. A debug build builds them anyway
+    // and asserts below that the section does end raw, so every test that
+    // compresses checks the refusal against what it stands in for.
+    let mut refused = false;
+    // What the new table's one stream takes, where its code lengths gave it.
+    let mut new_stream = None;
     // Mutable because the size query encodes the weight description into the
     // table's buffer; `write_table` below then reads it rather than repeating
     // the encode.
-    let mut new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    let Some(mut new_encoder_table) = huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
         &counts[..=max_symbol],
         literals.len(),
         huf_search,
         weight_scratch,
-    );
+        |shape| {
+            new_stream = Some(shape.one_stream_bytes());
+            refused = previous_stream.is_none()
+                && new_table_cannot_pay(shape, literals.len(), strategy, single_stream);
+            refused && !verify_refusals
+        },
+    ) else {
+        raw_literals(literals, writer);
+        return None;
+    };
 
     let Some(new_table_description_size) =
         new_encoder_table.writeable_table_description_size(weight_scratch.weight_fse_table())
@@ -3645,25 +3799,59 @@ fn compress_literals<K: EncodeTier>(
     // input.
     let choice = decide_huff_reuse_like_encoder(
         &new_encoder_table,
-        last_table,
+        &mut new_stream,
+        previous_stream,
         new_table_description_size,
         literals,
         counts,
     );
-    let new_table = match choice {
+    // The table chosen, with the bytes the section takes as one stream under
+    // it: the code lengths summed over the counts, which the build gave for a
+    // new table and the comparison for the previous one. Only a searched
+    // build, which reports no lengths, that met no comparison is summed here.
+    let (new_table, one_stream) = match choice {
         HuffChoice::Raw => {
             raw_literals(literals, writer);
             weight_scratch.recycle(new_encoder_table);
             return None;
         }
-        HuffChoice::New => true,
-        HuffChoice::Repeat => false,
+        HuffChoice::New => match new_stream {
+            Some(bytes) => (true, bytes),
+            None => (
+                true,
+                new_encoder_table.estimate_compressed_size_from_counts(counts),
+            ),
+        },
+        HuffChoice::Repeat(bytes) => (false, bytes),
     };
     let encoder_table = if new_table {
         &new_encoder_table
     } else {
         last_table.expect("reuse path implies prior table exists")
     };
+    debug_assert_eq!(
+        one_stream,
+        encoder_table.estimate_compressed_size_from_counts(counts),
+        "the stream size carried here is not the chosen table's"
+    );
+
+    // The raw fallback at the end, answered before the section is encoded
+    // where the histogram already settles it: one stream's size is exact, and
+    // four streams are never shorter than one with their six-byte jump table.
+    // A section refused here is one the fallback would refuse after writing
+    // and unwinding it.
+    let description = if new_table {
+        new_table_description_size
+    } else {
+        0
+    };
+    let payload_floor = one_stream + if single_stream { 0 } else { 6 };
+    if use_raw_literal_fallback(description + payload_floor, literals.len(), strategy) {
+        raw_literals(literals, writer);
+        weight_scratch.recycle(new_encoder_table);
+        return None;
+    }
+    debug_assert!(!refused, "a refused section codes under the fallback");
 
     if new_table {
         writer.write_bits(2u8, 2); // compressed literals type

@@ -253,7 +253,8 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
-            Some(&prev),
+            &mut None,
+            super::previous_table_stream_bytes(Some(&prev), &skewed_counts),
             new_desc,
             &skewed_literals,
             &skewed_counts,
@@ -275,6 +276,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
             false,
             &mut huff0_encoder::WeightScratch::default(),
             false,
+            super::VERIFY_REFUSALS,
         );
         writer.flush();
         (built.is_some(), out[0] & 0b11)
@@ -305,7 +307,8 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
-            Some(&prev),
+            &mut None,
+            super::previous_table_stream_bytes(Some(&prev), &counts_of(&big_skewed)),
             new_desc,
             &big_skewed,
             &counts_of(&big_skewed),
@@ -313,6 +316,49 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
         HuffChoice::New,
     );
     assert_eq!(section(&big_skewed, StrategyTag::Fast), (true, 2));
+
+    // The new table's stream size is summed at most once: a comparison that
+    // had to sum it leaves it for the caller, one handed a size reads that
+    // size and no other, and a description that eats the section settles on
+    // the previous table without it.
+    let previous_stream = super::previous_table_stream_bytes(Some(&prev), &skewed_counts);
+    let exact = new_tbl.estimate_compressed_size_from_counts(&skewed_counts);
+    let mut summed = None;
+    decide_huff_reuse_like_encoder(
+        &new_tbl,
+        &mut summed,
+        previous_stream,
+        new_desc,
+        &skewed_literals,
+        &skewed_counts,
+    );
+    assert_eq!(summed, Some(exact));
+    let mut handed = Some(skewed_literals.len() * 2);
+    assert_eq!(
+        decide_huff_reuse_like_encoder(
+            &new_tbl,
+            &mut handed,
+            previous_stream,
+            new_desc,
+            &skewed_literals,
+            &skewed_counts,
+        ),
+        HuffChoice::Repeat(previous_stream.expect("the uniform table codes every byte")),
+        "a new stream handed in at twice the section must lose to the previous table"
+    );
+    let mut untouched = None;
+    assert_eq!(
+        decide_huff_reuse_like_encoder(
+            &new_tbl,
+            &mut untouched,
+            previous_stream,
+            skewed_literals.len(),
+            &skewed_literals,
+            &skewed_counts,
+        ),
+        HuffChoice::Repeat(previous_stream.expect("the uniform table codes every byte")),
+    );
+    assert_eq!(untouched, None);
 }
 
 #[test]
@@ -600,6 +646,242 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
         emitted.len(),
         "the estimate is not what the emitter writes"
     );
+}
+
+/// A literals section refused from its code lengths is one the built table
+/// leaves raw. Across alphabets, lengths, distributions and strategies the
+/// emitter and the estimator build the table anyway in this (debug) build and
+/// assert the outcome, and their sizes agree. The refusal catches most of the
+/// sections that end raw, and leaves alone the ones a table pays for.
+#[test]
+fn a_section_refused_from_its_code_lengths_is_one_the_table_leaves_raw() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size, min_literals_to_compress, new_table_cannot_pay,
+        single_literal_stream,
+    };
+    let mut state = 0x1234_5678u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let (mut sections, mut raw, mut refused) = (0usize, 0usize, 0usize);
+    for strategy in [
+        StrategyTag::Fast,
+        StrategyTag::Dfast,
+        StrategyTag::Lazy,
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra2,
+    ] {
+        for alphabet in [2usize, 4, 10, 16, 40, 64, 95, 128, 200, 256] {
+            for len in [64usize, 78, 100, 128, 200, 256, 500, 1023, 1024, 2000, 5000] {
+                // Uniform, leaning to the low symbols, and leaning hard.
+                for draws in 1..=3 {
+                    let base = (next() as usize) % (257 - alphabet);
+                    let literals: Vec<u8> = (0..len)
+                        .map(|_| {
+                            let symbol = (0..draws)
+                                .map(|_| next() as usize % alphabet)
+                                .min()
+                                .unwrap();
+                            (base + symbol) as u8
+                        })
+                        .collect();
+                    let make_state = || CompressState::<EntropyOnlyMatcher> {
+                        matcher: EntropyOnlyMatcher,
+                        sequence_capture: None,
+                        copy_kernel: crate::encoding::fastpath::select_kernel(),
+                        last_huff_table: None,
+                        huf_repeat_valid: false,
+                        huff_table_spare: None,
+                        huff_weights: Default::default(),
+                        seen_content: Default::default(),
+                        fse_tables: FseTables::new(),
+                        block_scratch: CompressedBlockScratch::new(),
+                        workspace: Workspace::new(),
+                        offset_hist: [1, 4, 8],
+                        strategy_tag: strategy,
+                        split_strategy: strategy,
+                        pre_split: None,
+                        huf_optimal_search: false,
+                        literal_compression_disabled: false,
+                        post_split_allowed: true,
+                    };
+                    let mut est_state = make_state();
+                    let mut workspace = EstimatorWorkspace::default();
+                    let est =
+                        estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+                    let mut emit_state = make_state();
+                    let mut emitted: Vec<u8> = Vec::new();
+                    crate::encoding::fastpath::with_encode_tier!(
+                        emit_state.copy_kernel,
+                        K => encode_block_parts::<_, K>(
+                            &mut emit_state,
+                            &literals,
+                            &mut [],
+                            &mut emitted,
+                        )
+                    );
+                    assert_eq!(
+                        est,
+                        emitted.len(),
+                        "{strategy:?}, {alphabet} symbols, {len} bytes, {draws} draws"
+                    );
+                    sections += 1;
+                    // A raw section costs more than its bytes; a coded one less.
+                    let is_raw = emitted.len() > len;
+                    // Only a section long enough and past the flat-histogram
+                    // gate reaches the tree at all.
+                    let mut counts = [0usize; 256];
+                    let (max_symbol, largest) =
+                        crate::histogram::count_bytes(&literals, &mut counts);
+                    let reaches_tree = len >= min_literals_to_compress(strategy, false)
+                        && largest > (len >> 7) + 4
+                        && largest < len;
+                    raw += usize::from(is_raw && reaches_tree);
+                    // The refusal as the emitter asks it of this section, put
+                    // to the same build here: nothing shared with another
+                    // test's sections.
+                    let mut was_refused = false;
+                    if reaches_tree {
+                        let mut scratch = huff0_encoder::WeightScratch::default();
+                        huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
+                            &counts[..=max_symbol],
+                            len,
+                            false,
+                            &mut scratch,
+                            |shape| {
+                                was_refused = new_table_cannot_pay(
+                                    shape,
+                                    len,
+                                    strategy,
+                                    single_literal_stream(len, false),
+                                );
+                                false
+                            },
+                        );
+                    }
+                    refused += usize::from(was_refused);
+                    assert!(
+                        !was_refused || is_raw,
+                        "{strategy:?}, {alphabet} symbols, {len} bytes: refused, yet coded"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        refused * 2 > raw && sections > 4 * raw,
+        "{refused} refused of {raw} raw among {sections} sections"
+    );
+}
+
+/// A refused section written raw without its table is, byte for byte and at
+/// the same price, the section the built table falls back to; a section whose
+/// table pays is coded either way. The first mode is the one a release build
+/// runs, the second the one a debug build checks it with.
+#[test]
+fn a_refusal_writes_the_bytes_the_built_table_falls_back_to() {
+    use super::{BitWriter, HuffOutcome, compress_literals, estimate_literals_section_bytes};
+    let mut state = 0x9E37_79B9u32;
+    let mut draw = move |alphabet: u32| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (b' ' as u32 + state % alphabet) as u8
+    };
+    // 78 bytes of the 95 printable characters: nearly every symbol once.
+    let wide: Vec<u8> = (0..78).map(|_| draw(95)).collect();
+    // 128 bytes of 16 symbols: half a byte each under a table.
+    let narrow: Vec<u8> = (0..128).map(|_| draw(16)).collect();
+    // Outside the band that repeats a previous table before building one, so
+    // a previous table reaches the refusal and the size comparison.
+    let strategy = StrategyTag::Lazy;
+    // A previous table with no code for these literals, and one that codes
+    // every byte at eight bits: the first leaves the refusal standing, the
+    // second withdraws it and loses the size comparison to a table that pays.
+    let foreign = huff0_encoder::HuffmanTable::build_from_data(&[200, 200, 201, 202, 203, 203]);
+    let every_byte: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
+    let every_byte = huff0_encoder::HuffmanTable::build_from_data(&every_byte);
+    let cases = [(&wide, true), (&narrow, false)]
+        .into_iter()
+        .flat_map(|section| [None, Some(&foreign), Some(&every_byte)].map(|prev| (section, prev)));
+    for ((literals, ends_raw), previous) in cases {
+        let emitted = |verify_refusals: bool| {
+            let mut out = Vec::new();
+            let mut writer = BitWriter::from(&mut out);
+            let mut scratch = huff0_encoder::WeightScratch::default();
+            let table = crate::encoding::fastpath::with_encode_tier!(
+                crate::encoding::fastpath::select_kernel(),
+                K => compress_literals::<K>(
+                    literals,
+                    previous,
+                    false,
+                    &mut writer,
+                    strategy,
+                    false,
+                    &mut scratch,
+                    false,
+                    verify_refusals,
+                )
+            );
+            writer.flush();
+            (out, table.is_some())
+        };
+        let priced = |verify_refusals: bool| {
+            let mut counts = [0usize; 256];
+            let mut scratch = huff0_encoder::WeightScratch::default();
+            let (bytes, outcome) = estimate_literals_section_bytes(
+                literals,
+                previous,
+                false,
+                &mut counts,
+                strategy,
+                false,
+                false,
+                &mut scratch,
+                false,
+                verify_refusals,
+            );
+            (bytes, matches!(outcome, HuffOutcome::New(_)))
+        };
+        // Only a table with a code for every symbol present is one to repeat.
+        assert_eq!(
+            super::previous_table_stream_bytes(previous, &{
+                let mut counts = [0usize; 256];
+                crate::histogram::count_bytes(literals, &mut counts);
+                counts
+            })
+            .is_some(),
+            previous.is_some_and(|table| core::ptr::eq(table, &every_byte)),
+        );
+        // The section is one the code lengths refuse, or one they leave to
+        // its table: otherwise the two modes below would not differ.
+        let mut counts = [0usize; 256];
+        let (max_symbol, _) = crate::histogram::count_bytes(literals, &mut counts);
+        let mut refused = false;
+        huff0_encoder::HuffmanTable::build_from_counts_gated_unless(
+            &counts[..=max_symbol],
+            literals.len(),
+            false,
+            &mut huff0_encoder::WeightScratch::default(),
+            |shape| {
+                refused = super::new_table_cannot_pay(shape, literals.len(), strategy, true);
+                false
+            },
+        );
+        assert_eq!(refused, ends_raw, "{} bytes", literals.len());
+        let (taken, taken_table) = emitted(false);
+        let (verified, verified_table) = emitted(true);
+        assert_eq!(taken, verified, "{} bytes", literals.len());
+        assert_eq!(taken_table, verified_table, "{} bytes", literals.len());
+        assert_eq!(taken_table, !ends_raw, "{} bytes", literals.len());
+        assert_eq!(taken.len() > literals.len(), ends_raw);
+        assert_eq!(priced(false), priced(true), "{} bytes", literals.len());
+        assert_eq!(priced(false), (taken.len(), !ends_raw));
+    }
 }
 
 #[test]
