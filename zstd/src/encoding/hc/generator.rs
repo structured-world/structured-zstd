@@ -1273,6 +1273,7 @@ impl HcMatchGenerator {
         self.table.hash_log = config.hash_log;
         self.table.chain_log = config.chain_log;
         self.table.hash3_log = next_hash3_log;
+        let depth_changed = self.hc.search_depth != config.search_depth;
         self.hc.search_depth = config.search_depth;
         self.hc.target_len = config.target_len;
         // Mirror strategy-derived flags + search depth onto MatchTable so the
@@ -1286,19 +1287,20 @@ impl HcMatchGenerator {
         // clevels.h (srcSize > 256 KiB tier): btopt L16 is minMatch=5, btopt
         // L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main hash
         // + the hash3 short-match probe).
-        // The cached dms is keyed by the full (region, layout, mls, hash_log)
-        // shape that `build_dms!` validates on the normal prime path, but the
-        // reborrow fast path in `MatchTable::reset` reuses it on `dms.is_primed()`
-        // ALONE. A reused-compressor level switch can change the search mls or
-        // the table geometry (hash_log / chain_log / hash3, captured in
-        // `resize`) independently of each other, and either leaves the dms
-        // hashed for a different shape. Invalidate on ANY so the next dict frame
+        // The cached dms is keyed by the full (region, layout, mls, hash_log,
+        // compare budget) shape that `build_dms!` validates on the normal prime
+        // path, but the reborrow fast path in `MatchTable::reset` reuses it on
+        // `dms.is_primed()` ALONE. A reused-compressor level switch can change
+        // the search mls, the table geometry (hash_log / chain_log / hash3,
+        // captured in `resize`) or the compare budget the tree is sorted with
+        // independently of each other, and any of them leaves the dms built
+        // for a different shape. Invalidate on ANY so the next dict frame
         // re-primes at the new shape (configure runs before reset) instead of
         // probing a mismatched dms and silently degrading match quality.
         // Over-invalidation only costs a re-prime, which a real shape change
         // needs anyway.
         let mls_changed = self.table.search_mls != config.search_mls;
-        if resize || mls_changed {
+        if resize || mls_changed || depth_changed {
             self.table.dms.invalidate();
         }
         self.table.search_mls = config.search_mls;

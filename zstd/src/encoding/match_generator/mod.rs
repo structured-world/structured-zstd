@@ -1078,6 +1078,18 @@ impl MatchGeneratorDriver {
         self.primed.is_some()
     }
 
+    /// The compare budget an attached dictionary's tree was sorted with and
+    /// the one the optimal search runs with now; `None` without such a tree.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn attached_tree_compare_budgets(&self) -> Option<(usize, usize)> {
+        let MatcherStorage::HashChain(hc) = &self.storage else {
+            return None;
+        };
+        let tree = hc.table.dms.table().filter(|_| hc.table.dms.is_primed())?;
+        Some((tree.nb_compares, hc.table.search_depth.max(1)))
+    }
+
     /// The row backend's dict index builds started and how many allocated.
     /// Test-only.
     #[cfg(test)]

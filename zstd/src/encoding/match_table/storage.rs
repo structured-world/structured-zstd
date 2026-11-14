@@ -412,7 +412,8 @@ pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
 /// build-only widths come from the caller's surrounding locals.
 macro_rules! build_dms {
     (
-        $self:ident, $region_len:expr, $layout:expr, $mls:expr, $min_region:expr, $per_pos:expr,
+        $self:ident, $region_len:expr, $layout:expr, $mls:expr, $compares:expr, $min_region:expr,
+        $per_pos:expr,
         |$concat:ident, $ht:ident, $ct:ident, $hlog:ident, $region:ident| $build:block
     ) => {{
         let region = $region_len.min($self.live_history().len());
@@ -426,15 +427,18 @@ macro_rules! build_dms {
             $crate::encoding::match_table::storage::dms_hash_log(region, $self.hash_log);
         // CDict cache: the tables depend only on the dict bytes (re-committed
         // identically to the front of history every frame) and the
-        // (region, mls, hash_log) shape, so a primed same-shape table is valid
-        // as-is. A dictionary swap drops the cache via the invalidate path; a
-        // level change lands here with a different shape and rebuilds.
+        // (region, mls, hash_log, compare budget) shape, so a primed
+        // same-shape table is valid as-is. A dictionary swap drops the cache
+        // via the invalidate path; a level change lands here with a different
+        // shape and rebuilds.
         if $self.dms.is_primed()
             && $self.dms.region_len() == region
-            && $self
-                .dms
-                .table()
-                .is_some_and(|t| t.layout == $layout && t.mls == $mls && t.hash_log == dms_hash_log)
+            && $self.dms.table().is_some_and(|t| {
+                t.layout == $layout
+                    && t.mls == $mls
+                    && t.hash_log == dms_hash_log
+                    && t.nb_compares == $compares
+            })
         {
             return;
         }
@@ -471,6 +475,7 @@ macro_rules! build_dms {
         tables.chain_table = chain_table;
         tables.hash_log = dms_hash_log;
         tables.mls = $mls;
+        tables.nb_compares = $compares;
         $self.dms.set_region_len(region);
         $self.dms.mark_primed();
     }};
@@ -898,13 +903,6 @@ impl MatchTable {
         // eight times upstream's build at the levels whose `searchLog` is 5.
         let nb_compares = self.search_depth.max(1);
         let read = if mls >= 5 { 8 } else { 4 };
-        if self
-            .dms
-            .table()
-            .is_some_and(|tables| tables.nb_compares != nb_compares)
-        {
-            self.dms.invalidate();
-        }
         let floor = self.dict_index_floor;
         // 2 children per dict position: [smaller, larger].
         build_dms!(
@@ -912,6 +910,7 @@ impl MatchTable {
             region_len,
             DmsDictLayout::Bt,
             mls,
+            nb_compares,
             read,
             2,
             |concat, hash_table, chain_table, dms_hash_log, region| {
@@ -980,9 +979,6 @@ impl MatchTable {
                 }
             }
         );
-        if let Some(tables) = self.dms.table_mut() {
-            tables.nb_compares = nb_compares;
-        }
     }
 
     /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
@@ -1392,11 +1388,12 @@ impl MatchTable {
         // fully resident at concat `[0, region)` with no drain (`history_start
         // == 0`). Pinned at abs `[0, region)` (concat-keyed dms is abs-invariant).
         //
-        // mls consistency: `dms.is_primed()` here is sufficient because the dms is
-        // keyed by `(region, layout, mls, hash_log)` and `configure()` invalidates
-        // it whenever `search_mls` changes (a level switch). So a primed dms is
-        // always one built with the CURRENT `search_mls`; the reborrow can never
-        // reuse a dms whose tables were built under a stale mls.
+        // Shape consistency: `dms.is_primed()` here is sufficient because the
+        // dms is keyed by `(region, layout, mls, hash_log, compare budget)` and
+        // `configure()` invalidates it whenever `search_mls`, the table widths
+        // or the search depth change (a level switch). So a primed dms is
+        // always one built for the CURRENT search; the reborrow can never
+        // reuse a dms whose tree was built under a stale mls or budget.
         let kept = if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
             // `checked_sub`, not `-`: after the dict chunk is evicted,
             // `compact_history` can reset `history_start` to 0 while

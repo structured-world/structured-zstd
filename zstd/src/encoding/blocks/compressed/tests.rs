@@ -1231,6 +1231,45 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
     }
 }
 
+/// A dictionary's table with no state for a code below the highest one a
+/// block uses is repeated only when the block leaves that code unused: the
+/// coverage read finds the gap, and the block is priced against the table to
+/// see whether it steps into it.
+#[test]
+fn a_dictionary_table_with_a_gap_repeats_only_for_a_block_that_avoids_it() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::encoding::strategy::StrategyTag;
+    // States for codes 0 and 2, none for code 1.
+    let previous = PreviousFseTable::Dictionary(SharedFseTable::new(
+        build_table_from_symbol_counts(&[8, 0, 1], 9, false),
+    ));
+    let fse_tables = FseTables::new();
+    for (code_one, repeats) in [(0usize, true), (3, false)] {
+        let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
+        counts[0] = 4;
+        counts[1] = code_one;
+        counts[2] = 6;
+        let total = 10 + code_one;
+        let mut slot = None;
+        let mode = super::choose_table_from_counts(
+            Some(&previous),
+            fse_tables.ll_default_ref(),
+            &mut counts,
+            total,
+            2,
+            9,
+            StrategyTag::Dfast,
+            None,
+            &mut slot,
+        );
+        assert_eq!(
+            matches!(mode, FseTableMode::RepeatLast(_)),
+            repeats,
+            "{code_one} sequences on the code the table has no state for",
+        );
+    }
+}
+
 #[test]
 fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
     let mut fse_tables = FseTables::new();

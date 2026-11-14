@@ -1264,23 +1264,20 @@ impl DfastMatchGenerator {
     /// same keys in the same order, the last position of each slot winning.
     fn copy_dict_index_into_live(&mut self) {
         let region = self.dict.region_len();
-        if self.dict.table().is_none() || region == 0 {
+        let tagged = self.tagged;
+        let long_len = self.long_len();
+        let Some(index) = self.dict.table().filter(|_| region != 0) else {
             // A dictionary too short to index: nothing of it is searchable,
             // and what earlier frames left in the tables lies below the floor.
             return;
-        }
+        };
         debug_assert_eq!(self.history_start, 0, "a dictionary is primed at the front");
+        debug_assert!(region <= self.max_rel());
         // Every slot is rewritten, so nothing holds the old base: it restarts
         // at the dictionary's first byte, where a slot's packed position is
         // the index's own. A tagged table is then the index word for word,
         // and a bare one the index without its tags.
         self.position_base = self.history_abs_start;
-        debug_assert!(region <= self.max_rel());
-        let tagged = self.tagged;
-        let long_len = self.long_len();
-        let Some(index) = self.dict.table() else {
-            return;
-        };
         let (long, short) = self.tables.split_at_mut(long_len);
         let fill = |live: &mut [u32], index: &[u32]| {
             if tagged {
