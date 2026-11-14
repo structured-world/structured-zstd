@@ -2110,10 +2110,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if !fits_u32 {
                 return false;
             }
-            // Dictionary frames: only the Simple (Fast) backend in attach mode
-            // has a borrowed (no input copy) dict scan. Copy-mode dict frames
-            // and the other backends still take the owned path. The reset laid
-            // the history out on a prediction of this, which must hold, or the
+            // Dictionary frames: the Simple (Fast) backend, attached or copied,
+            // and the Dfast backend attached have a borrowed (no input copy)
+            // dict scan; the rest take the owned path. The reset laid the
+            // history out on a prediction of this, which must hold, or the
             // history is either unused or outgrown.
             let attached = self.state.matcher.borrowed_dict_supported();
             debug_assert_eq!(

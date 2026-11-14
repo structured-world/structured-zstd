@@ -3440,7 +3440,7 @@ fn fast_dict_attach_follows_the_source_size_cutoff() {
         driver.reset(level);
         driver.prime_with_dictionary(dict, [1, 4, 8]);
         assert_eq!(
-            driver.borrowed_dict_supported(),
+            driver.frame_attaches_dictionary(),
             attaches,
             "Fast dict frame with hint {hint} resolved the wrong dictionary mode",
         );
@@ -3606,7 +3606,6 @@ fn oversized_dict_hint_routes_fast_to_copy_mode() {
     // mode instead of the tagged attach fill, which would overflow the packed
     // position. The decision is keyed on the load-set size hint, so a hint past
     // the limit suffices to exercise it without allocating a real 16 MiB dict.
-    // Copy mode leaves the borrowed in-place dict scan (attach-only) unavailable.
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(
         MAX_FAST_ATTACH_DICT_REGION + 1,
@@ -3614,7 +3613,7 @@ fn oversized_dict_hint_routes_fast_to_copy_mode() {
     driver.reset(CompressionLevel::Level(1));
     driver.prime_with_dictionary(b"small dict content with some padding here", [1, 4, 8]);
     assert!(
-        !driver.borrowed_dict_supported(),
+        !driver.frame_attaches_dictionary(),
         "an oversized dict must use copy mode, not the tagged attach fill"
     );
 }

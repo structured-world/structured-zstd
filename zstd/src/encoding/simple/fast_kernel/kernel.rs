@@ -210,6 +210,54 @@ unsafe fn read32(ptr: *const u8) -> u32 {
 /// branch.
 const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
+/// Where the scan reads the window it indexes: the current position is always
+/// in the block being matched, a candidate may lie anywhere the window
+/// reaches. Upstream keeps the two cases apart the same way, `base` for the
+/// prefix and `dictBase` for an external dictionary segment
+/// (`ZSTD_compressBlock_fast_extDict_generic`, zstd_fast.c).
+///
+/// Every index is a position of the window plus the table's epoch bias.
+trait ScanWindow: Copy {
+    /// Address of the current-side byte at `index`.
+    fn at(self, index: usize) -> *const u8;
+
+    /// The four candidate bytes at `index`.
+    ///
+    /// # Safety
+    /// `index` is in the window, four bytes before its end.
+    unsafe fn cand_read32(self, index: usize) -> u32;
+
+    /// [`Self::cand_read32`] for a candidate the hash table named. A table
+    /// position has its whole hash read in one buffer (a dictionary is indexed
+    /// up to eight bytes before its end, as upstream's `ZSTD_fillHashTable`
+    /// stops at `iend - HASH_READ_SIZE`), so the read never straddles the
+    /// seam and the buffer is chosen without a branch.
+    ///
+    /// # Safety
+    /// As [`Self::cand_read32`], `index` a position the table holds.
+    unsafe fn table_read32(self, index: usize) -> u32;
+
+    /// [`Self::table_read32`] when `in_range`, else four bytes no input
+    /// position equals in practice; the caller re-tests `in_range`.
+    ///
+    /// # Safety
+    /// As [`Self::table_read32`] when `in_range`.
+    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32;
+
+    /// The candidate byte at `index`.
+    ///
+    /// # Safety
+    /// `index` is in the window.
+    unsafe fn cand_byte(self, index: usize) -> u8;
+
+    /// How far the current bytes from `cur` agree with the candidate bytes from
+    /// `cand`, up to the current side's `end`.
+    ///
+    /// # Safety
+    /// `cand < cur <= end`, all in the window.
+    unsafe fn count(self, cur: usize, cand: usize, end: usize) -> usize;
+}
+
 /// Upstream's `base`: the address its index adds to, one epoch bias below the
 /// data, so its index runs on from frame to frame. It lies outside the data,
 /// which only a wrapping offset may start from.
@@ -221,6 +269,151 @@ impl IndexBase {
     #[inline(always)]
     fn add(self, index: usize) -> *const u8 {
         self.0.wrapping_add(index)
+    }
+}
+
+impl ScanWindow for IndexBase {
+    #[inline(always)]
+    fn at(self, index: usize) -> *const u8 {
+        self.add(index)
+    }
+
+    #[inline(always)]
+    unsafe fn cand_read32(self, index: usize) -> u32 {
+        unsafe { read32(self.add(index)) }
+    }
+
+    #[inline(always)]
+    unsafe fn table_read32(self, index: usize) -> u32 {
+        unsafe { read32(self.add(index)) }
+    }
+
+    #[inline(always)]
+    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
+        // One address select and one load, the shape upstream's
+        // `ZSTD_match4Found_cmov` has, which LLVM lowers to a `cmov`.
+        let addr = if in_range {
+            self.add(index)
+        } else {
+            CMOV_DUMMY.as_ptr()
+        };
+        unsafe { read32(addr) }
+    }
+
+    #[inline(always)]
+    unsafe fn cand_byte(self, index: usize) -> u8 {
+        unsafe { *self.add(index) }
+    }
+
+    #[inline(always)]
+    unsafe fn count(self, cur: usize, cand: usize, end: usize) -> usize {
+        unsafe { count_forward(self.add(cur), self.add(cand), self.add(end)) }
+    }
+}
+
+/// A window in two buffers: a dictionary up to index `split`, then the input
+/// read where it lies. Positions run on across the seam as if the input
+/// followed the dictionary, which is how the decoder sees them; a candidate
+/// past the seam reads the input, one before it the dictionary, and a match
+/// starting in the dictionary continues into the input (upstream
+/// `ZSTD_count_2segments`).
+#[derive(Clone, Copy)]
+struct SplitWindow {
+    /// The dictionary's first byte less the bias.
+    dict: *const u8,
+    /// The input's first byte less `split`.
+    input: *const u8,
+    /// Index of the input's first byte.
+    split: usize,
+}
+
+impl SplitWindow {
+    /// Four candidate bytes straddling the seam: the dictionary's last ones,
+    /// then the input's first.
+    #[cold]
+    #[inline(never)]
+    unsafe fn read32_across(self, index: usize) -> u32 {
+        let mut bytes = [0u8; 4];
+        for (k, byte) in bytes.iter_mut().enumerate() {
+            *byte = unsafe { self.cand_byte(index + k) };
+        }
+        u32::from_ne_bytes(bytes)
+    }
+}
+
+impl ScanWindow for SplitWindow {
+    #[inline(always)]
+    fn at(self, index: usize) -> *const u8 {
+        self.input.wrapping_add(index)
+    }
+
+    #[inline(always)]
+    unsafe fn cand_read32(self, index: usize) -> u32 {
+        if index >= self.split {
+            unsafe { read32(self.input.wrapping_add(index)) }
+        } else if index + 4 <= self.split {
+            unsafe { read32(self.dict.wrapping_add(index)) }
+        } else {
+            unsafe { self.read32_across(index) }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn table_read32(self, index: usize) -> u32 {
+        debug_assert!(
+            index >= self.split || index + 4 <= self.split,
+            "a table position's hash read straddles the seam"
+        );
+        // Which buffer a table candidate lies in is a coin toss on input the
+        // dictionary does not describe, so it is a select, not a branch:
+        // upstream's `idxBase = idx < prefixStartIndex ? dictBase : base`.
+        let segment = core::hint::select_unpredictable(index >= self.split, self.input, self.dict);
+        unsafe { read32(segment.wrapping_add(index)) }
+    }
+
+    #[inline(always)]
+    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
+        debug_assert!(
+            !in_range || index >= self.split || index + 4 <= self.split,
+            "a table position's hash read straddles the seam"
+        );
+        let segment = core::hint::select_unpredictable(index >= self.split, self.input, self.dict);
+        let addr = core::hint::select_unpredictable(
+            in_range,
+            segment.wrapping_add(index),
+            CMOV_DUMMY.as_ptr(),
+        );
+        unsafe { read32(addr) }
+    }
+
+    #[inline(always)]
+    unsafe fn cand_byte(self, index: usize) -> u8 {
+        if index >= self.split {
+            unsafe { *self.input.wrapping_add(index) }
+        } else {
+            unsafe { *self.dict.wrapping_add(index) }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn count(self, cur: usize, cand: usize, end: usize) -> usize {
+        if cand >= self.split {
+            return unsafe { count_forward(self.at(cur), self.at(cand), self.at(end)) };
+        }
+        // The dictionary's remainder against the current bytes, then, if all
+        // of it agreed, the input's start against what follows them.
+        let first = (self.split - cand).min(end - cur);
+        let agreed = unsafe {
+            count_forward(
+                self.at(cur),
+                self.dict.wrapping_add(cand),
+                self.at(cur + first),
+            )
+        };
+        if agreed < first || cur + first == end {
+            return agreed;
+        }
+        agreed + unsafe { count_forward(self.at(cur + agreed), self.at(self.split), self.at(end)) }
     }
 }
 
@@ -245,9 +438,9 @@ impl IndexBase {
 /// a candidate it rejects is treated as out of range, so its bytes are never
 /// loaded — the random window access the tag exists to skip.
 #[inline(always)]
-unsafe fn match_found<const USE_CMOV: bool>(
+unsafe fn match_found<const USE_CMOV: bool, W: ScanWindow>(
     ip: *const u8,
-    base: *const u8,
+    window: W,
     match_idx: u32,
     prefix_start_index: u32,
     tag_ok: bool,
@@ -311,12 +504,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // (CMOV_DUMMY is exactly 4 bytes; base+match_pos has ≥ 4
         // by the bounds check above).
         let in_range = match_idx >= prefix_start_index;
-        let mval_addr = if in_range {
-            base.wrapping_add(match_pos)
-        } else {
-            CMOV_DUMMY.as_ptr()
-        };
-        if unsafe { read32(ip) != read32(mval_addr) } {
+        if unsafe { read32(ip) != window.table_read32_or_dummy(match_pos, in_range) } {
             return false;
         }
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -330,7 +518,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         if match_idx < prefix_start_index {
             return false;
         }
-        unsafe { read32(ip) == read32(base.wrapping_add(match_pos)) }
+        unsafe { read32(ip) == window.table_read32(match_pos) }
     }
 }
 
@@ -483,11 +671,89 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
+    handle_sequence: impl FnMut(Sequence),
+) -> FastBlockResult {
+    let window = IndexBase(data.as_ptr().wrapping_sub(hash_table.bias() as usize));
+    fast_scan::<MLS, USE_CMOV, TAGGED, _>(
+        window,
+        data.len(),
+        block_start,
+        bounds,
+        hash_table,
+        rep,
+        step_size,
+        handle_sequence,
+    )
+}
+
+/// [`compress_block_fast`] over a window in two buffers: the dictionary
+/// `dict`, then the input `input` read in place, so a frame that copies its
+/// dictionary's index into its table scans the input without copying it behind
+/// the dictionary (upstream `ZSTD_compressBlock_fast_extDict_generic`). Every
+/// position, the table's included, counts as if the input followed the
+/// dictionary: `block_start` is the block's offset in `input`, and `bounds`
+/// are positions of the joined window. The parse is the one
+/// [`compress_block_fast`] takes over the two buffers joined.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_fast_split<
+    const MLS: u32,
+    const USE_CMOV: bool,
+    const TAGGED: bool,
+>(
+    dict: &[u8],
+    input: &[u8],
+    block_start: usize,
+    bounds: PrefixBounds,
+    hash_table: &mut FastHashTable,
+    rep: [u32; 2],
+    step_size: usize,
+    handle_sequence: impl FnMut(Sequence),
+) -> FastBlockResult {
+    assert!(
+        !dict.is_empty(),
+        "a split window needs a dictionary in front of the input",
+    );
+    let bias = hash_table.bias() as usize;
+    let split = dict.len() + bias;
+    let window = SplitWindow {
+        dict: dict.as_ptr().wrapping_sub(bias),
+        input: input.as_ptr().wrapping_sub(split),
+        split,
+    };
+    let joined_len = dict
+        .len()
+        .checked_add(input.len())
+        .expect("a window's length fits a usize");
+    fast_scan::<MLS, USE_CMOV, TAGGED, _>(
+        window,
+        joined_len,
+        dict.len() + block_start,
+        bounds,
+        hash_table,
+        rep,
+        step_size,
+        handle_sequence,
+    )
+}
+
+/// The 4-cursor scan of [`compress_block_fast`] over any [`ScanWindow`] of
+/// `data_len` bytes, the block starting at `block_start`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fast_scan<const MLS: u32, const USE_CMOV: bool, const TAGGED: bool, W: ScanWindow>(
+    base: W,
+    data_len: usize,
+    block_start: usize,
+    bounds: PrefixBounds,
+    hash_table: &mut FastHashTable,
+    rep: [u32; 2],
+    step_size: usize,
     mut handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
-    // Everything below counts in upstream's index: a position of `data` plus
-    // the table's bias, so what earlier frames stored lies under the floor and
-    // a frame neither clears the table nor carries a second coordinate.
+    // Everything below counts in upstream's index: a position of the window
+    // plus the table's bias, so what earlier frames stored lies under the floor
+    // and a frame neither clears the table nor carries a second coordinate.
     let bias = hash_table.bias() as usize;
     let prefix_start_index = bounds.prefix_start_index + bias as u32;
     let window_low = bounds.window_low + bias as u32;
@@ -548,16 +814,14 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // entry turns this into a loud assertion instead of silent
     // miscompression.
     assert!(
-        block_start <= data.len(),
-        "block_start ({block_start}) must not exceed data.len() ({})",
-        data.len(),
+        block_start <= data_len,
+        "block_start ({block_start}) must not exceed the window's {data_len} bytes",
     );
     assert!(
-        data.len() + bias <= u32::MAX as usize,
-        "FastKernel does not support data.len() ({}) + bias ({bias}) > u32::MAX ({}); \
+        data_len + bias <= u32::MAX as usize,
+        "FastKernel does not support a window of {data_len} bytes + bias ({bias}) > u32::MAX ({}); \
          the kernel stores absolute positions in a u32 hash table and \
          u32 offset codes, so larger inputs would silently truncate",
-        data.len(),
         u32::MAX,
     );
     assert_eq!(
@@ -568,9 +832,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // A tagged slot holds positions below `TAGGED_POSITION_LIMIT`, and every
     // position stored is below `data.len()`.
     assert!(
-        !TAGGED || data.len() + bias <= TAGGED_POSITION_LIMIT,
-        "a tagged table cannot hold positions of a {}-byte window at bias {bias}",
-        data.len(),
+        !TAGGED || data_len + bias <= TAGGED_POSITION_LIMIT,
+        "a tagged table cannot hold positions of a {data_len}-byte window at bias {bias}",
     );
 
     // Block too short to do any matching — report the whole block
@@ -579,15 +842,14 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // returns `iend - anchor`). The caller emits the
     // `Sequence::Literals` wrapper per the contract above; we don't
     // double-emit here.
-    if data.len() < block_start + HASH_READ_SIZE {
+    if data_len < block_start + HASH_READ_SIZE {
         return FastBlockResult {
             rep,
-            tail_literals_len: data.len() - block_start,
+            tail_literals_len: data_len - block_start,
         };
     }
 
-    let base = IndexBase(data.as_ptr().wrapping_sub(bias));
-    let iend_addr = data.len() + bias;
+    let iend_addr = data_len + bias;
     let ilimit = iend_addr - HASH_READ_SIZE;
 
     let mut anchor: usize = block_start + bias;
@@ -674,7 +936,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // `MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1`, together under
         // `usize::MAX`.
         debug_assert!(
-            step <= MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1,
+            step <= MAX_STEP_SIZE + data_len / K_STEP_INCR + 1,
             "scan step {step} past the bound that keeps position sums from wrapping"
         );
         // Upstream zstd's four cursors are two pairs of adjacent positions,
@@ -691,8 +953,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // SAFETY: ip0, ip1 < ilimit = iend - 8, so ≥ 8 readable
         // bytes at each `base + ip*`. MLS ≤ 8 matches hash_ptr's
         // contract.
-        let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
-        let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 + 1), hlog) };
+        let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.at(ip0), hlog) };
+        let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.at(ip0 + 1), hlog) };
         // The slot word probed for the current ip0, tagged or bare.
         let mut match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash0)) };
         ktrace!(
@@ -759,7 +1021,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // `ip2 - rep_offset1 >= prefix_start_index >= 1`, so the
             // backward read stays in-bounds.
             if rep_offset1 > 0
-                && unsafe { read32(base.add(ip2)) == read32(base.add(ip2 - rep_offset1)) }
+                && unsafe { read32(base.at(ip2)) == base.cand_read32(ip2 - rep_offset1) }
             {
                 // Repcode match. ip0 fast-forwards to ip2; backward-
                 // extend by 1 if the byte before ip2 also matches.
@@ -785,7 +1047,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // the hot backward-extension path. `base == data.as_ptr()`.
                 if new_ip > anchor
                     && match0 > window_low as usize
-                    && unsafe { *base.add(new_ip - 1) == *base.add(match0 - 1) }
+                    && unsafe { *base.at(new_ip - 1) == base.cand_byte(match0 - 1) }
                 {
                     new_ip -= 1;
                     match0 -= 1;
@@ -820,9 +1082,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             ktrace!("PROBE1 ip0={} match_idx={}", ip0, match_idx);
             let match_pos = slot_position::<TAGGED>(match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(
-                    base.add(ip0),
-                    base.0,
+                match_found::<USE_CMOV, W>(
+                    base.at(ip0),
+                    base,
                     match_pos,
                     prefix_start_index,
                     tag_matches::<TAGGED>(match_idx, hash0),
@@ -855,7 +1117,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // the new `ip1`, NOT the new `ip2`.
             match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
-            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
+            hash1 = unsafe { hash_ptr_raw::<MLS>(base.at(ip2), hlog) };
             // Upstream's `ip0 = ip1; ip1 = ip2; ip2 = ip3`: from here to the
             // second shift its `ip1` is `ip2` and its `ip2` is `ip2 + 1`.
             ip0 += 1;
@@ -872,9 +1134,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             ktrace!("PROBE2 ip0={} match_idx={}", ip0, match_idx);
             let match_pos = slot_position::<TAGGED>(match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(
-                    base.add(ip0),
-                    base.0,
+                match_found::<USE_CMOV, W>(
+                    base.at(ip0),
+                    base,
                     match_pos,
                     prefix_start_index,
                     tag_matches::<TAGGED>(match_idx, hash0),
@@ -909,7 +1171,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // in. Upstream zstd lines 329-339.
             match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
-            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2 + 1), hlog) };
+            hash1 = unsafe { hash_ptr_raw::<MLS>(base.at(ip2 + 1), hlog) };
             // Upstream's `ip0 = ip1; ip1 = ip2; ip2 = ip0 + step;
             // ip3 = ip1 + step`, which leaves `ip1 == ip0 + 1` and
             // `ip3 == ip2 + 1` again. Cannot wrap, by the bound given at the
@@ -923,7 +1185,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             if ip2 >= next_step {
                 step += 1;
                 debug_assert!(
-                    step <= MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1,
+                    step <= MAX_STEP_SIZE + data_len / K_STEP_INCR + 1,
                     "scan step {step} past the bound that keeps position sums from wrapping"
                 );
                 // Upstream zstd `zstd_fast.c:344-345`: the widening step jumps
@@ -931,8 +1193,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // two. A prefetch never faults, and `wrapping_add` keeps an
                 // address past the buffer end a plain value, not a pointer
                 // offset out of bounds.
-                crate::decoding::prefetch::prefetch_l1_at(base.add(ip0 + 1 + 64));
-                crate::decoding::prefetch::prefetch_l1_at(base.add(ip0 + 1 + 128));
+                crate::decoding::prefetch::prefetch_l1_at(base.at(ip0 + 1 + 64));
+                crate::decoding::prefetch::prefetch_l1_at(base.at(ip0 + 1 + 128));
                 next_step += K_STEP_INCR;
             }
 
@@ -1013,7 +1275,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // `base == data.as_ptr()`.
             while match_ip > anchor
                 && match_pos > window_low as usize
-                && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
+                && unsafe { *base.at(match_ip - 1) == base.cand_byte(match_pos - 1) }
             {
                 match_ip -= 1;
                 match_pos -= 1;
@@ -1022,15 +1284,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         }
 
         // Forward extension via ZSTD_count.
-        // SAFETY: both pointers stay within `data`; iend pointer
-        // arithmetic stays in bounds.
-        let forward = unsafe {
-            count_forward(
-                base.add(match_ip + m_len),
-                base.add(match_pos + m_len),
-                base.add(iend_addr),
-            )
-        };
+        // SAFETY: both sides stay within the window; the candidate precedes
+        // the current position, and the count stops at the window's end.
+        let forward = unsafe { base.count(match_ip + m_len, match_pos + m_len, iend_addr) };
         m_len += forward;
 
         // Emit. The backward-extension loop above stops at `match_ip ==
@@ -1065,12 +1321,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // SAFETY: each `base.add(N)` covers ≥ 8 readable bytes when
             // N ≤ ilimit (ilimit = iend - 8).
             let current0_plus_2 = current0 + 2;
-            let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.add(current0_plus_2), hlog) };
+            let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.at(current0_plus_2), hlog) };
             unsafe {
                 *table.get_unchecked_mut(slot_index::<TAGGED>(h_fwd)) =
                     slot_value::<TAGGED>(current0_plus_2, h_fwd)
             };
-            let h_back = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), hlog) };
+            let h_back = unsafe { hash_ptr_raw::<MLS>(base.at(ip0 - 2), hlog) };
             unsafe {
                 *table.get_unchecked_mut(slot_index::<TAGGED>(h_back)) =
                     slot_value::<TAGGED>(ip0 - 2, h_back)
@@ -1084,26 +1340,20 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             debug_assert!(rep_offset2 == 0 || ip0 - rep_offset2 >= window_low as usize);
             while rep_offset2 > 0
                 && ip0 <= ilimit
-                && unsafe { read32(base.add(ip0)) == read32(base.add(ip0 - rep_offset2)) }
+                && unsafe { read32(base.at(ip0)) == base.cand_read32(ip0 - rep_offset2) }
             {
                 // 4-byte match guaranteed by the equality probe.
                 // Extend forward via count_forward starting at
                 // ip0 + 4.
                 let r_off = rep_offset2;
-                let r_extra = unsafe {
-                    count_forward(
-                        base.add(ip0 + 4),
-                        base.add(ip0 + 4 - r_off),
-                        base.add(iend_addr),
-                    )
-                };
+                let r_extra = unsafe { base.count(ip0 + 4, ip0 + 4 - r_off, iend_addr) };
                 let r_len = 4 + r_extra;
 
                 // Swap rep1 / rep2 (upstream zstd line 414).
                 core::mem::swap(&mut rep_offset1, &mut rep_offset2);
 
                 // Hash refill at ip0 (upstream zstd line 415).
-                let h_at = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
+                let h_at = unsafe { hash_ptr_raw::<MLS>(base.at(ip0), hlog) };
                 unsafe {
                     *table.get_unchecked_mut(slot_index::<TAGGED>(h_at)) =
                         slot_value::<TAGGED>(ip0, h_at)
@@ -1371,7 +1621,13 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
 
             // Main match (recent input) — upstream zstd line 600.
             if unsafe {
-                match_found::<USE_CMOV>(base.add(ip0), base, main_idx, prefix_start_index, true)
+                match_found::<USE_CMOV, _>(
+                    base.add(ip0),
+                    IndexBase(base),
+                    main_idx,
+                    prefix_start_index,
+                    true,
+                )
             } {
                 let mut match_ip = ip0;
                 let mut match_pos = main_idx as usize;

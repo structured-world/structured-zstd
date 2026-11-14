@@ -918,15 +918,18 @@ impl FastKernelMatcher {
         // buffer, above the bias a carried table keeps. Past what a slot holds
         // the table starts over, and past what a tagged slot holds at all the
         // frame runs untagged.
+        // A copied dictionary sits in front of the input in the positions the
+        // scan stores.
         let tagged = self.hash_table.is_tagged();
         let slot_limit = if tagged {
             TAGGED_POSITION_LIMIT as u64
         } else {
             u64::from(u32::MAX)
         };
-        if buffer.len() as u64 + u64::from(self.hash_table.bias()) > slot_limit {
+        let window_len = buffer.len() as u64 + self.loaded_dict_end as u64;
+        if window_len + u64::from(self.hash_table.bias()) > slot_limit {
             self.hash_table.clear();
-            if tagged && buffer.len() > TAGGED_POSITION_LIMIT {
+            if tagged && window_len > TAGGED_POSITION_LIMIT as u64 {
                 self.hash_table.untag_empty();
             }
         }
@@ -1358,14 +1361,16 @@ impl FastKernelMatcher {
             // `&mut self.hash_table` borrow handed to `run_fast_kernel_block`
             // (a `&self` accessor would borrow all of `self` and collide).
             run_fast_kernel_block(
+                &[],
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 &mut self.hash_table,
                 rep_in,
                 step_size,
-                mls,
                 use_cmov,
                 handle_sequence,
             )
@@ -1410,6 +1415,10 @@ impl FastKernelMatcher {
             block_start <= block_end && block_end <= total_len,
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
+        if self.loaded_dict_end != 0 {
+            self.start_matching_borrowed_copied_dict(block_start, block_end, handle_sequence);
+            return;
+        }
         // Borrowed scans store positions up to `block_end`; record them for
         // `reset`'s epoch-advance span.
         self.table_pos_high_water = self.table_pos_high_water.max(block_end);
@@ -1420,7 +1429,6 @@ impl FastKernelMatcher {
         let window_low = block_end.saturating_sub(advertised_window) as u32;
         let prefix_start_index = window_low.max(self.prefix_start_index);
         let rep_in = self.rep;
-        let mls = self.hash_table.mls();
         // SAFETY: `block_end <= total_len` (the registered buffer length)
         // by the caller contract + the always-on `assert!` above, so the slice stays
         // within the borrowed allocation; `set_borrowed_window`'s
@@ -1430,20 +1438,77 @@ impl FastKernelMatcher {
         // borrows passed to the kernel runner.
         let history: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
         let rep_out = run_fast_kernel_block(
+            &[],
             history,
             block_start,
-            prefix_start_index,
-            window_low,
+            super::fast_kernel::kernel::PrefixBounds {
+                prefix_start_index,
+                window_low,
+            },
             &mut self.hash_table,
             rep_in,
             self.step_size,
-            mls,
             self.use_cmov,
             handle_sequence,
         );
         self.rep = rep_out;
         // Record the scanned range so `last_committed_space` can return
         // this block's bytes (`borrowed[start..end]`) for the emit path.
+        self.last_borrowed_block = Some((block_start, block_end));
+    }
+
+    /// [`Self::start_matching_borrowed`] for a frame that copied its
+    /// dictionary into the table: the dictionary stays at the front of the
+    /// history, the input is read where it lies, and positions count as if the
+    /// input followed the dictionary, as they do when the owned path appends
+    /// it (upstream's copy-mode context scans the input as `extDict`,
+    /// `ZSTD_compressBlock_fast_extDict_generic`). The parse is the owned
+    /// path's: the same floors, from the same joined length.
+    fn start_matching_borrowed_copied_dict(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        handle_sequence: impl FnMut(Sequence),
+    ) {
+        let (ptr, _) = self
+            .borrowed
+            .expect("an in-place scan requires a registered borrowed window");
+        let dict_end = self.loaded_dict_end;
+        debug_assert!(dict_end <= self.history.len());
+        let joined_end = dict_end
+            .checked_add(block_end)
+            .filter(|&end| end <= u32::MAX as usize)
+            .expect("set_borrowed_window keeps the joined window within u32 positions");
+        self.table_pos_high_water = self.table_pos_high_water.max(joined_end);
+        // The owned path's floors (`start_matching`) over the joined length.
+        let advertised_window = 1usize << self.window_log;
+        let window_low = if joined_end <= advertised_window + dict_end {
+            0
+        } else {
+            (joined_end - advertised_window) as u32
+        };
+        let bounds = super::fast_kernel::kernel::PrefixBounds {
+            prefix_start_index: window_low.max(self.prefix_start_index),
+            window_low,
+        };
+        // SAFETY: `block_end` is within the registered buffer (asserted by the
+        // caller), which `set_borrowed_window`'s contract keeps live. The
+        // dictionary is the front of the history, which nothing writes while
+        // the input is scanned in place, so it can be read beside the
+        // `&mut self.hash_table` the scan takes.
+        let input: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
+        let dict: &[u8] = unsafe { core::slice::from_raw_parts(self.history.as_ptr(), dict_end) };
+        self.rep = run_fast_kernel_block(
+            dict,
+            input,
+            block_start,
+            bounds,
+            &mut self.hash_table,
+            self.rep,
+            self.step_size,
+            self.use_cmov,
+            handle_sequence,
+        );
         self.last_borrowed_block = Some((block_start, block_end));
     }
 
@@ -1858,9 +1923,13 @@ impl FastKernelMatcher {
             .borrowed
             .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
         // Store primed input positions in VIRTUAL `[dict][input]` coords so they
-        // match what the dual-base dict kernel reads from the main table; 0 when
-        // no dict is attached.
-        let base_offset = self.dict.region_len();
+        // match what the scan reads from the main table: behind an attached
+        // dictionary's region or a copied one's end, 0 with no dictionary.
+        let base_offset = if self.loaded_dict_end != 0 {
+            self.loaded_dict_end
+        } else {
+            self.dict.region_len()
+        };
         debug_assert!(
             base_offset
                 .checked_add(block_end)
@@ -2496,43 +2565,56 @@ fn tagged_positions_fit(max_window_size: usize) -> bool {
         .is_some_and(|len| len <= TAGGED_POSITION_LIMIT)
 }
 
+/// Run the fast scan over `history`, the block starting at `block_start`.
+/// With a non-empty `dict`, `history` is the input read in place behind that
+/// copied dictionary: `block_start` is an offset in it and `bounds` are
+/// positions of the joined window
+/// ([`super::fast_kernel::kernel::compress_block_fast_split`]).
 #[allow(clippy::too_many_arguments)]
 fn run_fast_kernel_block(
+    dict: &[u8],
     history: &[u8],
     block_start: usize,
-    prefix_start_index: u32,
-    window_low: u32,
+    bounds: super::fast_kernel::kernel::PrefixBounds,
     hash_table: &mut FastHashTable,
     rep_in: [u32; 2],
     step_size: usize,
-    mls: u32,
     use_cmov: bool,
     mut handle_sequence: impl FnMut(Sequence),
 ) -> [u32; 2] {
-    use super::fast_kernel::kernel::PrefixBounds;
-
-    let bounds = PrefixBounds {
-        prefix_start_index,
-        window_low,
-    };
-    // Dispatch on (mls, use_cmov, tagged) — each triple monomorphises the
+    use super::fast_kernel::kernel::compress_block_fast_split;
+    // Dispatch on (mls, use_cmov, tagged): each triple monomorphises the
     // kernel hot loop independently. A table is tagged only under the cmov
     // probe (see `reset`), so the branch probe dispatches to the bare kernel
     // alone and no tagged branch-probe copy is built; the kernel asserts its
     // slot format against the table's on entry. `_` is unreachable:
     // `FastHashTable::new` rejects mls outside 4..=8 at construction.
+    let mls = hash_table.mls();
     let tagged = hash_table.is_tagged();
     macro_rules! run {
         ($mls:literal, $cmov:literal, $tagged:literal) => {
-            compress_block_fast::<$mls, $cmov, $tagged>(
-                history,
-                block_start,
-                bounds,
-                hash_table,
-                rep_in,
-                step_size,
-                &mut handle_sequence,
-            )
+            if dict.is_empty() {
+                compress_block_fast::<$mls, $cmov, $tagged>(
+                    history,
+                    block_start,
+                    bounds,
+                    hash_table,
+                    rep_in,
+                    step_size,
+                    &mut handle_sequence,
+                )
+            } else {
+                compress_block_fast_split::<$mls, $cmov, $tagged>(
+                    dict,
+                    history,
+                    block_start,
+                    bounds,
+                    hash_table,
+                    rep_in,
+                    step_size,
+                    &mut handle_sequence,
+                )
+            }
         };
     }
     let result = match (mls, use_cmov, tagged) {
@@ -2552,8 +2634,8 @@ fn run_fast_kernel_block(
         (8, true, false) => run!(8, true, false),
         (8, true, true) => run!(8, true, true),
         _ => unreachable!(
-            "FastHashTable construction rejects mls outside 4..=8 — \
-             got mls={mls} which means the table was bypassed",
+            "FastHashTable construction rejects mls outside 4..=8; \
+             got mls={mls}, which means the table was bypassed",
         ),
     };
 

@@ -1051,6 +1051,79 @@ fn dict_primed_matcher_snapshot_reused_across_frames_is_byte_identical() {
     }
 }
 
+/// A fast-band frame past the attach cutoff copies the dictionary into its
+/// table and reads the input in place, behind the dictionary, instead of
+/// copying it into the history; it writes the frame the owned path writes,
+/// fresh and from a restored snapshot alike. Covered: positions read across
+/// the dictionary/input seam, several blocks, and an input past the window,
+/// which slides the dictionary out of reach mid-frame.
+#[test]
+fn a_copied_dictionary_frame_read_in_place_writes_the_owned_frame() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let mut seed = 0x2545_F491u32;
+    let random: Vec<u8> = (0..10 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    // Dictionary content interleaved with noise, so matches start in the
+    // dictionary and run on into the input.
+    let mixed: Vec<u8> = dict_raw
+        .chunks(97)
+        .zip(random.chunks(31))
+        .flat_map(|(d, r)| d.iter().chain(r.iter()).copied())
+        .collect();
+    let logs: Vec<u8> = b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo\n"
+        .repeat(300 * 1024 / 68);
+    let long: Vec<u8> = mixed.iter().copied().cycle().take(1536 * 1024).collect();
+    for level in [-7, -4, -1, 1, 2] {
+        for (name, payload) in [
+            ("random", &random),
+            ("mixed", &mixed),
+            ("logs", &logs),
+            ("long", &long),
+        ] {
+            let level = super::CompressionLevel::Level(level);
+            let mut owned_frame = Vec::new();
+            let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+            owned.set_dictionary_from_bytes(dict_raw).unwrap();
+            owned.set_source_size_hint(payload.len() as u64);
+            owned.set_source(payload.as_slice());
+            owned.set_drain(&mut owned_frame);
+            owned.compress();
+
+            let mut compressor: FrameCompressor = FrameCompressor::new(level);
+            compressor.set_dictionary_from_bytes(dict_raw).unwrap();
+            for round in 0..2 {
+                let frame = compressor.compress_independent_frame(payload.as_slice());
+                assert!(
+                    compressor.state.matcher.frame_scans_in_place()
+                        && !compressor.state.matcher.frame_attaches_dictionary(),
+                    "{level:?} {name}: the frame copies the dictionary and is read in place"
+                );
+                assert!(
+                    frame == owned_frame,
+                    "{level:?} {name} frame {round}: {} bytes in place, {} owned",
+                    frame.len(),
+                    owned_frame.len(),
+                );
+            }
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder
+                .decode_all_to_vec(&owned_frame, &mut decoded)
+                .unwrap();
+            assert!(decoded == *payload, "{level:?} {name}: round trip");
+        }
+    }
+}
+
 /// A compressor that alternates frames under the attach cutoff with frames
 /// past it, and then takes another dictionary of the same shape, builds the
 /// attached dictionary tables once per dictionary and allocates them once in
