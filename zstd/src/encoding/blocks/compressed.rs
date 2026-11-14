@@ -3807,7 +3807,14 @@ fn compress_literals<K: EncodeTier>(
         0
     };
     let one_stream = match new_table_payload {
-        Some(bytes) if new_table => bytes,
+        Some(bytes) if new_table => {
+            debug_assert_eq!(
+                bytes,
+                encoder_table.estimate_compressed_size_from_counts(counts),
+                "the table's lengths are not the ones it was built from"
+            );
+            bytes
+        }
         _ => encoder_table.estimate_compressed_size_from_counts(counts),
     };
     let payload_floor = one_stream + if single_stream { 0 } else { 6 };
