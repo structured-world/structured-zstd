@@ -199,6 +199,9 @@ pub(crate) struct DmsDictTables {
     /// the live cParams `minMatch` (upstream zstd `ZSTD_dictMatchState` uses the same
     /// `mls` as the live search), so probe hashing matches the build.
     pub(crate) mls: usize,
+    /// Compares each insert of the build was allowed (`1 << searchLog`): the
+    /// tree's shape depends on it, so it is part of the reuse key.
+    pub(crate) nb_compares: usize,
 }
 
 /// Storage of the optimal parsers' binary-tree search: the contiguous history
@@ -889,11 +892,19 @@ impl MatchTable {
         // at a loss. The dms's value is being a SEPARATE structure (the dict is
         // not in the live tree), not a lower minMatch.
         let mls = self.search_mls;
+        // Compares per insert, as upstream sorts a CDict's tree
+        // (`ZSTD_insertBt1`: `1 << searchLog` of the dictionary's cParams,
+        // which an attached frame runs under as well). A fixed 512 here cost
+        // eight times upstream's build at the levels whose `searchLog` is 5.
+        let nb_compares = self.search_depth.max(1);
         let read = if mls >= 5 { 8 } else { 4 };
-        // Build-pass compare budget: the dict is bounded (<= window), so a
-        // generous fixed depth keeps the tree well-ordered without the live
-        // searchLog cap. Mirrors upstream zstd `ZSTD_insertBt1` nbCompares.
-        const DMS_BUILD_DEPTH: usize = 1 << 9;
+        if self
+            .dms
+            .table()
+            .is_some_and(|tables| tables.nb_compares != nb_compares)
+        {
+            self.dms.invalidate();
+        }
         let floor = self.dict_index_floor;
         // 2 children per dict position: [smaller, larger].
         build_dms!(
@@ -904,6 +915,13 @@ impl MatchTable {
             read,
             2,
             |concat, hash_table, chain_table, dms_hash_log, region| {
+                use crate::encoding::fastpath::scalar::common_prefix_len_ptr;
+                // Every position a key can be read at goes into the tree.
+                // Upstream steps past what a long match covers
+                // (`ZSTD_updateTree`); the positions it leaves out are ones a
+                // frame's search would have matched, and leaving them out
+                // cost level 22 more per frame than the build saved.
+                let base = concat.as_ptr();
                 let mut current = floor;
                 while current + read <= region {
                     let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
@@ -915,7 +933,7 @@ impl MatchTable {
                     let mut larger_slot = 2 * current + 1;
                     let mut common_smaller = 0usize;
                     let mut common_larger = 0usize;
-                    let mut compares = DMS_BUILD_DEPTH;
+                    let mut compares = nb_compares;
                     while compares > 0 && match_packed != 0 {
                         let cand = (match_packed - 1) as usize;
                         // Tree holds only earlier positions; `cand < current` always.
@@ -928,9 +946,16 @@ impl MatchTable {
                         // Common prefix bounded by the dict tail from `current`
                         // (`cand < current`, so `current` is the binding limit).
                         let limit = region - current;
-                        while ml < limit && concat[cand + ml] == concat[current + ml] {
-                            ml += 1;
-                        }
+                        // SAFETY: `cand < current` and `current + limit ==
+                        // region <= concat.len()`, so both runs of `limit - ml`
+                        // bytes lie inside `concat`.
+                        ml += unsafe {
+                            common_prefix_len_ptr(
+                                base.add(cand + ml),
+                                base.add(current + ml),
+                                limit - ml,
+                            )
+                        };
                         if current + ml >= region {
                             // Reached the dict end: can't order this pair, stop
                             // (upstream zstd `ip+matchLength == iend` break).
@@ -955,6 +980,9 @@ impl MatchTable {
                 }
             }
         );
+        if let Some(tables) = self.dms.table_mut() {
+            tables.nb_compares = nb_compares;
+        }
     }
 
     /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
