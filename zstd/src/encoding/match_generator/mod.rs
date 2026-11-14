@@ -940,12 +940,11 @@ impl MatchGeneratorDriver {
     }
 
     /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
-    /// The Simple (Fast) and Dfast backends with the dictionary ATTACHED (not
-    /// the copy/merge regime) have a borrowed dict scan: live matches read the
-    /// borrowed input in place and dict matches the committed dict prefix via
-    /// the 2-segment counter. Every other backend, and copy-mode (large-input)
-    /// dict frames, stay on the owned path. Checked AFTER priming, so
-    /// `is_attached()` reflects the resolved attach-vs-copy decision.
+    /// The Simple (Fast) backend, whether it attaches or copies the dictionary,
+    /// and the Dfast backend with the dictionary ATTACHED have a borrowed dict
+    /// scan: live matches read the borrowed input in place and dict matches the
+    /// committed dict prefix via the 2-segment counter. Every other backend,
+    /// and copy-mode Dfast frames, stay on the owned path.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
         // As in `borrowed_supported`: a producer reads the committed block. A
         // long-distance search counts the dictionary ahead of the input, which
@@ -954,7 +953,9 @@ impl MatchGeneratorDriver {
         self.producer.is_none()
             && !self.matches_beyond_window_tables()
             && match &self.storage {
-                MatcherStorage::Simple(m) => m.dict_is_attached(),
+                // Attached or copied, the reset laid the frame out to be
+                // scanned in place, which is what it settled here.
+                MatcherStorage::Simple(_) => self.frame_in_place,
                 // The reset also asked that the input fit the window, so that
                 // no block evicts the dictionary the scan reads.
                 MatcherStorage::Dfast(d) => d.dict.is_attached() && self.frame_in_place,
@@ -1245,6 +1246,13 @@ impl MatchGeneratorDriver {
     fn dict_attached(&self) -> bool {
         self.reset_dict_use
             .is_some_and(crate::encoding::levels::config::DictUse::attaches)
+    }
+
+    /// [`Self::dict_attached`] for the frame the last reset prepared.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn frame_attaches_dictionary(&self) -> bool {
+        self.dict_attached()
     }
 
     /// Whether the dfast backend fills this frame's tables from the index of
@@ -1675,9 +1683,14 @@ impl Matcher for MatchGeneratorDriver {
                 && dict_len >= dfast_key_len
                 && len <= max_window_size
         };
+        // The Fast backend scans a slice in place behind a dictionary however it
+        // holds it: attached, in a table of its own; copied or loaded, in the
+        // frame's table, the dictionary's bytes at the front of the history and
+        // the input read where it lies (upstream's `extDict` scan).
+        let fast_dict_in_place = matches!(next_backend, super::strategy::BackendTag::Simple);
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
-                (dict_hint.is_none() || fast_attach || dfast_dict_in_place(len))
+                (dict_hint.is_none() || fast_dict_in_place || dfast_dict_in_place(len))
                     && (!long_distance || long_distance_in_place)
                     && self.borrowed_supported()
                     && len

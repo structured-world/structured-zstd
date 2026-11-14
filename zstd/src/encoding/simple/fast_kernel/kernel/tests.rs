@@ -559,12 +559,12 @@ fn cmov_variant_rejects_out_of_window_when_ip_equals_dummy() {
     let base = data.as_ptr();
     let ip_pos = 16usize;
     let ip = unsafe { base.add(ip_pos) };
-    let branch_result = unsafe { match_found::<false>(ip, base, 4, 10, true) };
+    let branch_result = unsafe { match_found::<false, _>(ip, IndexBase(base), 4, 10, true) };
     assert!(
         !branch_result,
         "branch variant must reject out-of-window match_idx"
     );
-    let cmov_result = unsafe { match_found::<true>(ip, base, 4, 10, true) };
+    let cmov_result = unsafe { match_found::<true, _>(ip, IndexBase(base), 4, 10, true) };
     assert!(
         !cmov_result,
         "cmov variant must reject out-of-window match_idx even when \
@@ -585,12 +585,12 @@ fn match_found_rejects_a_candidate_whose_tag_differs() {
     let ip = unsafe { base.add(8) };
     for (tag_ok, expected) in [(false, false), (true, true)] {
         assert_eq!(
-            unsafe { match_found::<false>(ip, base, 0, 0, tag_ok) },
+            unsafe { match_found::<false, _>(ip, IndexBase(base), 0, 0, tag_ok) },
             expected,
             "branch variant, tag_ok={tag_ok}",
         );
         assert_eq!(
-            unsafe { match_found::<true>(ip, base, 0, 0, tag_ok) },
+            unsafe { match_found::<true, _>(ip, IndexBase(base), 0, 0, tag_ok) },
             expected,
             "cmov variant, tag_ok={tag_ok}",
         );
@@ -697,6 +697,108 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
         saw_dict_region_match,
         "expected at least one match reading from the dictionary region (dual-base path)",
     );
+}
+
+/// The scan over a dictionary and an input held apart takes the parse it takes
+/// over the two joined: every candidate it reads in the dictionary, across the
+/// seam (a four-byte read straddling it, a match running from the dictionary
+/// into the input, a repcode reaching back over it) and in the input gives the
+/// joined scan's answer, so the two emit the same sequences, leave the same
+/// table and the same repcodes, at every cursor shape and table bias.
+#[test]
+fn split_window_scan_takes_the_joined_scan_parse() {
+    fn check<const MLS: u32, const CMOV: bool>(bias_span: u32) {
+        let mut seed = 0x9E37_79B9u32;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed >> 24) as u8 & 0x0F
+                })
+                .collect()
+        };
+        let dict = noise(600);
+        // The input opens on the dictionary's tail, so matches start inside
+        // the dictionary and run on into the input, and repeats both.
+        let mut input = noise(40);
+        for _ in 0..6 {
+            input.extend_from_slice(&dict[dict.len() - 37..]);
+            input.extend_from_within(..50);
+            input.extend_from_slice(&dict[100..180]);
+            input.extend_from_slice(&noise(29));
+        }
+        let joined: Vec<u8> = dict.iter().chain(input.iter()).copied().collect();
+        // A table holding the dictionary at every position its own bytes can
+        // be hashed at, as the copy fill leaves it; reads straddling the seam
+        // come from repcodes and from matches running out of the dictionary.
+        let mut table = FastHashTable::new(11, MLS);
+        if bias_span > 0 {
+            table.advance_epoch(bias_span, u32::MAX as usize);
+        }
+        let bias = table.bias();
+        for pos in 1..=dict.len() - HASH_READ_SIZE {
+            // SAFETY: `pos + 8 <= dict.len()`; MLS is the table's.
+            let hash = unsafe { table.hash_ptr::<MLS>(joined.as_ptr().add(pos)) };
+            unsafe { table.put(hash, pos as u32) };
+        }
+        let mut split_table = table.clone();
+        let bounds = PrefixBounds {
+            prefix_start_index: 1,
+            window_low: 0,
+        };
+        let rep = [1, 4];
+        for step in [2usize, 3, 5] {
+            let mut joined_table = table.clone();
+            let mut joined_seqs = Vec::new();
+            let joined_result = compress_block_fast::<MLS, CMOV, false>(
+                &joined,
+                dict.len(),
+                bounds,
+                &mut joined_table,
+                rep,
+                step,
+                |s| joined_seqs.push(s),
+            );
+            split_table.clone_from(&table);
+            let mut split_seqs = Vec::new();
+            let split_result = compress_block_fast_split::<MLS, CMOV, false>(
+                &dict,
+                &input,
+                0,
+                bounds,
+                &mut split_table,
+                rep,
+                step,
+                |s| split_seqs.push(s),
+            );
+            let what = alloc::format!("mls {MLS} cmov {CMOV} bias {bias} step {step}");
+            assert!(
+                joined_seqs.iter().any(|s| matches!(
+                    s,
+                    Sequence::Triple { offset, .. } if *offset > input.len() / 2
+                )),
+                "{what}: the input matches into the dictionary"
+            );
+            assert!(joined_seqs == split_seqs, "{what}: sequences");
+            assert_eq!(joined_result.rep, split_result.rep, "{what}: repcodes");
+            assert_eq!(
+                joined_result.tail_literals_len, split_result.tail_literals_len,
+                "{what}: tail"
+            );
+            assert!(
+                joined_table.hot_state().0 == split_table.hot_state().0,
+                "{what}: table"
+            );
+        }
+    }
+    for bias_span in [0, 70_000] {
+        check::<4, false>(bias_span);
+        check::<4, true>(bias_span);
+        check::<5, true>(bias_span);
+        check::<6, false>(bias_span);
+    }
 }
 
 /// A repeat offset can point into the dictionary rather than the input — that
