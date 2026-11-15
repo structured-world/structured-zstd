@@ -395,6 +395,19 @@ impl Workspace {
         previous: &Region<T>,
         empty: T,
     ) -> (Region<T>, bool) {
+        self.table_after_with(count, previous, empty, false)
+    }
+
+    /// [`Self::table_after`], for a table a frame touches at only a few places
+    /// (`sparse`): on fresh pages its zeros are left demand-zero, since writing
+    /// them first would fault in every page for the few a frame reaches.
+    fn table_after_with<T: TableValue>(
+        &mut self,
+        count: usize,
+        previous: &Region<T>,
+        empty: T,
+        sparse: bool,
+    ) -> (Region<T>, bool) {
         let offset = self.carve_front(region_bytes::<T>(count));
         let mut region = self.region_at::<T>(offset, count);
         let kept = count > 0
@@ -404,7 +417,7 @@ impl Workspace {
         if !kept {
             if !(self.zeroed && empty.is_zero()) {
                 region.fill(empty);
-            } else if self.frame_touches_every_page(region_bytes::<T>(count)) {
+            } else if !sparse && self.frame_touches_every_page(region_bytes::<T>(count)) {
                 // A zeroed allocation already holds the zeros, but left
                 // demand-zero each page faults twice: the match finder's first
                 // touch is a probe, a read, which maps the shared zero page,
@@ -790,6 +803,19 @@ impl<T: Copy> Table<T> {
         T: TableValue,
     {
         let (view, kept) = workspace.table_after(count, &self.view, empty);
+        self.view = view;
+        self.own = Vec::new();
+        kept
+    }
+
+    /// [`Self::bind`] for a table a frame touches at only a few places, such
+    /// as a cache indexed by a code: on fresh pages its zeros stay demand-zero
+    /// instead of being written first.
+    pub(crate) fn bind_sparse(&mut self, workspace: &mut Workspace, count: usize, empty: T) -> bool
+    where
+        T: TableValue,
+    {
+        let (view, kept) = workspace.table_after_with(count, &self.view, empty, true);
         self.view = view;
         self.own = Vec::new();
         kept

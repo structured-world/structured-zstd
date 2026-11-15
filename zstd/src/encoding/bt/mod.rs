@@ -206,9 +206,11 @@ impl BtMatcher {
             .bind_unwritten(workspace, HC_OPT_NODE_LEN);
         self.opt_candidates_scratch
             .bind_unwritten(workspace, HC_OPT_CANDIDATE_CAPACITY);
+        // Indexed by literal and match length codes, so a frame reaches a few
+        // of its pages.
         if !self
             .opt_price_arena
-            .bind(workspace, HC_OPT_PRICE_ARENA_LEN, [0, 0])
+            .bind_sparse(workspace, HC_OPT_PRICE_ARENA_LEN, [0, 0])
         {
             self.opt_ll_price_stamp = 0;
             self.opt_ml_price_stamp = 0;
