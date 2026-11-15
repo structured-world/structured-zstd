@@ -1988,24 +1988,22 @@ impl WeightScratch {
     }
 
     /// Lays the description's FSE table out in the open `workspace`, for the
-    /// frame being laid out. A table left where it was keeps what the last
-    /// frame built in it, and one on fresh pages already reads as a blank
-    /// table (every field of [`fse_encoder::FSETable::blank`] is zero), so it
-    /// is not written first: clearing four kibibytes there faults in pages the
-    /// description's few symbols never reach. Anywhere else it is cleared on
-    /// first use.
+    /// frame being laid out, when the layout took the fresh-page room asked
+    /// for it ([`Self::workspace_bytes`]): there it already reads as a blank
+    /// table (every field of [`fse_encoder::FSETable::blank`] is zero) and is
+    /// not written first, since clearing four kibibytes faults in pages the
+    /// description's few symbols never reach. Otherwise the table keeps the
+    /// allocation it has, as before, cleared on first use.
     pub(crate) fn bind(&mut self, workspace: &mut Workspace) {
-        if !workspace.on_fresh_pages() {
-            // Recycled memory: clearing the room costs what an allocation of
-            // its own does, so the table keeps the one it has.
-            if self.weight_fse_table.owned_bytes() == 0 {
-                self.weight_fse_table = Table::empty();
-                self.weight_fse_ready = false;
-            }
-            return;
+        if self.weight_fse_table.bind_fresh_room(workspace, 1) {
+            // Zero bytes are a blank table.
+            self.weight_fse_ready = true;
+        } else if self.weight_fse_table.owned_bytes() == 0 {
+            // No room this frame: a room of an earlier layout must not outlive
+            // it, so the table takes one of its own on first use and keeps it.
+            self.weight_fse_table = Table::empty();
+            self.weight_fse_ready = false;
         }
-        self.weight_fse_table.bind_unwritten_back(workspace, 1);
-        self.weight_fse_ready = true;
     }
 
     /// Drops the workspace room, for a frame that lays none out; a region of
@@ -2017,7 +2015,8 @@ impl WeightScratch {
         }
     }
 
-    /// Workspace bytes [`Self::bind`] carves.
+    /// Fresh-page room [`Self::bind`] carves
+    /// ([`Workspace::reserve_on_fresh_pages`]).
     pub(crate) fn workspace_bytes() -> usize {
         crate::encoding::workspace::region_bytes::<fse_encoder::FSETable>(1)
     }

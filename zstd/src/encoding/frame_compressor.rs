@@ -1643,6 +1643,11 @@ impl<M: Matcher> CompressState<M> {
         };
         self.workspace
             .begin_layout(block_target, trailing_for, ingest);
+        if ingest != crate::encoding::workspace::IngestPlan::Raw {
+            self.workspace.reserve_on_fresh_pages(
+                crate::huff0::huff0_encoder::WeightScratch::workspace_bytes(),
+            );
+        }
         self.matcher.reset_in_workspace(level, &mut self.workspace);
     }
 
