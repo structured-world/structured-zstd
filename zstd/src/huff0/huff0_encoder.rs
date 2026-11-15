@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
@@ -1913,16 +1912,27 @@ impl CodeShape {
 /// split candidate — reuses them instead of taking fresh allocations every
 /// time. The table-log SEARCH path already reused its scratch; this is the
 /// same for the cheap single-build path.
-#[derive(Default)]
 pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
     weights: Vec<usize>,
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
     spare_table: Option<HuffmanTable>,
-    /// Where each table's weight description builds its FSE table. Taken on
-    /// first use and kept, so a description costs no table allocation or copy.
-    weight_fse_table: Option<Box<fse_encoder::FSETable>>,
+    /// Where each table's weight description builds its FSE table: held
+    /// inline, as upstream builds it in the context's workspace, so a context
+    /// built per frame takes no allocation for it.
+    weight_fse_table: fse_encoder::FSETable,
+}
+
+impl Default for WeightScratch {
+    fn default() -> Self {
+        Self {
+            leaves: Vec::new(),
+            weights: Vec::new(),
+            spare_table: None,
+            weight_fse_table: fse_encoder::FSETable::blank(),
+        }
+    }
 }
 
 impl WeightScratch {
@@ -1938,15 +1948,12 @@ impl WeightScratch {
         self.leaves.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
             + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
-            + self
-                .weight_fse_table
-                .as_ref()
-                .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
     }
 
-    /// The most heap this scratch keeps: the tree over the byte values, at most
-    /// twice the 256 values, a weight per value, a parked table, and the FSE
-    /// table weight descriptions build into.
+    /// The most memory this scratch keeps beyond its buffers' headers: the
+    /// tree over the byte values, at most twice the 256 values, a weight per
+    /// value, a parked table, and the FSE table weight descriptions build into
+    /// (inline, but budgeted here with the rest of the entropy scratch).
     pub(crate) const fn max_heap_size() -> usize {
         512 * core::mem::size_of::<HuffNode>()
             + 256 * core::mem::size_of::<usize>()
@@ -1961,8 +1968,7 @@ impl WeightScratch {
 
     /// The storage a weight description builds its FSE table in.
     pub(crate) fn weight_fse_table(&mut self) -> &mut fse_encoder::FSETable {
-        self.weight_fse_table
-            .get_or_insert_with(|| Box::new(fse_encoder::FSETable::blank()))
+        &mut self.weight_fse_table
     }
 }
 
