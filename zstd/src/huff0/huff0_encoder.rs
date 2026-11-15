@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
 
+use crate::encoding::workspace::{Table, Workspace};
+
 /// Cache primitive for `HuffmanTable::cached_encoded_weight_description`,
 /// std-only. `std::sync::OnceLock` is `Sync` (atomic-init), so wrapping
 /// it inside `pub struct HuffmanTable` keeps the type's auto-traits
@@ -1918,12 +1920,13 @@ pub(crate) struct WeightScratch {
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
     spare_table: Option<HuffmanTable>,
-    /// Where each table's weight description builds its FSE table: held
-    /// inline, as upstream builds it in the context's workspace, so a context
-    /// built per frame takes no allocation for it. Written on first use
-    /// (`weight_fse_ready`), so a frame that describes no table never pays for
-    /// clearing it.
-    weight_fse_table: MaybeUninit<fse_encoder::FSETable>,
+    /// Where each table's weight description builds its FSE table: room in the
+    /// context's workspace, as upstream builds it in its own
+    /// (`HUF_writeCTable_wksp`), so a context built per frame takes no
+    /// allocation for it and grows by nothing. Cleared on first use in the
+    /// frame (`weight_fse_ready`); a scratch used outside a context takes room
+    /// of its own then.
+    weight_fse_table: Table<MaybeUninit<fse_encoder::FSETable>>,
     weight_fse_ready: bool,
 }
 
@@ -1933,7 +1936,7 @@ impl Default for WeightScratch {
             leaves: Vec::new(),
             weights: Vec::new(),
             spare_table: None,
-            weight_fse_table: MaybeUninit::uninit(),
+            weight_fse_table: Table::empty(),
             weight_fse_ready: false,
         }
     }
@@ -1973,11 +1976,36 @@ impl WeightScratch {
     /// The storage a weight description builds its FSE table in.
     pub(crate) fn weight_fse_table(&mut self) -> &mut fse_encoder::FSETable {
         if !self.weight_fse_ready {
-            self.weight_fse_table.write(fse_encoder::FSETable::blank());
+            if self.weight_fse_table.is_empty() {
+                self.weight_fse_table = Table::owned_unwritten(1);
+            }
+            self.weight_fse_table[0].write(fse_encoder::FSETable::blank());
             self.weight_fse_ready = true;
         }
-        // SAFETY: written above or by an earlier call (`weight_fse_ready`).
-        unsafe { self.weight_fse_table.assume_init_mut() }
+        // SAFETY: written above or by an earlier call since the room was
+        // last laid out (`weight_fse_ready`).
+        unsafe { self.weight_fse_table[0].assume_init_mut() }
+    }
+
+    /// Lays the description's FSE table out in the open `workspace`, for the
+    /// frame being laid out; it is cleared again on first use.
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace) {
+        self.weight_fse_table.bind_unwritten_back(workspace, 1);
+        self.weight_fse_ready = false;
+    }
+
+    /// Drops the workspace room, for a frame that lays none out; a region of
+    /// an earlier layout must not outlive it.
+    pub(crate) fn unbind(&mut self) {
+        if !self.weight_fse_table.is_empty() && self.weight_fse_table.owned_bytes() == 0 {
+            self.weight_fse_table = Table::empty();
+            self.weight_fse_ready = false;
+        }
+    }
+
+    /// Workspace bytes [`Self::bind`] carves.
+    pub(crate) fn workspace_bytes() -> usize {
+        crate::encoding::workspace::region_bytes::<fse_encoder::FSETable>(1)
     }
 }
 

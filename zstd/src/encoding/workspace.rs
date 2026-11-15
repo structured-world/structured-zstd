@@ -881,6 +881,13 @@ impl<T: Copy> Table<MaybeUninit<T>> {
         self.view = workspace.scratch_room(count);
         self.own = Vec::new();
     }
+
+    /// [`Self::bind_unwritten`] from the trailing part, beside the block
+    /// buffers, for scratch of the context rather than of the match finder.
+    pub(crate) fn bind_unwritten_back(&mut self, workspace: &mut Workspace, count: usize) {
+        self.view = workspace.buffer::<MaybeUninit<T>>(count).region;
+        self.own = Vec::new();
+    }
 }
 
 impl<T: Copy> Clone for Table<T> {

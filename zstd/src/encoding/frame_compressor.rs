@@ -1668,8 +1668,10 @@ impl<M: Matcher> CompressState<M> {
         );
         if self.workspace.ingest() == crate::encoding::workspace::IngestPlan::Raw {
             self.block_scratch.unbind();
+            self.huff_weights.unbind();
         } else {
             self.block_scratch.bind(&mut self.workspace, reserved);
+            self.huff_weights.bind(&mut self.workspace);
         }
         // Everything is laid out in the current allocation by now.
         self.workspace.release_retired();

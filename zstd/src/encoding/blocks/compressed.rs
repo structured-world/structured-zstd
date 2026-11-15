@@ -352,7 +352,9 @@ impl CompressedBlockScratch {
     /// source bytes whose sequences cover at least `sequence_floor` bytes each.
     pub(crate) fn workspace_bytes(block_capacity: usize, sequence_floor: usize) -> usize {
         let sequences = max_sequences(block_capacity, sequence_floor);
-        region_bytes::<u8>(block_capacity) + region_bytes::<RawSequence>(sequences)
+        region_bytes::<u8>(block_capacity)
+            + region_bytes::<RawSequence>(sequences)
+            + huff0_encoder::WeightScratch::workspace_bytes()
     }
 
     /// Takes the buffers from the open `workspace` layout, sized for blocks of
