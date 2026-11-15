@@ -1686,11 +1686,21 @@ impl Matcher for MatchGeneratorDriver {
         // The Fast backend scans a slice in place behind a dictionary however it
         // holds it: attached, in a table of its own; copied or loaded, in the
         // frame's table, the dictionary's bytes at the front of the history and
-        // the input read where it lies (upstream's `extDict` scan).
-        let fast_dict_in_place = matches!(next_backend, super::strategy::BackendTag::Simple);
+        // the input read where it lies (upstream's `extDict` scan). A copied
+        // dictionary fills the table before the input is registered, so the
+        // two together must fit the positions a tagged slot holds: past them
+        // the in-place scan would have to start the table over and lose the
+        // dictionary, where the owned history drains and keeps it.
+        let fast_dict_in_place = |len: usize| {
+            matches!(next_backend, super::strategy::BackendTag::Simple)
+                && (fast_attach
+                    || len.checked_add(dict_len).is_some_and(|joined| {
+                        joined <= crate::encoding::simple::fast_kernel::hash_table::TAGGED_POSITION_LIMIT
+                    }))
+        };
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
-                (dict_hint.is_none() || fast_dict_in_place || dfast_dict_in_place(len))
+                (dict_hint.is_none() || fast_dict_in_place(len) || dfast_dict_in_place(len))
                     && (!long_distance || long_distance_in_place)
                     && self.borrowed_supported()
                     && len
@@ -1699,12 +1709,24 @@ impl Matcher for MatchGeneratorDriver {
             }
             _ => false,
         };
+        // A Fast frame that copies its dictionary and is scanned in place keeps
+        // the input's first bytes after the dictionary in its history
+        // (`SEAM_PAD`).
+        let seam_pad = if self.frame_in_place
+            && dict_len > 0
+            && !fast_attach
+            && matches!(next_backend, super::strategy::BackendTag::Simple)
+        {
+            crate::encoding::simple::fast_kernel::kernel::SEAM_PAD
+        } else {
+            0
+        };
         let history_bytes = frame_history_bytes(
             next_backend,
             workspace,
             self.frame_in_place,
             hint,
-            dict_hint.map_or(0, |sizes| sizes.content),
+            dict_len + seam_pad,
             max_window_size,
             level,
         );

@@ -730,16 +730,16 @@ fn split_window_scan_takes_the_joined_scan_parse() {
             input.extend_from_slice(&noise(29));
         }
         let joined: Vec<u8> = dict.iter().chain(input.iter()).copied().collect();
-        // A table holding the dictionary at every position its own bytes can
-        // be hashed at, as the copy fill leaves it; reads straddling the seam
-        // come from repcodes and from matches running out of the dictionary.
+        // A table holding the dictionary at every position a hash can be
+        // taken at in the joined window, its last seven included, whose keys
+        // run on into the input: the positions a skipped first block indexes.
         let mut table = FastHashTable::new(11, MLS);
         if bias_span > 0 {
             table.advance_epoch(bias_span, u32::MAX as usize);
         }
         let bias = table.bias();
-        for pos in 1..=dict.len() - HASH_READ_SIZE {
-            // SAFETY: `pos + 8 <= dict.len()`; MLS is the table's.
+        for pos in 1..dict.len() {
+            // SAFETY: `pos + 8 <= joined.len()`; MLS is the table's.
             let hash = unsafe { table.hash_ptr::<MLS>(joined.as_ptr().add(pos)) };
             unsafe { table.put(hash, pos as u32) };
         }
@@ -763,8 +763,11 @@ fn split_window_scan_takes_the_joined_scan_parse() {
             );
             split_table.clone_from(&table);
             let mut split_seqs = Vec::new();
+            // The dictionary with the input's first bytes after it, as the
+            // matcher's history holds it.
             let split_result = compress_block_fast_split::<MLS, CMOV, false>(
-                &dict,
+                &joined[..dict.len() + SEAM_PAD],
+                dict.len(),
                 &input,
                 0,
                 bounds,

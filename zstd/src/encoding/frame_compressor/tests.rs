@@ -1124,6 +1124,92 @@ fn a_copied_dictionary_frame_read_in_place_writes_the_owned_frame() {
     }
 }
 
+/// The owned frame of a copied dictionary `dict` and `payload` at `level`,
+/// and the same frame read in place, fresh and from a restored snapshot.
+fn copied_dictionary_frames(
+    level: super::CompressionLevel,
+    params: Option<&crate::encoding::CompressionParameters>,
+    dict: &[u8],
+    payload: &[u8],
+) -> (Vec<u8>, [Vec<u8>; 2]) {
+    let mut owned_frame = Vec::new();
+    let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+    if let Some(params) = params {
+        owned.set_parameters(params);
+    }
+    owned.set_dictionary_from_bytes(dict).unwrap();
+    owned.set_source_size_hint(payload.len() as u64);
+    owned.set_source(payload);
+    owned.set_drain(&mut owned_frame);
+    owned.compress();
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    if let Some(params) = params {
+        compressor.set_parameters(params);
+    }
+    compressor.set_dictionary_from_bytes(dict).unwrap();
+    let first = compressor.compress_independent_frame(payload);
+    let second = compressor.compress_independent_frame(payload);
+    (owned_frame, [first, second])
+}
+
+/// A first block written out unsearched (here RLE) still indexes the seven
+/// dictionary positions whose hashed bytes run on into the input, as the owned
+/// path does, so a later match across the dictionary/input seam is found: the
+/// frame read in place is the owned frame.
+#[test]
+fn a_copied_dictionary_seam_indexed_after_a_skipped_block_matches_the_owned_frame() {
+    let dict = b"raw dictionary contents ending in XYZUVWQ";
+    let mut payload = vec![b'a'; 131_072];
+    payload.extend_from_slice(b"XYZUVWQ");
+    payload.extend(core::iter::repeat_n(b'a', 1000));
+    for level in [-4, -1, 1, 2] {
+        let level = super::CompressionLevel::Level(level);
+        let (owned, in_place) = copied_dictionary_frames(level, None, dict, &payload);
+        for (round, frame) in in_place.iter().enumerate() {
+            assert!(
+                *frame == owned,
+                "{level:?} frame {round}: {} bytes in place, {} owned",
+                frame.len(),
+                owned.len()
+            );
+        }
+    }
+}
+
+/// A copied-dictionary frame whose dictionary and input together pass what a
+/// tagged slot can hold keeps the dictionary's entries: it writes the owned
+/// frame instead of losing every dictionary match.
+#[test]
+fn a_copied_dictionary_frame_past_the_tagged_range_keeps_the_dictionary() {
+    let mut seed = 0x9E37_79B9u32;
+    let dict: Vec<u8> = (0..64 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let mut payload = dict.clone();
+    payload.resize(17 * 1024 * 1024, 0);
+    // A small window keeps the cmov probe, the one that runs tagged slots.
+    let level = super::CompressionLevel::Level(1);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .strategy(crate::encoding::Strategy::Fast)
+        .window_log(17)
+        .build()
+        .expect("a level, the fast strategy and a 128 KiB window are valid parameters");
+    let (owned, in_place) = copied_dictionary_frames(level, Some(&params), &dict, &payload);
+    for (round, frame) in in_place.iter().enumerate() {
+        assert!(
+            *frame == owned,
+            "frame {round}: {} bytes, {} owned",
+            frame.len(),
+            owned.len()
+        );
+    }
+}
+
 /// A frame start leaves an FSE slot that still holds the dictionary's table on
 /// that handle, giving it back the seed's form (the offset table a block turned
 /// custom is valid again), without touching the reference count; a slot

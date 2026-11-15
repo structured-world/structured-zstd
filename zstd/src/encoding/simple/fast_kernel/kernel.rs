@@ -227,22 +227,12 @@ trait ScanWindow: Copy {
     /// `index` is in the window, four bytes before its end.
     unsafe fn cand_read32(self, index: usize) -> u32;
 
-    /// [`Self::cand_read32`] for a candidate the hash table named. A table
-    /// position has its whole hash read in one buffer (a dictionary is indexed
-    /// up to eight bytes before its end, as upstream's `ZSTD_fillHashTable`
-    /// stops at `iend - HASH_READ_SIZE`), so the read never straddles the
-    /// seam and the buffer is chosen without a branch.
-    ///
-    /// # Safety
-    /// As [`Self::cand_read32`], `index` a position the table holds.
-    unsafe fn table_read32(self, index: usize) -> u32;
-
-    /// [`Self::table_read32`] when `in_range`, else four bytes no input
+    /// [`Self::cand_read32`] when `in_range`, else four bytes no input
     /// position equals in practice; the caller re-tests `in_range`.
     ///
     /// # Safety
-    /// As [`Self::table_read32`] when `in_range`.
-    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32;
+    /// As [`Self::cand_read32`] when `in_range`.
+    unsafe fn cand_read32_or_dummy(self, index: usize, in_range: bool) -> u32;
 
     /// The candidate byte at `index`.
     ///
@@ -284,12 +274,7 @@ impl ScanWindow for IndexBase {
     }
 
     #[inline(always)]
-    unsafe fn table_read32(self, index: usize) -> u32 {
-        unsafe { read32(self.add(index)) }
-    }
-
-    #[inline(always)]
-    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
+    unsafe fn cand_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
         // One address select and one load, the shape upstream's
         // `ZSTD_match4Found_cmov` has, which LLVM lowers to a `cmov`.
         let addr = if in_range {
@@ -317,6 +302,11 @@ impl ScanWindow for IndexBase {
 /// past the seam reads the input, one before it the dictionary, and a match
 /// starting in the dictionary continues into the input (upstream
 /// `ZSTD_count_2segments`).
+///
+/// The dictionary's buffer carries the input's first [`SEAM_PAD`] bytes after
+/// it, so a read of a candidate up to eight bytes before the seam (a repcode,
+/// or a seam position a skipped block indexed) finds there the bytes the
+/// joined window has and stays one load.
 #[derive(Clone, Copy)]
 struct SplitWindow {
     /// The dictionary's first byte less the bias.
@@ -327,17 +317,19 @@ struct SplitWindow {
     split: usize,
 }
 
+/// Bytes of the input a split window's dictionary buffer carries after the
+/// dictionary: the most any candidate read before the seam, a hash read at the
+/// dictionary's last position, reaches past it.
+pub(crate) const SEAM_PAD: usize = HASH_READ_SIZE;
+
 impl SplitWindow {
-    /// Four candidate bytes straddling the seam: the dictionary's last ones,
-    /// then the input's first.
-    #[cold]
-    #[inline(never)]
-    unsafe fn read32_across(self, index: usize) -> u32 {
-        let mut bytes = [0u8; 4];
-        for (k, byte) in bytes.iter_mut().enumerate() {
-            *byte = unsafe { self.cand_byte(index + k) };
-        }
-        u32::from_ne_bytes(bytes)
+    /// The buffer the candidate at `index` is read from. Which one a table
+    /// candidate lies in is a coin toss on input the dictionary does not
+    /// describe, so it is a select, not a branch: upstream's
+    /// `idxBase = idx < prefixStartIndex ? dictBase : base`.
+    #[inline(always)]
+    fn segment(self, index: usize) -> *const u8 {
+        core::hint::select_unpredictable(index >= self.split, self.input, self.dict)
     }
 }
 
@@ -349,35 +341,12 @@ impl ScanWindow for SplitWindow {
 
     #[inline(always)]
     unsafe fn cand_read32(self, index: usize) -> u32 {
-        if index >= self.split {
-            unsafe { read32(self.input.wrapping_add(index)) }
-        } else if index + 4 <= self.split {
-            unsafe { read32(self.dict.wrapping_add(index)) }
-        } else {
-            unsafe { self.read32_across(index) }
-        }
+        unsafe { read32(self.segment(index).wrapping_add(index)) }
     }
 
     #[inline(always)]
-    unsafe fn table_read32(self, index: usize) -> u32 {
-        debug_assert!(
-            index >= self.split || index + 4 <= self.split,
-            "a table position's hash read straddles the seam"
-        );
-        // Which buffer a table candidate lies in is a coin toss on input the
-        // dictionary does not describe, so it is a select, not a branch:
-        // upstream's `idxBase = idx < prefixStartIndex ? dictBase : base`.
-        let segment = core::hint::select_unpredictable(index >= self.split, self.input, self.dict);
-        unsafe { read32(segment.wrapping_add(index)) }
-    }
-
-    #[inline(always)]
-    unsafe fn table_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
-        debug_assert!(
-            !in_range || index >= self.split || index + 4 <= self.split,
-            "a table position's hash read straddles the seam"
-        );
-        let segment = core::hint::select_unpredictable(index >= self.split, self.input, self.dict);
+    unsafe fn cand_read32_or_dummy(self, index: usize, in_range: bool) -> u32 {
+        let segment = self.segment(index);
         let addr = core::hint::select_unpredictable(
             in_range,
             segment.wrapping_add(index),
@@ -504,7 +473,7 @@ unsafe fn match_found<const USE_CMOV: bool, W: ScanWindow>(
         // (CMOV_DUMMY is exactly 4 bytes; base+match_pos has ≥ 4
         // by the bounds check above).
         let in_range = match_idx >= prefix_start_index;
-        if unsafe { read32(ip) != window.table_read32_or_dummy(match_pos, in_range) } {
+        if unsafe { read32(ip) != window.cand_read32_or_dummy(match_pos, in_range) } {
             return false;
         }
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -518,7 +487,7 @@ unsafe fn match_found<const USE_CMOV: bool, W: ScanWindow>(
         if match_idx < prefix_start_index {
             return false;
         }
-        unsafe { read32(ip) == window.table_read32(match_pos) }
+        unsafe { read32(ip) == window.cand_read32(match_pos) }
     }
 }
 
@@ -686,10 +655,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     )
 }
 
-/// [`compress_block_fast`] over a window in two buffers: the dictionary
-/// `dict`, then the input `input` read in place, so a frame that copies its
-/// dictionary's index into its table scans the input without copying it behind
-/// the dictionary (upstream `ZSTD_compressBlock_fast_extDict_generic`). Every
+/// [`compress_block_fast`] over a window in two buffers: the dictionary's
+/// `dict_len` bytes at the front of `dict`, which carries the input's first
+/// [`SEAM_PAD`] bytes after them, then the input `input` read in place, so a
+/// frame that copies its dictionary's index into its table scans the input
+/// without copying it behind the dictionary (upstream
+/// `ZSTD_compressBlock_fast_extDict_generic`). Every
 /// position, the table's included, counts as if the input followed the
 /// dictionary: `block_start` is the block's offset in `input`, and `bounds`
 /// are positions of the joined window. The parse is the one
@@ -702,6 +673,7 @@ pub(crate) fn compress_block_fast_split<
     const TAGGED: bool,
 >(
     dict: &[u8],
+    dict_len: usize,
     input: &[u8],
     block_start: usize,
     bounds: PrefixBounds,
@@ -710,25 +682,38 @@ pub(crate) fn compress_block_fast_split<
     step_size: usize,
     handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
+    // `dict` is the dictionary's `dict_len` bytes and the input's first ones
+    // after them (`SEAM_PAD`, or the whole input when it is shorter): every
+    // read before the seam stays in that buffer.
+    let pad = input.len().min(SEAM_PAD);
     assert!(
-        !dict.is_empty(),
-        "a split window needs a dictionary in front of the input",
+        dict_len >= 1
+            && dict_len
+                .checked_add(pad)
+                .is_some_and(|end| end <= dict.len()),
+        "a split window needs a dictionary of {dict_len} bytes and {pad} of the input after it, \
+         got {} bytes",
+        dict.len(),
+    );
+    debug_assert_eq!(
+        &dict[dict_len..dict_len + pad],
+        &input[..pad],
+        "the bytes after the dictionary are the input's first"
     );
     let bias = hash_table.bias() as usize;
-    let split = dict.len() + bias;
+    let split = dict_len + bias;
     let window = SplitWindow {
         dict: dict.as_ptr().wrapping_sub(bias),
         input: input.as_ptr().wrapping_sub(split),
         split,
     };
-    let joined_len = dict
-        .len()
+    let joined_len = dict_len
         .checked_add(input.len())
         .expect("a window's length fits a usize");
     fast_scan::<MLS, USE_CMOV, TAGGED, _>(
         window,
         joined_len,
-        dict.len() + block_start,
+        dict_len + block_start,
         bounds,
         hash_table,
         rep,
