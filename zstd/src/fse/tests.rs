@@ -1,5 +1,24 @@
 use super::*;
 
+/// A context takes the room for a Huffman weight description's FSE table on
+/// fresh, zeroed pages as an already blank table and does not clear it first
+/// (`WeightScratch::bind`). That holds only while a blank table is all zero
+/// bytes; a non-zero default would leave the description reading garbage.
+#[test]
+fn a_blank_encoder_table_is_all_zero_bytes() {
+    let blank = fse_encoder::FSETable::blank();
+    // SAFETY: the table is plain integers with no padding between them
+    // (`[i32; 256]`, `usize`, `[u16; 512]`, `[SymbolTT; 256]` of two `u32`-sized
+    // fields, `usize`), so every byte of it is initialised.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::from_ref(&blank).cast::<u8>(),
+            core::mem::size_of::<fse_encoder::FSETable>(),
+        )
+    };
+    assert!(bytes.iter().all(|&byte| byte == 0));
+}
+
 #[test]
 fn an_encoder_table_holds_nothing_on_the_heap() {
     // The dictionary-entropy footprint reports a cached `Custom` table as

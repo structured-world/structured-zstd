@@ -1988,10 +1988,15 @@ impl WeightScratch {
     }
 
     /// Lays the description's FSE table out in the open `workspace`, for the
-    /// frame being laid out; it is cleared again on first use.
+    /// frame being laid out. A table left where it was keeps what the last
+    /// frame built in it, and one on fresh pages already reads as a blank
+    /// table (every field of [`fse_encoder::FSETable::blank`] is zero), so it
+    /// is not written first: clearing four kibibytes there faults in pages the
+    /// description's few symbols never reach. Anywhere else it is cleared on
+    /// first use.
     pub(crate) fn bind(&mut self, workspace: &mut Workspace) {
-        self.weight_fse_table.bind_unwritten_back(workspace, 1);
-        self.weight_fse_ready = false;
+        let kept = self.weight_fse_table.bind_unwritten_back(workspace, 1);
+        self.weight_fse_ready = (kept && self.weight_fse_ready) || workspace.on_fresh_pages();
     }
 
     /// Drops the workspace room, for a frame that lays none out; a region of

@@ -884,9 +884,18 @@ impl<T: Copy> Table<MaybeUninit<T>> {
 
     /// [`Self::bind_unwritten`] from the trailing part, beside the block
     /// buffers, for scratch of the context rather than of the match finder.
-    pub(crate) fn bind_unwritten_back(&mut self, workspace: &mut Workspace, count: usize) {
-        self.view = workspace.buffer::<MaybeUninit<T>>(count).region;
+    /// Returns `true` when the room is the one it had, at the same place in
+    /// the same allocation, so whatever its holder wrote there is still there.
+    pub(crate) fn bind_unwritten_back(&mut self, workspace: &mut Workspace, count: usize) -> bool {
+        let region = workspace.buffer::<MaybeUninit<T>>(count).region;
+        let kept = count > 0
+            && self.own.is_empty()
+            && region.generation == self.view.generation
+            && region.ptr == self.view.ptr
+            && region.len == self.view.len;
+        self.view = region;
         self.own = Vec::new();
+        kept
     }
 }
 
