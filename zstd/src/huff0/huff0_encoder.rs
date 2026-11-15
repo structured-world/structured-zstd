@@ -1920,8 +1920,11 @@ pub(crate) struct WeightScratch {
     spare_table: Option<HuffmanTable>,
     /// Where each table's weight description builds its FSE table: held
     /// inline, as upstream builds it in the context's workspace, so a context
-    /// built per frame takes no allocation for it.
-    weight_fse_table: fse_encoder::FSETable,
+    /// built per frame takes no allocation for it. Written on first use
+    /// (`weight_fse_ready`), so a frame that describes no table never pays for
+    /// clearing it.
+    weight_fse_table: MaybeUninit<fse_encoder::FSETable>,
+    weight_fse_ready: bool,
 }
 
 impl Default for WeightScratch {
@@ -1930,7 +1933,8 @@ impl Default for WeightScratch {
             leaves: Vec::new(),
             weights: Vec::new(),
             spare_table: None,
-            weight_fse_table: fse_encoder::FSETable::blank(),
+            weight_fse_table: MaybeUninit::uninit(),
+            weight_fse_ready: false,
         }
     }
 }
@@ -1968,7 +1972,12 @@ impl WeightScratch {
 
     /// The storage a weight description builds its FSE table in.
     pub(crate) fn weight_fse_table(&mut self) -> &mut fse_encoder::FSETable {
-        &mut self.weight_fse_table
+        if !self.weight_fse_ready {
+            self.weight_fse_table.write(fse_encoder::FSETable::blank());
+            self.weight_fse_ready = true;
+        }
+        // SAFETY: written above or by an earlier call (`weight_fse_ready`).
+        unsafe { self.weight_fse_table.assume_init_mut() }
     }
 }
 
