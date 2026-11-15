@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/structured-world/structured-zstd/compare/v0.4.0...v0.4.1) - 2026-11-15
+
+### Performance
+
+- *(encode)* read the lazy tree tables without bounds checks ([#674](https://github.com/structured-world/structured-zstd/pull/674))
+- *(encode)* scan copied-dictionary fast frames in place ([#672](https://github.com/structured-world/structured-zstd/pull/672))
+- *(encode)* tag long in-place slices and zero a stream's read room once ([#671](https://github.com/structured-world/structured-zstd/pull/671))
+- *(encode)* refuse a literal section before its table is built ([#669](https://github.com/structured-world/structured-zstd/pull/669))
+
 ## [0.4.0](https://github.com/structured-world/structured-zstd/compare/v0.3.0...v0.4.0) - 2026-11-14
 
 ### Added
