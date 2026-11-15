@@ -1555,7 +1555,7 @@ impl HcMatchGenerator {
 
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
-        drop(best_plan);
+        // `best_plan` is not read past here, so the room goes back.
         self.bt.opt_segment_plan_scratch = plan_room;
         let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
         self.bt.opt_state = opt_state;

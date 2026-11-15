@@ -1914,6 +1914,7 @@ impl CodeShape {
 /// split candidate — reuses them instead of taking fresh allocations every
 /// time. The table-log SEARCH path already reused its scratch; this is the
 /// same for the cheap single-build path.
+#[derive(Default)]
 pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
     weights: Vec<usize>,
@@ -1928,18 +1929,6 @@ pub(crate) struct WeightScratch {
     /// of its own then.
     weight_fse_table: Table<MaybeUninit<fse_encoder::FSETable>>,
     weight_fse_ready: bool,
-}
-
-impl Default for WeightScratch {
-    fn default() -> Self {
-        Self {
-            leaves: Vec::new(),
-            weights: Vec::new(),
-            spare_table: None,
-            weight_fse_table: Table::empty(),
-            weight_fse_ready: false,
-        }
-    }
 }
 
 impl WeightScratch {
