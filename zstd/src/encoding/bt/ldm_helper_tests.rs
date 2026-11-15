@@ -169,7 +169,9 @@ fn ldm_process_match_candidate_returns_none_when_store_exhausted() {
 
 #[test]
 fn push_candidate_ladder_rejects_below_min_match() {
-    let mut out: Vec<MatchCandidate> = vec![];
+    let mut room = Table::owned_unwritten(4);
+    // SAFETY: `room` is used only through `out`.
+    let mut out: RegionVec<MatchCandidate> = unsafe { RegionVec::over(&mut room) };
     let mut best = 0usize;
     let accepted = BtMatcher::push_candidate_ladder(
         &mut out,
@@ -188,7 +190,9 @@ fn push_candidate_ladder_rejects_below_min_match() {
 
 #[test]
 fn push_candidate_ladder_rejects_when_not_strictly_better() {
-    let mut out: Vec<MatchCandidate> = vec![];
+    let mut room = Table::owned_unwritten(4);
+    // SAFETY: `room` is used only through `out`.
+    let mut out: RegionVec<MatchCandidate> = unsafe { RegionVec::over(&mut room) };
     let mut best = 8usize;
     let accepted = BtMatcher::push_candidate_ladder(
         &mut out,

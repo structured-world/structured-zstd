@@ -370,19 +370,12 @@ pub(crate) use prefix_len_first_word;
 /// slots, more than one search can write.
 macro_rules! push_opt_candidate {
     ($out:expr, $candidate:expr) => {{
-        let out: &mut alloc::vec::Vec<$crate::encoding::opt::types::MatchCandidate> = $out;
+        let out: &mut $crate::encoding::workspace::RegionVec<
+            $crate::encoding::opt::types::MatchCandidate,
+        > = $out;
         let candidate = $candidate;
-        let len = out.len();
-        debug_assert!(
-            len < out.capacity(),
-            "the candidate ladder outgrew its reservation"
-        );
-        // SAFETY: `len < capacity` (the reservation above), so the slot is
-        // allocated, and the new length covers only initialised elements.
-        unsafe {
-            out.as_mut_ptr().add(len).write(candidate);
-            out.set_len(len + 1);
-        }
+        // SAFETY: the room holds more candidates than one search writes.
+        unsafe { out.push_within_capacity(candidate) };
     }};
 }
 pub(crate) use push_opt_candidate;

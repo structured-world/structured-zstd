@@ -12,12 +12,12 @@ use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 fn estimated_workspace_bytes_matches_retained_scratch_at_growth_bounds() {
     let frontier = HC_OPT_NUM + 1;
     let mut bt = BtMatcher::new();
-    bt.opt_nodes_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
-    bt.opt_node_prices_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
-    bt.opt_candidates_scratch = Vec::with_capacity(HC_OPT_CANDIDATE_CAPACITY);
+    bt.opt_nodes_scratch = Table::owned_unwritten(HC_OPT_NODE_LEN);
+    bt.opt_node_prices_scratch = Table::owned_unwritten(HC_OPT_NODE_LEN);
+    bt.opt_candidates_scratch = Table::owned_unwritten(HC_OPT_CANDIDATE_CAPACITY);
     bt.opt_segment_plan_scratch = Vec::with_capacity(frontier);
     bt.opt_seed_plan_scratch = Vec::with_capacity(frontier);
-    bt.opt_price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
+    bt.opt_price_arena = Table::owned(alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN]);
     assert_eq!(
         BtMatcher::estimated_workspace_bytes(),
         core::mem::size_of::<BtMatcher>() + bt.heap_size()

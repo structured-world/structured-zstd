@@ -1970,12 +1970,17 @@ impl Matcher for MatchGeneratorDriver {
                 let tables = hc.table.tables_workspace_bytes();
                 // The history keeps only what the reset will, as on the dfast arm.
                 hc.table.retire_history();
+                // The optimal parser's scratch sits beside the tables, so a
+                // frame takes one allocation, as upstream's context does.
                 workspace.open(
-                    tables + hc.table.history.workspace_bytes(history_bytes),
+                    tables
+                        + crate::encoding::bt::BtMatcher::scratch_workspace_bytes()
+                        + hc.table.history.workspace_bytes(history_bytes),
                     max_window_size,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
+                hc.bt.bind_scratch(workspace);
                 hc.reset();
             }
         }
@@ -2080,6 +2085,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::HashChain(m) => {
                 m.table.tables.leave_workspace();
                 m.table.history.leave_workspace();
+                m.bt.leave_workspace();
             }
         }
     }

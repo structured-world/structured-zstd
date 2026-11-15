@@ -17,7 +17,7 @@
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
-use core::mem::{align_of, size_of};
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
 
 /// Alignment of every region, and of the workspace itself (upstream
@@ -487,6 +487,17 @@ impl Workspace {
         self.region_at::<u8>(self.history_front, capacity)
     }
 
+    /// Room for `count` values from the front, left unwritten: scratch whose
+    /// holder writes every value before it reads it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::table_after`].
+    fn scratch_room<T>(&mut self, count: usize) -> Region<T> {
+        let offset = self.carve_front(region_bytes::<T>(count));
+        self.region_at::<T>(offset, count)
+    }
+
     /// Advances the front cursor past `bytes`, returning where they start.
     fn carve_front(&mut self, bytes: usize) -> usize {
         assert!(
@@ -655,6 +666,12 @@ macro_rules! table_value {
 
 table_value!(u8, u32, u64);
 
+impl TableValue for [u32; 2] {
+    fn is_zero(self) -> bool {
+        self == [0, 0]
+    }
+}
+
 /// A fixed-length run of values in a workspace.
 ///
 /// Holders keep it for as long as the layout it was carved in: every holder is
@@ -819,6 +836,24 @@ impl<T: Copy> Table<T> {
         if self.own.is_empty() && !self.is_empty() {
             *self = self.clone();
         }
+    }
+}
+
+impl<T: Copy> Table<MaybeUninit<T>> {
+    /// A table of `count` values its holder writes before reading, in an
+    /// allocation of its own.
+    pub(crate) fn owned_unwritten(count: usize) -> Self {
+        let mut values = Vec::with_capacity(count);
+        // SAFETY: the capacity is `count`, and an unwritten `MaybeUninit` is
+        // a valid one.
+        unsafe { values.set_len(count) };
+        Self::owned(values)
+    }
+
+    /// Lays the table out in `workspace` at `count` values, left unwritten.
+    pub(crate) fn bind_unwritten(&mut self, workspace: &mut Workspace, count: usize) {
+        self.view = workspace.scratch_room(count);
+        self.own = Vec::new();
     }
 }
 
@@ -1246,6 +1281,23 @@ impl<T: Copy> RegionVec<T> {
     pub(crate) const fn empty() -> Self {
         Self {
             region: Region::empty(),
+            len: 0,
+        }
+    }
+
+    /// An empty buffer over `room`'s values, with their count as its capacity.
+    ///
+    /// # Safety
+    ///
+    /// `room` must be neither used nor laid out again, nor dropped, while the
+    /// buffer is: the buffer writes and reads its values in place.
+    pub(crate) unsafe fn over(room: &mut Table<MaybeUninit<T>>) -> Self {
+        Self {
+            region: Region {
+                ptr: room.view.ptr.cast(),
+                len: room.view.len,
+                generation: room.view.generation,
+            },
             len: 0,
         }
     }
