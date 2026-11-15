@@ -105,6 +105,75 @@ const DUBT_SORT_COMPARE_CAP: usize = 8 * 1024;
 /// A tree link "pointer" whose write is discarded (upstream `dummy32`).
 const BT_DISCARD: usize = usize::MAX;
 
+/// A tree search's hash or link table, indexed without a bounds check. Every
+/// index the search forms is in range by construction: a hash is shifted down
+/// to its table's width, and a link is `2 * (idx & bt_mask) + {0, 1}`, below
+/// `1 << chain_log`, the link table's length. Debug builds check each access.
+#[derive(Clone, Copy)]
+struct TreeTable {
+    ptr: *mut u32,
+    #[cfg(debug_assertions)]
+    len: usize,
+}
+
+impl TreeTable {
+    #[inline(always)]
+    fn new(table: &mut [u32]) -> Self {
+        Self {
+            ptr: table.as_mut_ptr(),
+            #[cfg(debug_assertions)]
+            len: table.len(),
+        }
+    }
+
+    /// # Safety
+    /// `i` is in the table, and the table outlives the search.
+    #[inline(always)]
+    unsafe fn get(self, i: usize) -> usize {
+        #[cfg(debug_assertions)]
+        debug_assert!(i < self.len, "tree table index {i} past {}", self.len);
+        unsafe { *self.ptr.add(i) as usize }
+    }
+
+    /// # Safety
+    /// As [`Self::get`].
+    #[inline(always)]
+    unsafe fn set(self, i: usize, value: u32) {
+        #[cfg(debug_assertions)]
+        debug_assert!(i < self.len, "tree table index {i} past {}", self.len);
+        unsafe { *self.ptr.add(i) = value }
+    }
+}
+
+/// [`TreeTable`] for a table the search only reads (an attached
+/// dictionary's).
+#[derive(Clone, Copy)]
+struct TreeView {
+    ptr: *const u32,
+    #[cfg(debug_assertions)]
+    len: usize,
+}
+
+impl TreeView {
+    #[inline(always)]
+    fn new(table: &[u32]) -> Self {
+        Self {
+            ptr: table.as_ptr(),
+            #[cfg(debug_assertions)]
+            len: table.len(),
+        }
+    }
+
+    /// # Safety
+    /// As [`TreeTable::get`].
+    #[inline(always)]
+    unsafe fn get(self, i: usize) -> usize {
+        #[cfg(debug_assertions)]
+        debug_assert!(i < self.len, "tree table index {i} past {}", self.len);
+        unsafe { *self.ptr.add(i) as usize }
+    }
+}
+
 /// [`LazyFinder`] as the const parameter of the lazy monoliths: each
 /// finder is compiled into its own monolith (the others fold away), so a
 /// tier carries one parse per finder instead of three finders in every
@@ -1109,20 +1178,33 @@ macro_rules! hc_find_best_match {
 /// the node's next-candidate link, its other link the sort mark); the next
 /// search of that bucket sorts them in one batch (`dubt_insert1!`).
 macro_rules! dubt_update {
-    ($m:expr, $ctx:ident, $from:expr, $to:expr) => {{
-        let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+    ($hash:expr, $chain:expr, $bt_mask:expr, $hash_bits:expr, $ctx:ident, $from:expr, $to:expr) => {{
+        let (hash, chain, bt_mask, hash_bits): (TreeTable, TreeTable, usize, usize) =
+            ($hash, $chain, $bt_mask, $hash_bits);
         let mut idx = $from;
         while idx < $to {
-            let h = $m.hc_hash_at($ctx, idx);
+            let i = idx - $ctx.hist_start;
+            debug_assert!(i + ROW_HASH_KEY_LEN <= $ctx.len);
+            // SAFETY: a linked position lies at least `ROW_HASH_KEY_LEN` bytes
+            // before the block end; the hash is narrowed to the table's width.
+            let h = unsafe {
+                RowMatchGenerator::key_hash_raw(
+                    $ctx.base,
+                    $ctx.len,
+                    i,
+                    $ctx.key_mls(),
+                    hash_bits,
+                    0,
+                )
+            } as usize;
             let ci = idx + BT_IDX_BASE;
             let node = 2 * (ci & bt_mask);
-            // Both tables live in one buffer, so take the two halves together;
-            // the split ends with the iteration, leaving `hc_hash_at` free to
-            // borrow again on the next one.
-            let (hash, chain) = $m.hc_tables_mut();
-            chain[node] = hash[h];
-            chain[node + 1] = BT_UNSORTED_MARK;
-            hash[h] = ci as u32;
+            // SAFETY: `h` and the masked node are in their tables.
+            unsafe {
+                chain.set(node, hash.get(h) as u32);
+                chain.set(node + 1, BT_UNSORTED_MARK);
+                hash.set(h, ci as u32);
+            }
             idx += 1;
         }
     }};
@@ -1135,12 +1217,10 @@ macro_rules! dubt_update {
 /// not the dictionary rule). A node whose match runs to the block end is
 /// dropped from the tree (upstream: "no way to know if inf or sup").
 macro_rules! dubt_insert1 {
-    // Takes the mask and the link table from the caller rather than the
-    // matcher: the caller already holds a mutable borrow of the shared table
-    // buffer, so reaching back through `$m` here would not borrow-check.
-    ($bt_mask:expr, $hc_chain:ident, $ctx:ident, $curr:expr, $nb_compares:expr, $bt_low:expr, $cpl:path) => {{
+    // Takes the mask and the link table the caller resolved for its search.
+    ($bt_mask:expr, $chain:expr, $ctx:ident, $curr:expr, $nb_compares:expr, $bt_low:expr, $cpl:path) => {{
         let bt_mask = $bt_mask;
-        let hc_chain = &mut *$hc_chain;
+        let chain: TreeTable = $chain;
         let hist_start = $ctx.hist_start;
         let curr: usize = $curr;
         let cur_abs = curr - BT_IDX_BASE;
@@ -1168,7 +1248,9 @@ macro_rules! dubt_insert1 {
             + BT_IDX_BASE;
         let mut smaller_ptr = 2 * (curr & bt_mask);
         let mut larger_ptr = smaller_ptr + 1;
-        let mut match_index = hc_chain[smaller_ptr] as usize;
+        // SAFETY (every `chain` access below): a masked node index, see
+        // `TreeTable`.
+        let mut match_index = unsafe { chain.get(smaller_ptr) };
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut nb = $nb_compares;
@@ -1204,31 +1286,31 @@ macro_rules! dubt_insert1 {
                 break;
             }
             if smaller {
-                hc_chain[smaller_ptr] = match_index as u32;
+                unsafe { chain.set(smaller_ptr, match_index as u32) };
                 common_smaller = ml;
                 if match_index <= $bt_low {
                     smaller_ptr = BT_DISCARD;
                     break;
                 }
                 smaller_ptr = next_ptr + 1;
-                match_index = hc_chain[next_ptr + 1] as usize;
+                match_index = unsafe { chain.get(next_ptr + 1) };
             } else {
-                hc_chain[larger_ptr] = match_index as u32;
+                unsafe { chain.set(larger_ptr, match_index as u32) };
                 common_larger = ml;
                 if match_index <= $bt_low {
                     larger_ptr = BT_DISCARD;
                     break;
                 }
                 larger_ptr = next_ptr;
-                match_index = hc_chain[next_ptr] as usize;
+                match_index = unsafe { chain.get(next_ptr) };
             }
             nb -= 1;
         }
         if smaller_ptr != BT_DISCARD {
-            hc_chain[smaller_ptr] = 0;
+            unsafe { chain.set(smaller_ptr, 0) };
         }
         if larger_ptr != BT_DISCARD {
-            hc_chain[larger_ptr] = 0;
+            unsafe { chain.set(larger_ptr, 0) };
         }
     }};
 }
@@ -1248,9 +1330,9 @@ macro_rules! dubt_find_best_match {
         if p < $ntu {
             (0usize, 0usize)
         } else {
-            dubt_update!($m, $ctx, $ntu, p);
             let hist_start = $ctx.hist_start;
             let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+            let hash_bits = $m.row_hash_log + $m.row_log;
             let cur_idx = p - hist_start;
             // SAFETY: the parse searches only positions >= 8 bytes before
             // the block end.
@@ -1261,12 +1343,18 @@ macro_rules! dubt_find_best_match {
             let window_low = $ctx.window_low(p) + BT_IDX_BASE;
             let bt_low = curr.saturating_sub(bt_mask);
             let unsort_limit = bt_low.max(window_low);
-            // Take the two halves of the shared buffer once for the whole
-            // walk: every access below is an index into them, and re-deriving
-            // the split per access would put a load in the hot tree loop.
             let search_depth = $m.search_depth;
+            // Both tables once for the whole search, read through their base
+            // pointers: every index below is a hash or a masked node, in range
+            // by construction (`TreeTable`).
             let (hc_hash, hc_chain) = $m.hc_tables_mut();
-            let mut match_index = hc_hash[h] as usize;
+            debug_assert_eq!(hc_hash.len(), 1usize << hash_bits);
+            debug_assert_eq!(hc_chain.len(), 2 * (bt_mask + 1));
+            let hc_hash = TreeTable::new(hc_hash);
+            let hc_chain = TreeTable::new(hc_chain);
+            dubt_update!(hc_hash, hc_chain, bt_mask, hash_bits, $ctx, $ntu, p);
+            // SAFETY (every `hc_hash` / `hc_chain` access below): see above.
+            let mut match_index = unsafe { hc_hash.get(h) };
             let mut next_candidate = 2 * (match_index & bt_mask);
             let mut unsorted_mark = next_candidate + 1;
             let mut nb_compares = search_depth;
@@ -1275,26 +1363,30 @@ macro_rules! dubt_find_best_match {
             // Reach the end of the unsorted candidate list, reversing it
             // through the sort-mark slots.
             while match_index > unsort_limit
-                && hc_chain[unsorted_mark] == BT_UNSORTED_MARK
+                && unsafe { hc_chain.get(unsorted_mark) } == BT_UNSORTED_MARK as usize
                 && nb_candidates > 1
             {
-                hc_chain[unsorted_mark] = previous_candidate as u32;
+                unsafe { hc_chain.set(unsorted_mark, previous_candidate as u32) };
                 previous_candidate = match_index;
-                match_index = hc_chain[next_candidate] as usize;
+                match_index = unsafe { hc_chain.get(next_candidate) };
                 next_candidate = 2 * (match_index & bt_mask);
                 unsorted_mark = next_candidate + 1;
                 nb_candidates -= 1;
             }
             // Nullify the last candidate if it is still unsorted (upstream:
             // costs a little ratio, buys speed).
-            if match_index > unsort_limit && hc_chain[unsorted_mark] == BT_UNSORTED_MARK {
-                hc_chain[next_candidate] = 0;
-                hc_chain[unsorted_mark] = 0;
+            if match_index > unsort_limit
+                && unsafe { hc_chain.get(unsorted_mark) } == BT_UNSORTED_MARK as usize
+            {
+                unsafe {
+                    hc_chain.set(next_candidate, 0);
+                    hc_chain.set(unsorted_mark, 0);
+                }
             }
             // Batch-sort the stacked candidates, oldest first.
             match_index = previous_candidate;
             while match_index != 0 {
-                let next_idx = hc_chain[2 * (match_index & bt_mask) + 1] as usize;
+                let next_idx = unsafe { hc_chain.get(2 * (match_index & bt_mask) + 1) };
                 dubt_insert1!(
                     bt_mask,
                     hc_chain,
@@ -1315,8 +1407,8 @@ macro_rules! dubt_find_best_match {
             let mut match_end_idx = curr + 8 + 1;
             let mut best_len = 0usize;
             let mut best_off = 0usize;
-            match_index = hc_hash[h] as usize;
-            hc_hash[h] = curr as u32;
+            match_index = unsafe { hc_hash.get(h) };
+            unsafe { hc_hash.set(h, curr as u32) };
             while nb_compares > 0 && match_index > window_low {
                 // Tree nodes hold only earlier positions.
                 debug_assert!(match_index < curr, "tree walk reached a future node");
@@ -1356,31 +1448,31 @@ macro_rules! dubt_find_best_match {
                     break;
                 }
                 if smaller {
-                    hc_chain[smaller_ptr] = match_index as u32;
+                    unsafe { hc_chain.set(smaller_ptr, match_index as u32) };
                     common_smaller = ml;
                     if match_index <= bt_low {
                         smaller_ptr = BT_DISCARD;
                         break;
                     }
                     smaller_ptr = next_ptr + 1;
-                    match_index = hc_chain[next_ptr + 1] as usize;
+                    match_index = unsafe { hc_chain.get(next_ptr + 1) };
                 } else {
-                    hc_chain[larger_ptr] = match_index as u32;
+                    unsafe { hc_chain.set(larger_ptr, match_index as u32) };
                     common_larger = ml;
                     if match_index <= bt_low {
                         larger_ptr = BT_DISCARD;
                         break;
                     }
                     larger_ptr = next_ptr;
-                    match_index = hc_chain[next_ptr] as usize;
+                    match_index = unsafe { hc_chain.get(next_ptr) };
                 }
                 nb_compares -= 1;
             }
             if smaller_ptr != BT_DISCARD {
-                hc_chain[smaller_ptr] = 0;
+                unsafe { hc_chain.set(smaller_ptr, 0) };
             }
             if larger_ptr != BT_DISCARD {
-                hc_chain[larger_ptr] = 0;
+                unsafe { hc_chain.set(larger_ptr, 0) };
             }
             // Attached dictionary (upstream `dictMatchState`): walk the
             // CDict's sorted tree with the compares left, entered through
@@ -1411,7 +1503,14 @@ macro_rules! dubt_find_best_match {
                         0,
                     )
                 } as usize;
-                let mut dmi = dict.hc_hash[dh] as usize;
+                // The dictionary's tables, read like the frame's: `dh` is
+                // narrowed to `hash_log`, a node masked by `dbt_mask`.
+                debug_assert_eq!(dict.hc_hash.len(), 1usize << dict.shape.hash_log);
+                debug_assert_eq!(dict.hc_chain.len(), 2 * (dbt_mask + 1));
+                let dict_hash = TreeView::new(&dict.hc_hash);
+                let dict_chain = TreeView::new(&dict.hc_chain);
+                // SAFETY (every `dict_hash` / `dict_chain` access): see above.
+                let mut dmi = unsafe { dict_hash.get(dh) };
                 let mut common_smaller = 0usize;
                 let mut common_larger = 0usize;
                 while nb_compares > 0 && dmi > dlow {
@@ -1451,10 +1550,10 @@ macro_rules! dubt_find_best_match {
                     }
                     if smaller {
                         common_smaller = ml;
-                        dmi = dict.hc_chain[next_ptr + 1] as usize;
+                        dmi = unsafe { dict_chain.get(next_ptr + 1) };
                     } else {
                         common_larger = ml;
-                        dmi = dict.hc_chain[next_ptr] as usize;
+                        dmi = unsafe { dict_chain.get(next_ptr) };
                     }
                     nb_compares -= 1;
                 }
