@@ -1995,8 +1995,17 @@ impl WeightScratch {
     /// description's few symbols never reach. Anywhere else it is cleared on
     /// first use.
     pub(crate) fn bind(&mut self, workspace: &mut Workspace) {
-        let kept = self.weight_fse_table.bind_unwritten_back(workspace, 1);
-        self.weight_fse_ready = (kept && self.weight_fse_ready) || workspace.on_fresh_pages();
+        if !workspace.on_fresh_pages() {
+            // Recycled memory: clearing the room costs what an allocation of
+            // its own does, so the table keeps the one it has.
+            if self.weight_fse_table.owned_bytes() == 0 {
+                self.weight_fse_table = Table::empty();
+                self.weight_fse_ready = false;
+            }
+            return;
+        }
+        self.weight_fse_table.bind_unwritten_back(workspace, 1);
+        self.weight_fse_ready = true;
     }
 
     /// Drops the workspace room, for a frame that lays none out; a region of
