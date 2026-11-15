@@ -701,6 +701,30 @@ impl PreviousFseTable {
     }
 }
 
+/// Put a dictionary's `seed` in an axis's previous-table `slot` for a new
+/// frame. A slot still holding the seed's own table, as the last frame of the
+/// same dictionary leaves it unless a block replaced it, keeps its handle and
+/// takes only the seed's form back (the offset table turns custom after the
+/// first block): the handle is re-borrowed, with no reference count touched.
+fn seed_previous_table(slot: &mut Option<PreviousFseTable>, seed: &Option<PreviousFseTable>) {
+    use PreviousFseTable::{Custom, Dictionary};
+    if let (Some(Custom(held) | Dictionary(held)), Some(Custom(source) | Dictionary(source))) =
+        (slot.as_ref(), seed.as_ref())
+        && SharedFseTable::ptr_eq(held, source)
+    {
+        let valid = matches!(seed, Some(Dictionary(_)));
+        if let Some(Custom(handle) | Dictionary(handle)) = slot.take() {
+            *slot = Some(if valid {
+                Dictionary(handle)
+            } else {
+                Custom(handle)
+            });
+        }
+        return;
+    }
+    slot.clone_from(seed);
+}
+
 pub(crate) struct FseTables {
     /// The three predefined LL/ML/OF tables are functions of
     /// compile-time-constant distributions. The
@@ -1496,6 +1520,13 @@ pub(crate) struct CompressState<M: Matcher> {
     /// it without a histogram. A table a block built is upstream's
     /// `HUF_repeat_check`.
     pub(crate) huf_repeat_valid: bool,
+    /// Whether `last_huff_table` is the attached dictionary's table as the
+    /// frame start seeded it, no block having replaced or cleared it since: the
+    /// next frame of the same dictionary keeps it in place instead of copying
+    /// the seed again, as upstream's frames share the CDict's entropy rather
+    /// than rebuild it. Cleared with the table and whenever the dictionary
+    /// changes.
+    pub(crate) huff_is_dictionary_seed: bool,
     /// Recycled `HuffmanTable` buffers: when a block clears or replaces
     /// `last_huff_table`, the old table parks here instead of dropping, so
     /// the next frame's dictionary entropy seed `clone_from`s into existing
@@ -1670,6 +1701,7 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
         self.huf_repeat_valid = false;
+        self.huff_is_dictionary_seed = false;
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
         }
@@ -1681,6 +1713,7 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn replace_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
         self.huf_repeat_valid = false;
+        self.huff_is_dictionary_seed = false;
         if let Some(old) = self.last_huff_table.replace(table) {
             self.park_huff_table(old);
         }
@@ -1946,6 +1979,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huf_repeat_valid: false,
+                huff_is_dictionary_seed: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -2110,10 +2144,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if !fits_u32 {
                 return false;
             }
-            // Dictionary frames: only the Simple (Fast) backend in attach mode
-            // has a borrowed (no input copy) dict scan. Copy-mode dict frames
-            // and the other backends still take the owned path. The reset laid
-            // the history out on a prediction of this, which must hold, or the
+            // Dictionary frames: the Simple (Fast) backend, attached or copied,
+            // and the Dfast backend attached have a borrowed (no input copy)
+            // dict scan; the rest take the owned path. The reset laid the
+            // history out on a prediction of this, which must hold, or the
             // history is either unused or outgrown.
             let attached = self.state.matcher.borrowed_dict_supported();
             debug_assert_eq!(
@@ -2507,6 +2541,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huf_repeat_valid: false,
+                huff_is_dictionary_seed: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -3045,6 +3080,12 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             // whose last block cleared the table would otherwise re-clone
             // the dict seed every frame.
             match &cache.huff {
+                // The table the last frame of this dictionary was seeded with
+                // is still in place: re-borrowed, not copied again.
+                Some(_) if self.state.huff_is_dictionary_seed => {
+                    debug_assert!(self.state.last_huff_table.is_some());
+                    self.state.huf_repeat_valid = cache.huff_valid;
+                }
                 Some(src) => {
                     if self.state.last_huff_table.is_none() {
                         self.state.last_huff_table = self.state.huff_table_spare.take();
@@ -3054,6 +3095,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                         slot => *slot = Some(src.clone()),
                     }
                     self.state.huf_repeat_valid = cache.huff_valid;
+                    self.state.huff_is_dictionary_seed = true;
                 }
                 None => self.state.clear_huff_table(),
             }
@@ -3068,18 +3110,10 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
         if let Some(cache) = cached_entropy {
-            self.state
-                .fse_tables
-                .ll_previous
-                .clone_from(&cache.ll_previous);
-            self.state
-                .fse_tables
-                .ml_previous
-                .clone_from(&cache.ml_previous);
-            self.state
-                .fse_tables
-                .of_previous
-                .clone_from(&cache.of_previous);
+            let tables = &mut self.state.fse_tables;
+            seed_previous_table(&mut tables.ll_previous, &cache.ll_previous);
+            seed_previous_table(&mut tables.ml_previous, &cache.ml_previous);
+            seed_previous_table(&mut tables.of_previous, &cache.of_previous);
         } else {
             self.state.fse_tables.ll_previous = None;
             self.state.fse_tables.ml_previous = None;
@@ -3786,6 +3820,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         // being removed and must not be restored against a different (or no)
         // dictionary on the next frame.
         self.state.matcher.invalidate_primed_dictionary();
+        self.state.huff_is_dictionary_seed = false;
         self.dictionary.take()
     }
 
@@ -3813,6 +3848,8 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         // dictionary; drop it so the first frame with the new dictionary
         // re-primes (and re-captures) instead of restoring stale tables.
         self.state.matcher.invalidate_primed_dictionary();
+        // The Huffman table in place was seeded from the old dictionary.
+        self.state.huff_is_dictionary_seed = false;
         if !prepared.is_used_for_compression() {
             return Ok(self.dictionary.take());
         }
