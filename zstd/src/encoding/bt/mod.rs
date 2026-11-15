@@ -23,7 +23,7 @@ use core::mem::MaybeUninit;
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
-use super::workspace::{RegionVec, Table, Workspace};
+use super::workspace::{FORMAT_MIN_MATCH, RegionVec, Table, Workspace};
 
 /// Maximum offset reachable by the HC3 short-match probe. Upstream zstd
 /// parity: keeps the 3-byte side table from emitting offsets that
@@ -54,10 +54,9 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_node_prices_scratch: Table<MaybeUninit<u32>>,
     /// Per-frame room for collected match candidates, written before read.
     pub(crate) opt_candidates_scratch: Table<MaybeUninit<MatchCandidate>>,
-    /// Per-segment plan buffer (parse → encode hand-off).
-    pub(crate) opt_segment_plan_scratch: Vec<HcOptimalSequence>,
-    /// `btultra2` seed-pass plan buffer.
-    pub(crate) opt_seed_plan_scratch: Vec<HcOptimalSequence>,
+    /// Room for a block's plan (parse → encode hand-off), at most one sequence
+    /// per [`FORMAT_MIN_MATCH`] bytes of the block; written before read.
+    pub(crate) opt_segment_plan_scratch: Table<MaybeUninit<HcOptimalSequence>>,
     /// Single backing allocation for the LL/ML price caches as `[price,
     /// generation]` pairs (see [`HcOptimalPlanBuffers::price_arena`]): two
     /// fixed-stride pair regions behind one base pointer, like upstream zstd's
@@ -93,21 +92,19 @@ impl BtMatcher {
     /// (`HC_OPT_NODE_LEN` nodes, including the `+2` cells the traceback
     /// writes the path into), the SoA node-price companion (`HC_OPT_NODE_LEN`
     /// `u32`s), the consolidated price arena (`HC_OPT_PRICE_ARENA_LEN`
-    /// `[price, generation]` pairs, LL and ML regions), the per-segment plan
-    /// buffers, and the candidate ladder (`HC_OPT_CANDIDATE_CAPACITY`). LDM is
-    /// opt-in and excluded (`ldm_sequences` stays empty on every level
+    /// `[price, generation]` pairs, LL and ML regions), the plan of a `block`
+    /// byte block, and the candidate ladder (`HC_OPT_CANDIDATE_CAPACITY`). LDM
+    /// is opt-in and excluded (`ldm_sequences` stays empty on every level
     /// preset). Kept next to the struct so the estimator and the real
     /// retained layout evolve together.
-    pub(crate) fn estimated_workspace_bytes() -> usize {
-        use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_NUM, HC_OPT_PRICE_ARENA_LEN};
-        use super::hc::HC_OPT_CANDIDATE_CAPACITY;
-        let frontier = HC_OPT_NUM + 1;
-        core::mem::size_of::<Self>()
-            + HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
-            + HC_OPT_NODE_LEN * core::mem::size_of::<u32>()
-            + HC_OPT_PRICE_ARENA_LEN * core::mem::size_of::<[u32; 2]>()
-            + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
-            + HC_OPT_CANDIDATE_CAPACITY * core::mem::size_of::<MatchCandidate>()
+    pub(crate) fn estimated_workspace_bytes(block: usize) -> usize {
+        core::mem::size_of::<Self>() + Self::scratch_workspace_bytes(block)
+    }
+
+    /// Plan entries a block of `block` bytes can hold: every sequence covers
+    /// at least [`FORMAT_MIN_MATCH`] bytes of it.
+    pub(crate) fn plan_room_len(block: usize) -> usize {
+        block / FORMAT_MIN_MATCH + 1
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the
@@ -156,8 +153,7 @@ impl BtMatcher {
             opt_nodes_scratch: Table::empty(),
             opt_node_prices_scratch: Table::empty(),
             opt_candidates_scratch: Table::empty(),
-            opt_segment_plan_scratch: Vec::new(),
-            opt_seed_plan_scratch: Vec::new(),
+            opt_segment_plan_scratch: Table::empty(),
             opt_price_arena: Table::empty(),
             opt_ll_price_stamp: 0,
             opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
@@ -176,14 +172,14 @@ impl BtMatcher {
         self.opt_nodes_scratch.owned_bytes()
             + self.opt_node_prices_scratch.owned_bytes()
             + self.opt_candidates_scratch.owned_bytes()
-            + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
-                * core::mem::size_of::<HcOptimalSequence>()
+            + self.opt_segment_plan_scratch.owned_bytes()
             + self.opt_price_arena.owned_bytes()
             + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>()
     }
 
-    /// Workspace bytes [`Self::bind_scratch`] carves.
-    pub(crate) fn scratch_workspace_bytes() -> usize {
+    /// Workspace bytes [`Self::bind_scratch`] carves for blocks of `block`
+    /// bytes.
+    pub(crate) fn scratch_workspace_bytes(block: usize) -> usize {
         use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_PRICE_ARENA_LEN};
         use super::hc::HC_OPT_CANDIDATE_CAPACITY;
         use super::workspace::region_bytes;
@@ -191,6 +187,7 @@ impl BtMatcher {
             + region_bytes::<u32>(HC_OPT_NODE_LEN)
             + region_bytes::<MatchCandidate>(HC_OPT_CANDIDATE_CAPACITY)
             + region_bytes::<[u32; 2]>(HC_OPT_PRICE_ARENA_LEN)
+            + region_bytes::<HcOptimalSequence>(Self::plan_room_len(block))
     }
 
     /// Lays the optimal parser's scratch out in the open `workspace`, the way
@@ -198,9 +195,11 @@ impl BtMatcher {
     /// The price arena keeps its cells only where it continues the last
     /// frame's, together with the stamps they carry; otherwise it starts
     /// zeroed and the stamps start over.
-    pub(crate) fn bind_scratch(&mut self, workspace: &mut Workspace) {
+    pub(crate) fn bind_scratch(&mut self, workspace: &mut Workspace, block: usize) {
         use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_PRICE_ARENA_LEN};
         use super::hc::HC_OPT_CANDIDATE_CAPACITY;
+        self.opt_segment_plan_scratch
+            .bind_unwritten(workspace, Self::plan_room_len(block));
         self.opt_nodes_scratch
             .bind_unwritten(workspace, HC_OPT_NODE_LEN);
         self.opt_node_prices_scratch
@@ -222,6 +221,7 @@ impl BtMatcher {
         self.opt_nodes_scratch.leave_workspace();
         self.opt_node_prices_scratch.leave_workspace();
         self.opt_candidates_scratch.leave_workspace();
+        self.opt_segment_plan_scratch.leave_workspace();
         self.opt_price_arena.leave_workspace();
     }
 
@@ -239,8 +239,6 @@ impl BtMatcher {
         // pass — zeroing the stamp would risk a stale cell aliasing the
         // fresh value `1`. The inline lit price/generation arrays are
         // small and stay zeroed (self-consistent stamp reset).
-        self.opt_segment_plan_scratch.clear();
-        self.opt_seed_plan_scratch.clear();
         self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_stamp = 0;

@@ -745,10 +745,11 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
                 .saturating_add(hash3)
         }),
     };
-    // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
-    // next to the struct so estimator and allocator evolve together.
+    // BT modes box a `BtMatcher` and carve its scratch from the workspace;
+    // both are budgeted next to the struct so estimator and allocator evolve
+    // together.
     let bt = if uses_bt {
-        crate::encoding::bt::BtMatcher::estimated_workspace_bytes()
+        crate::encoding::bt::BtMatcher::estimated_workspace_bytes(block)
     } else {
         0
     };
@@ -821,7 +822,11 @@ pub fn estimated_bt_strategy_extra_bytes(
     } else {
         0
     };
-    crate::encoding::bt::BtMatcher::estimated_workspace_bytes() + hash3
+    let block = 1usize
+        .checked_shl(window_log)
+        .unwrap_or(usize::MAX)
+        .min(crate::common::MAX_BLOCK_SIZE as usize);
+    crate::encoding::bt::BtMatcher::estimated_workspace_bytes(block) + hash3
 }
 
 /// Resolve a [`CompressionLevel`] (+ optional source-size hint) to the

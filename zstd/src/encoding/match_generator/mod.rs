@@ -1971,16 +1971,18 @@ impl Matcher for MatchGeneratorDriver {
                 // The history keeps only what the reset will, as on the dfast arm.
                 hc.table.retire_history();
                 // The optimal parser's scratch sits beside the tables, so a
-                // frame takes one allocation, as upstream's context does.
+                // frame takes one allocation, as upstream's context does. Its
+                // plan holds a block, the one `open` sizes the layout for.
+                let block = workspace.block_for_window(max_window_size);
                 workspace.open(
                     tables
-                        + crate::encoding::bt::BtMatcher::scratch_workspace_bytes()
+                        + crate::encoding::bt::BtMatcher::scratch_workspace_bytes(block)
                         + hc.table.history.workspace_bytes(history_bytes),
                     max_window_size,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
-                hc.bt.bind_scratch(workspace);
+                hc.bt.bind_scratch(workspace, block);
                 hc.reset();
             }
         }

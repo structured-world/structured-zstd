@@ -1377,8 +1377,16 @@ impl HcMatchGenerator {
         debug_assert_eq!(profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
-        let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
-        best_plan.clear();
+        // The block's plan, written in place in the room the frame laid out
+        // (`BtMatcher::bind_scratch`); a matcher driven without a workspace
+        // takes room of its own the first time a block needs it.
+        let mut plan_room = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
+        if plan_room.len() < BtMatcher::plan_room_len(current_len) {
+            plan_room = Table::owned_unwritten(BtMatcher::plan_room_len(current_len));
+        }
+        // SAFETY: `plan_room` is touched only through `best_plan` until both
+        // are put back below.
+        let mut best_plan = unsafe { RegionVec::over(&mut plan_room) };
         let plan_reps = self.table.offset_hist;
         let (cursor, plan_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
         // Frame-constant LDM presence, resolved once per block (not per segment
@@ -1547,8 +1555,8 @@ impl HcMatchGenerator {
 
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
-        best_plan.clear();
-        self.bt.opt_segment_plan_scratch = best_plan;
+        drop(best_plan);
+        self.bt.opt_segment_plan_scratch = plan_room;
         let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
         self.bt.opt_state = opt_state;
     }
@@ -1579,8 +1587,9 @@ impl HcMatchGenerator {
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
         let seed_reps = self.table.offset_hist;
         let (cursor, seed_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
-        let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
-        seed_plan.clear();
+        // The seed pass keeps no plan (`KEEP_PLAN = false`), so it writes into
+        // none.
+        let mut seed_plan = RegionVec::empty();
         let has_ldm = !self.bt.ldm_sequences.is_empty();
         // SIMD tier resolved ONCE (see start_matching_optimal): the seed pass
         // runs as one kernel-monomorphized block pass. It keeps the statistics
@@ -1741,8 +1750,7 @@ impl HcMatchGenerator {
         {
             run_seed_loop!(run_optimal_block_scalar);
         }
-        seed_plan.clear();
-        self.bt.opt_seed_plan_scratch = seed_plan;
+        debug_assert!(seed_plan.is_empty(), "the seed pass keeps no plan");
         // The DP scratch buffers are owned by the caller (start_matching_optimal)
         // and shared across both passes, so the seed pass leaves them in place
         // (`plan_buffers` is a borrow) instead of restoring them here.
@@ -1840,7 +1848,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1885,7 +1893,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1930,7 +1938,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1972,7 +1980,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -2029,7 +2037,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -2078,7 +2086,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
