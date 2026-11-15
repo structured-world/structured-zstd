@@ -159,9 +159,36 @@ fn main() {
         Some(n) => src.chunks(n).collect(),
         None => vec![src.as_slice()],
     };
+    // `FRESH=1`: a new context for every frame, the shape of the benchmark's
+    // `compress` cells (`FRESH` in `encode_loop_dict`).
+    let fresh = env::var("FRESH").is_ok_and(|v| v == "1");
+    assert!(
+        !(fresh && dict_path.is_some()),
+        "FRESH=1 measures frames without a dictionary"
+    );
     let mut sink: usize = 0;
     for i in 0..iters {
         let frame = frames[i as usize % frames.len()];
+        let cctx = if fresh {
+            // SAFETY: created here, freed after the frame.
+            let fresh_cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
+            assert!(!fresh_cctx.is_null(), "ZSTD_createCCtx failed");
+            let rc = unsafe {
+                zstd_sys::ZSTD_CCtx_setParameter(
+                    fresh_cctx,
+                    zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+                    level,
+                )
+            };
+            assert_eq!(
+                unsafe { zstd_sys::ZSTD_isError(rc) },
+                0,
+                "setParameter failed"
+            );
+            fresh_cctx
+        } else {
+            cctx
+        };
         let rc = unsafe {
             zstd_sys::ZSTD_compress2(
                 cctx,
@@ -172,6 +199,12 @@ fn main() {
             )
         };
         assert_eq!(unsafe { zstd_sys::ZSTD_isError(rc) }, 0, "compress failed");
+        if fresh {
+            // SAFETY: the context created for this frame.
+            unsafe {
+                zstd_sys::ZSTD_freeCCtx(cctx);
+            }
+        }
         sink = sink.wrapping_add(rc);
         core::hint::black_box(&dst);
     }
