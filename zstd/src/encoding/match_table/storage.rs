@@ -295,6 +295,15 @@ pub(crate) struct MatchTable {
     /// [`Self::reset`], which would otherwise read the floor off a history
     /// already cut down to what it keeps.
     pub(crate) retired: Option<crate::encoding::workspace::RetiredHistory>,
+    /// The caller's input `(ptr, len)` while a frame is scanned in place: the
+    /// window is its first [`Self::borrowed_end`] bytes, and the history stays
+    /// empty (see [`Self::set_borrowed_window`]).
+    borrowed_input: Option<(*const u8, usize)>,
+    /// End of the last block staged from the borrowed input.
+    borrowed_end: usize,
+    /// How far into the borrowed input the frame indexed, for the floor of
+    /// the next frame.
+    borrowed_extent: usize,
 }
 
 // Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
@@ -338,6 +347,11 @@ impl Clone for MatchTable {
             block_live: (core::ptr::null(), 0),
             dms: self.dms.clone(),
             retired: self.retired,
+            // A copy reads no caller's input; the floor it advances past
+            // travels with it.
+            borrowed_input: None,
+            borrowed_end: 0,
+            borrowed_extent: self.borrowed_extent,
         }
     }
 
@@ -380,6 +394,9 @@ impl Clone for MatchTable {
         // The source's view points into the source's history.
         self.block_live = (core::ptr::null(), 0);
         self.retired = source.retired;
+        self.borrowed_input = None;
+        self.borrowed_end = 0;
+        self.borrowed_extent = source.borrowed_extent;
     }
 }
 
@@ -514,6 +531,9 @@ impl MatchTable {
             block_live: (core::ptr::null(), 0),
             dms: DictAttach::new(),
             retired: None,
+            borrowed_input: None,
+            borrowed_end: 0,
+            borrowed_extent: 0,
         }
     }
 
@@ -1136,10 +1156,72 @@ impl MatchTable {
     /// `history` Vec.
     #[inline]
     pub(crate) fn live_history(&self) -> &[u8] {
+        // A frame scanned in place: the window is the caller's input up to the
+        // last staged block. Loop-invariant for a whole pass, which takes the
+        // slice once (`capture_block_coords`).
+        if let Some((ptr, _)) = self.borrowed_input {
+            // SAFETY: `set_borrowed_window`'s contract keeps the input live,
+            // and `borrowed_end` is within it (checked when staged).
+            return unsafe { core::slice::from_raw_parts(ptr, self.borrowed_end) };
+        }
         // Stop at the committed end, not at `history.len()`: the next block's
         // bytes may already be read into the tail, and a scan must not see
         // past the block it is compressing.
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
+    }
+
+    /// Scan the caller's `buffer` in place for this frame: its blocks are
+    /// staged with [`Self::stage_borrowed_block`] instead of being read into
+    /// the history, and are positions `history_abs_start + offset` exactly as
+    /// the owned path would give them. Only a frame no block of which evicts
+    /// anything is scanned this way (the reset settles it), so the window, the
+    /// blocks and every position match the owned path's.
+    ///
+    /// # Safety
+    /// `buffer` must stay live and unmodified until
+    /// [`Self::clear_borrowed_window`] or the next reset.
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        debug_assert!(
+            self.history.is_empty() && self.window_size == 0 && self.chunk_lens.is_empty(),
+            "a frame scanned in place starts with an empty window"
+        );
+        debug_assert!(buffer.len() <= self.max_window_size);
+        self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
+        self.borrowed_end = 0;
+        self.borrowed_extent = 0;
+    }
+
+    /// Stop reading the caller's input. The window it filled is left to the
+    /// next reset, which advances the floor past it.
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.borrowed_input = None;
+        self.borrowed_end = 0;
+    }
+
+    /// Claim `[block_start, block_end)` of the borrowed input as the next
+    /// block, the bookkeeping [`Self::commit_block`] does for an owned one.
+    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        let (_, total) = self
+            .borrowed_input
+            .expect("stage_borrowed_block requires a registered borrowed window");
+        assert!(
+            block_start == self.borrowed_end && block_start <= block_end && block_end <= total,
+            "borrowed blocks are staged in order: start={block_start} end={block_end} \
+             staged={} total={total}",
+            self.borrowed_end,
+        );
+        let len = block_end - block_start;
+        if len == 0 {
+            return;
+        }
+        // The reset scans in place only a frame that fits the window, so
+        // nothing is evicted, as on the owned path for the same frame.
+        debug_assert!(self.window_size + len <= self.max_window_size);
+        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.borrowed_end = block_end;
+        self.borrowed_extent = self.borrowed_extent.max(block_end);
     }
 
     /// Absolute position one past the end of the live history.
@@ -1152,6 +1234,9 @@ impl MatchTable {
     /// data has been committed yet.
     pub(crate) fn get_last_space(&self) -> &[u8] {
         let last = *self.chunk_lens.back().unwrap();
+        if self.borrowed_input.is_some() {
+            return &self.live_history()[self.borrowed_end - last..];
+        }
         &self.history[self.history.len() - self.uncommitted_len - last
             ..self.history.len() - self.uncommitted_len]
     }
@@ -1379,8 +1464,14 @@ impl MatchTable {
         self.uncommitted_len = 0;
         // Snapshot the previous frame's one-past-the-end absolute
         // position before clearing the history that `history_abs_end`
-        // reads. Every stale table entry points strictly below this.
-        let next_floor = self.history_abs_end();
+        // reads. Every stale table entry points strictly below this. A frame
+        // scanned in place indexed its borrowed input instead.
+        let next_floor = self
+            .history_abs_end()
+            .max(self.history_abs_start + self.borrowed_extent);
+        self.borrowed_input = None;
+        self.borrowed_end = 0;
+        self.borrowed_extent = 0;
         // Re-borrow: an ATTACH-mode reused dict frame keeps the dict in the
         // separate cached dms (not the live tables), so the resident dict bytes
         // at the front of history + the cached dms can stay in place — the frame

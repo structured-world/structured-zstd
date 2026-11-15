@@ -1124,6 +1124,70 @@ fn a_copied_dictionary_frame_read_in_place_writes_the_owned_frame() {
     }
 }
 
+/// An optimal-level frame given as one slice that fits the window is scanned
+/// in place and writes the frame the owned path writes: one block, several
+/// blocks, and a compressor reused across frames, whose floor has to clear
+/// the input the previous frame read where it lay.
+#[test]
+fn an_optimal_frame_read_in_place_writes_the_owned_frame() {
+    let mut seed = 0x9E37_79B9u32;
+    let random: Vec<u8> = (0..10 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let logs: Vec<u8> = b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo\n"
+        .repeat(4096 / 68 + 1)[..4096]
+        .to_vec();
+    // Three blocks, all inside the window.
+    let long_logs: Vec<u8> = random
+        .chunks(53)
+        .flat_map(|chunk| {
+            chunk.iter().copied().chain(
+                b"op=put key=17 value=aaaaabbbbbcccccdddddeeeee\n"
+                    .iter()
+                    .copied(),
+            )
+        })
+        .cycle()
+        .take(300 * 1024)
+        .collect();
+    for level in [16, 17, 18, 19, 20, 22] {
+        for (name, payload) in [("random", &random), ("logs", &logs), ("long", &long_logs)] {
+            let level = super::CompressionLevel::Level(level);
+            let mut owned_frame = Vec::new();
+            let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+            owned.set_source_size_hint(payload.len() as u64);
+            owned.set_source(payload.as_slice());
+            owned.set_drain(&mut owned_frame);
+            owned.compress();
+
+            let mut compressor: FrameCompressor = FrameCompressor::new(level);
+            for round in 0..3 {
+                let frame = compressor.compress_independent_frame(payload.as_slice());
+                assert!(
+                    compressor.state.matcher.frame_scans_in_place(),
+                    "{level:?} {name}: the frame is read in place"
+                );
+                assert!(
+                    frame == owned_frame,
+                    "{level:?} {name} frame {round}: {} bytes in place, {} owned",
+                    frame.len(),
+                    owned_frame.len(),
+                );
+            }
+            let mut decoded = Vec::with_capacity(payload.len());
+            FrameDecoder::new()
+                .decode_all_to_vec(&owned_frame, &mut decoded)
+                .unwrap();
+            assert!(decoded == *payload, "{level:?} {name}: round trip");
+        }
+    }
+}
+
 /// The owned frame of a copied dictionary `dict` and `payload` at `level`,
 /// and the same frame read in place, fresh and from a restored snapshot.
 fn copied_dictionary_frames(
