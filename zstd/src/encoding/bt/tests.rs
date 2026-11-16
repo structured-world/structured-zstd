@@ -1,7 +1,5 @@
-use alloc::vec::Vec;
-
 use super::*;
-use crate::encoding::cost_model::{HC_OPT_NODE_LEN, HC_OPT_NUM, HC_OPT_PRICE_ARENA_LEN};
+use crate::encoding::cost_model::{HC_OPT_NODE_LEN, HC_OPT_PRICE_ARENA_LEN};
 use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 
 /// The workspace estimate must equal what a matcher retains once every
@@ -10,18 +8,30 @@ use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 /// budgeting frontier-sized regions over-reports every optimal-level context.
 #[test]
 fn estimated_workspace_bytes_matches_retained_scratch_at_growth_bounds() {
-    let frontier = HC_OPT_NUM + 1;
+    use crate::encoding::workspace::region_bytes;
+    // A 128 KiB block: the estimate rounds each region to the workspace's
+    // alignment, the owned buffers here are exact, so the two are compared
+    // through the same rounding.
+    let block = 128 * 1024;
+    let plan = BtMatcher::plan_room_len(block);
     let mut bt = BtMatcher::new();
-    bt.opt_nodes_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
-    bt.opt_node_prices_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
-    bt.opt_candidates_scratch = Vec::with_capacity(HC_OPT_CANDIDATE_CAPACITY);
-    bt.opt_segment_plan_scratch = Vec::with_capacity(frontier);
-    bt.opt_seed_plan_scratch = Vec::with_capacity(frontier);
-    bt.opt_price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
+    bt.opt_nodes_scratch = Table::owned_unwritten(HC_OPT_NODE_LEN);
+    bt.opt_node_prices_scratch = Table::owned_unwritten(HC_OPT_NODE_LEN);
+    bt.opt_candidates_scratch = Table::owned_unwritten(HC_OPT_CANDIDATE_CAPACITY);
+    bt.opt_segment_plan_scratch = Table::owned_unwritten(plan);
+    bt.opt_price_arena = Table::owned(alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN]);
+    let rounded = region_bytes::<HcOptimalNode>(HC_OPT_NODE_LEN)
+        + region_bytes::<u32>(HC_OPT_NODE_LEN)
+        + region_bytes::<MatchCandidate>(HC_OPT_CANDIDATE_CAPACITY)
+        + region_bytes::<HcOptimalSequence>(plan)
+        + region_bytes::<[u32; 2]>(HC_OPT_PRICE_ARENA_LEN);
     assert_eq!(
-        BtMatcher::estimated_workspace_bytes(),
-        core::mem::size_of::<BtMatcher>() + bt.heap_size()
+        BtMatcher::estimated_workspace_bytes(block),
+        core::mem::size_of::<BtMatcher>() + rounded
     );
+    // Every byte the estimate charges is a byte the scratch holds, up to the
+    // rounding of five regions.
+    assert!(rounded - bt.heap_size() < 5 * crate::encoding::workspace::ALIGN);
 }
 
 /// The repeat-code probe selects instead of branching; it must return what

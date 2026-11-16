@@ -17,7 +17,7 @@
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
-use core::mem::{align_of, size_of};
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
 
 /// Alignment of every region, and of the workspace itself (upstream
@@ -120,6 +120,11 @@ pub struct Workspace {
     /// The open layout made the allocation zeroed, on fresh pages, so its
     /// regions hold zeros until their holders write them.
     zeroed: bool,
+    /// Bytes the context asked to add to the trailing part only when the
+    /// layout lands on fresh pages anyway ([`Self::reserve_on_fresh_pages`]),
+    /// and whether the open layout added them.
+    fresh_extra: usize,
+    fresh_extra_open: bool,
     /// Zero tables [`Self::table_after`] wrote on fresh pages, which their
     /// contents alone cannot tell from ones left demand-zero.
     #[cfg(test)]
@@ -145,11 +150,11 @@ const TOO_LARGE_MAX_LAYOUTS: u32 = 128;
 /// (`malloc/malloc.c`): 512 KiB on 32-bit targets, 32 MiB on 64-bit ones.
 /// Other allocators take the glibc 64-bit ceiling, the one that assumes least.
 #[cfg(target_env = "musl")]
-const FRESH_PAGES_FROM: usize = 128 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 128 * 1024;
 #[cfg(all(not(target_env = "musl"), target_pointer_width = "32"))]
-const FRESH_PAGES_FROM: usize = 512 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 512 * 1024;
 #[cfg(all(not(target_env = "musl"), not(target_pointer_width = "32")))]
-const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
 
 /// The page a fault maps, the unit [`Workspace::table_after`] reasons about.
 const PAGE_BYTES: usize = 4096;
@@ -197,6 +202,8 @@ impl Workspace {
             open: false,
             oversized_layouts: 0,
             zeroed: false,
+            fresh_extra: 0,
+            fresh_extra_open: false,
             #[cfg(test)]
             zero_tables_written: 0,
         }
@@ -246,7 +253,46 @@ impl Workspace {
         self.trailing_for = trailing_for;
         self.sequence_floor = FORMAT_MIN_MATCH;
         self.ingest = ingest;
+        self.fresh_extra = 0;
+        self.fresh_extra_open = false;
         self.open = false;
+    }
+
+    /// Asks the layout being begun for `bytes` more at the back, taken only
+    /// when it lands on fresh pages without them: there a region left
+    /// unwritten costs nothing, while on a smaller layout the extra bytes alone
+    /// can add a page to every frame. [`Self::fresh_room`] hands them out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layout is already open.
+    pub(crate) fn reserve_on_fresh_pages(&mut self, bytes: usize) {
+        assert!(
+            !self.open,
+            "fresh-page room is asked for before the layout opens"
+        );
+        self.fresh_extra = bytes;
+    }
+
+    /// `count` values from the room [`Self::reserve_on_fresh_pages`] asked
+    /// for, unwritten and zero (they are on fresh pages), when the open layout
+    /// took it and allocated anew; `None` otherwise.
+    pub(crate) fn fresh_room<T>(&mut self, count: usize) -> Option<Region<T>> {
+        if !(self.fresh_extra_open && self.zeroed) {
+            return None;
+        }
+        let bytes = region_bytes::<T>(count);
+        assert!(
+            bytes <= self.fresh_extra,
+            "fresh-page room asked for more than was reserved"
+        );
+        self.fresh_extra_open = false;
+        assert!(
+            bytes <= self.back - self.leading,
+            "workspace sized below its layout"
+        );
+        self.back -= bytes;
+        Some(self.region_at::<T>(self.back, count))
     }
 
     /// Raises the shortest match the frame's sequences carry, for a match
@@ -315,12 +361,20 @@ impl Workspace {
     pub(crate) fn open(&mut self, leading: usize, window: usize) {
         assert!(!self.open, "a workspace layout opens once per frame");
         self.block_capacity = self.block_for_window(window);
-        let total = leading
+        let mut total = leading
             .checked_add((self.trailing_for)(
                 self.block_capacity,
                 self.sequence_floor,
             ))
             .expect("workspace size overflows usize");
+        // The fresh-page room joins only a layout already on fresh pages.
+        self.fresh_extra_open = self.fresh_extra > 0
+            && SYSTEM_ALLOCATOR
+            && total >= FRESH_PAGES_FROM
+            && total.checked_add(self.fresh_extra).is_some();
+        if self.fresh_extra_open {
+            total += self.fresh_extra;
+        }
         let reallocate = if total > self.capacity {
             true
         } else {
@@ -395,6 +449,19 @@ impl Workspace {
         previous: &Region<T>,
         empty: T,
     ) -> (Region<T>, bool) {
+        self.table_after_with(count, previous, empty, false)
+    }
+
+    /// [`Self::table_after`], for a table a frame touches at only a few places
+    /// (`sparse`): on fresh pages its zeros are left demand-zero, since writing
+    /// them first would fault in every page for the few a frame reaches.
+    fn table_after_with<T: TableValue>(
+        &mut self,
+        count: usize,
+        previous: &Region<T>,
+        empty: T,
+        sparse: bool,
+    ) -> (Region<T>, bool) {
         let offset = self.carve_front(region_bytes::<T>(count));
         let mut region = self.region_at::<T>(offset, count);
         let kept = count > 0
@@ -404,7 +471,7 @@ impl Workspace {
         if !kept {
             if !(self.zeroed && empty.is_zero()) {
                 region.fill(empty);
-            } else if self.frame_touches_every_page(region_bytes::<T>(count)) {
+            } else if !sparse && self.frame_touches_every_page(region_bytes::<T>(count)) {
                 // A zeroed allocation already holds the zeros, but left
                 // demand-zero each page faults twice: the match finder's first
                 // touch is a probe, a read, which maps the shared zero page,
@@ -485,6 +552,17 @@ impl Workspace {
         );
         self.history_front -= bytes;
         self.region_at::<u8>(self.history_front, capacity)
+    }
+
+    /// Room for `count` values from the front, left unwritten: scratch whose
+    /// holder writes every value before it reads it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::table_after`].
+    fn scratch_room<T>(&mut self, count: usize) -> Region<T> {
+        let offset = self.carve_front(region_bytes::<T>(count));
+        self.region_at::<T>(offset, count)
     }
 
     /// Advances the front cursor past `bytes`, returning where they start.
@@ -655,6 +733,12 @@ macro_rules! table_value {
 
 table_value!(u8, u32, u64);
 
+impl TableValue for [u32; 2] {
+    fn is_zero(self) -> bool {
+        self == [0, 0]
+    }
+}
+
 /// A fixed-length run of values in a workspace.
 ///
 /// Holders keep it for as long as the layout it was carved in: every holder is
@@ -778,6 +862,19 @@ impl<T: Copy> Table<T> {
         kept
     }
 
+    /// [`Self::bind`] for a table a frame touches at only a few places, such
+    /// as a cache indexed by a code: on fresh pages its zeros stay demand-zero
+    /// instead of being written first.
+    pub(crate) fn bind_sparse(&mut self, workspace: &mut Workspace, count: usize, empty: T) -> bool
+    where
+        T: TableValue,
+    {
+        let (view, kept) = workspace.table_after_with(count, &self.view, empty, true);
+        self.view = view;
+        self.own = Vec::new();
+        kept
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.view.len
     }
@@ -818,6 +915,38 @@ impl<T: Copy> Table<T> {
     pub(crate) fn leave_workspace(&mut self) {
         if self.own.is_empty() && !self.is_empty() {
             *self = self.clone();
+        }
+    }
+}
+
+impl<T: Copy> Table<MaybeUninit<T>> {
+    /// A table of `count` values its holder writes before reading, in an
+    /// allocation of its own.
+    pub(crate) fn owned_unwritten(count: usize) -> Self {
+        let mut values = Vec::with_capacity(count);
+        // SAFETY: the capacity is `count`, and an unwritten `MaybeUninit` is
+        // a valid one.
+        unsafe { values.set_len(count) };
+        Self::owned(values)
+    }
+
+    /// Lays the table out in `workspace` at `count` values, left unwritten.
+    pub(crate) fn bind_unwritten(&mut self, workspace: &mut Workspace, count: usize) {
+        self.view = workspace.scratch_room(count);
+        self.own = Vec::new();
+    }
+
+    /// Lays the table out in the room [`Workspace::reserve_on_fresh_pages`]
+    /// asked for, when the open layout took it: `count` values, zero bytes on
+    /// fresh pages. Returns `false`, leaving the table as it was, otherwise.
+    pub(crate) fn bind_fresh_room(&mut self, workspace: &mut Workspace, count: usize) -> bool {
+        match workspace.fresh_room::<MaybeUninit<T>>(count) {
+            Some(region) => {
+                self.view = region;
+                self.own = Vec::new();
+                true
+            }
+            None => false,
         }
     }
 }
@@ -1246,6 +1375,23 @@ impl<T: Copy> RegionVec<T> {
     pub(crate) const fn empty() -> Self {
         Self {
             region: Region::empty(),
+            len: 0,
+        }
+    }
+
+    /// An empty buffer over `room`'s values, with their count as its capacity.
+    ///
+    /// # Safety
+    ///
+    /// `room` must be neither used nor laid out again, nor dropped, while the
+    /// buffer is: the buffer writes and reads its values in place.
+    pub(crate) unsafe fn over(room: &mut Table<MaybeUninit<T>>) -> Self {
+        Self {
+            region: Region {
+                ptr: room.view.ptr.cast(),
+                len: room.view.len,
+                generation: room.view.generation,
+            },
             len: 0,
         }
     }

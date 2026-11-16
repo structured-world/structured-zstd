@@ -3480,6 +3480,42 @@ fn an_unsearched_last_block_of_a_borrowed_frame_is_not_indexed() {
     driver.clear_borrowed_window();
 }
 
+/// The same for the tree: a skipped block's sparse insert has no "staged
+/// only" form, so the frame's last block leaves the tree untouched rather than
+/// being inserted into it, densely or not.
+#[test]
+fn an_unsearched_last_block_of_a_borrowed_tree_frame_is_not_indexed() {
+    let mut state = 0x9e37_79b9_u32;
+    let input: Vec<u8> = (0..4096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let half = input.len() / 2;
+    let occupied = |driver: &mut MatchGeneratorDriver| {
+        let tables = &driver.hc_matcher().table.tables;
+        tables.iter().filter(|&&slot| slot != HC_EMPTY).count()
+    };
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.set_source_size_hint(input.len() as u64);
+    driver.reset(CompressionLevel::Level(19));
+    // SAFETY: `input` outlives the window, cleared before it drops.
+    unsafe { driver.set_borrowed_window(&input) };
+    driver.set_borrowed_block(0, half);
+    driver.skip_matching_with_hint(Some(true));
+    let indexed = occupied(&mut driver);
+    assert!(indexed > 0, "a block with blocks after it is indexed");
+    driver.set_borrowed_block(half, input.len());
+    driver.skip_matching_with_hint(Some(true));
+    assert_eq!(
+        occupied(&mut driver),
+        indexed,
+        "the frame's last block was indexed with nothing left to read it",
+    );
+    driver.clear_borrowed_window();
+}
+
 #[test]
 fn dfast_geometry_follows_the_reference_cparams() {
     // The double-fast short table keys on `cParams.minMatch` bytes, as upstream
@@ -5903,4 +5939,87 @@ fn a_driver_counts_its_own_workspace_and_not_a_contexts() {
             context.heap_bytes(),
         );
     }
+}
+
+/// A primed binary-tree dictionary is restored into the frame's own optimal
+/// parser state: the reset laid its scratch out in the workspace, and the
+/// restore takes only the dictionary's state from the snapshot. A restore that
+/// replaced the parser with the snapshot's would allocate and copy its scratch
+/// on every frame of a reused dictionary context, and the snapshot would keep
+/// a copy of scratch it never reads.
+#[test]
+fn a_primed_tree_dictionary_restores_into_the_frames_parser_state() {
+    for level in [16, 19, 22] {
+        let level = CompressionLevel::Level(level);
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(10 * 1024);
+        driver.reset(level);
+        driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnopqrstuvwx", [1, 4, 8]);
+        driver.capture_primed_dictionary(level);
+        let Some((MatcherStorage::HashChain(snapshot), ..)) = &driver.primed else {
+            panic!("{level:?}: a binary-tree snapshot was captured");
+        };
+        assert_eq!(
+            snapshot.bt.heap_size(),
+            0,
+            "{level:?}: the snapshot holds parser scratch"
+        );
+
+        driver.set_source_size_hint(10 * 1024);
+        driver.reset(level);
+        let parser: *const crate::encoding::bt::BtMatcher = &*driver.hc_matcher().bt;
+        assert!(
+            driver.restore_primed_dictionary(level),
+            "{level:?}: restored"
+        );
+        assert!(
+            core::ptr::eq(parser, &*driver.hc_matcher().bt),
+            "{level:?}: the restore replaced the frame's parser state"
+        );
+        assert_eq!(
+            driver.hc_matcher().bt.heap_size(),
+            0,
+            "{level:?}: the parser scratch left the workspace"
+        );
+    }
+}
+
+/// A tree level that attached its dictionary keeps it in a tree of its own,
+/// so its live tables hold nothing of the dictionary: the snapshot takes the
+/// dictionary's state without them, the live tables stay where they are, and
+/// a restore lays out empty tables beside the dictionary's tree.
+#[test]
+fn an_attached_tree_snapshot_leaves_the_live_tables_out() {
+    let level = CompressionLevel::Level(19);
+    let dict: Vec<u8> = (0..16 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let prepare = |driver: &mut MatchGeneratorDriver| {
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.set_source_size_hint(2 * 1024);
+        driver.reset(level);
+    };
+    prepare(&mut driver);
+    assert!(
+        driver.frame_attaches_dictionary(),
+        "precondition: a 2 KiB frame attaches"
+    );
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.hc_matcher().table.dms.is_primed());
+    let live_tables = driver.hc_matcher().table.tables.len();
+    assert!(live_tables > 0);
+    driver.capture_primed_dictionary(level);
+    assert_eq!(driver.hc_matcher().table.tables.len(), live_tables);
+    let Some((MatcherStorage::HashChain(snapshot), ..)) = &driver.primed else {
+        panic!("a tree level captures a tree snapshot");
+    };
+    assert!(snapshot.table.tables.is_empty());
+    assert!(snapshot.table.dms.is_primed());
+    prepare(&mut driver);
+    assert!(driver.restore_primed_dictionary(level));
+    let table = &driver.hc_matcher().table;
+    assert_eq!(table.tables.len(), live_tables);
+    assert!(table.tables.iter().all(|&slot| slot == HC_EMPTY));
+    assert!(table.dms.is_primed());
 }

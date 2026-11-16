@@ -924,11 +924,11 @@ impl MatchGeneratorDriver {
         }
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
-            // The optimal parsers stay owned: their cost-based DP is sensitive
-            // to candidate quality, and a borrowed continuous-index scan yields
-            // different (ratio-worse) candidates than the owned evict+rehash
-            // scan.
-            BackendTag::HashChain => false,
+            // The optimal parsers scan in place only a frame that fits the
+            // window (the reset checks it): with nothing evicted, the in-place
+            // window, blocks and positions are the owned path's, and so are
+            // the candidates the cost-based parse weighs.
+            BackendTag::HashChain => true,
         }
     }
 
@@ -992,9 +992,9 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Row => unsafe {
                 self.row_matcher_mut().set_borrowed_window(buffer)
             },
-            super::strategy::BackendTag::HashChain => {
-                unreachable!("the optimal parsers have no borrowed scan")
-            }
+            super::strategy::BackendTag::HashChain => unsafe {
+                self.hc_matcher_mut().table.set_borrowed_window(buffer)
+            },
         }
     }
 
@@ -1005,7 +1005,9 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Row => self.row_matcher_mut().clear_borrowed_window(),
-            super::strategy::BackendTag::HashChain => {}
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().table.clear_borrowed_window()
+            }
         }
         self.borrowed_pending = None;
         self.borrowed_len = 0;
@@ -1052,9 +1054,12 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Row => self
                 .row_matcher_mut()
                 .stage_borrowed_block(block_start, block_end),
-            super::strategy::BackendTag::HashChain => {
-                unreachable!("`borrowed_supported` refuses the optimal parsers")
-            }
+            // Staged once, here: the stage claims the block, as committing
+            // an owned one does, and the scan or skip that follows reads it.
+            super::strategy::BackendTag::HashChain => self
+                .hc_matcher_mut()
+                .table
+                .stage_borrowed_block(block_start, block_end),
         }
     }
 
@@ -1698,9 +1703,17 @@ impl Matcher for MatchGeneratorDriver {
                         joined <= crate::encoding::simple::fast_kernel::hash_table::TAGGED_POSITION_LIMIT
                     }))
         };
+        // The optimal parsers scan in place only a frame that fits the window:
+        // past it the owned history evicts block by block, and the in-place
+        // positions would no longer be the owned ones.
+        let fits_optimal_window = |len: usize| {
+            !matches!(next_backend, super::strategy::BackendTag::HashChain)
+                || len <= max_window_size
+        };
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
                 (dict_hint.is_none() || fast_dict_in_place(len) || dfast_dict_in_place(len))
+                    && fits_optimal_window(len)
                     && (!long_distance || long_distance_in_place)
                     && self.borrowed_supported()
                     && len
@@ -1970,12 +1983,19 @@ impl Matcher for MatchGeneratorDriver {
                 let tables = hc.table.tables_workspace_bytes();
                 // The history keeps only what the reset will, as on the dfast arm.
                 hc.table.retire_history();
+                // The optimal parser's scratch sits beside the tables, so a
+                // frame takes one allocation, as upstream's context does. Its
+                // plan holds a block, the one `open` sizes the layout for.
+                let block = workspace.block_for_window(max_window_size);
                 workspace.open(
-                    tables + hc.table.history.workspace_bytes(history_bytes),
+                    tables
+                        + crate::encoding::bt::BtMatcher::scratch_workspace_bytes(block)
+                        + hc.table.history.workspace_bytes(history_bytes),
                     max_window_size,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
+                hc.bt.bind_scratch(workspace, block);
                 hc.reset();
             }
         }
@@ -2080,6 +2100,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::HashChain(m) => {
                 m.table.tables.leave_workspace();
                 m.table.history.leave_workspace();
+                m.bt.leave_workspace();
             }
         }
     }
@@ -2249,27 +2270,32 @@ impl MatchGeneratorDriver {
             // block would index: no later block follows, and the next frame
             // starts a window past it or, behind a dictionary, verifies every
             // candidate it takes. Unsearched, that block is then only staged.
-            let incompressible_hint = if block_end == self.borrowed_len {
+            let last_block = block_end == self.borrowed_len;
+            let staged_hint = if last_block {
                 None
             } else {
                 incompressible_hint
             };
             match self.active_backend() {
-                super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
-                    block_start,
-                    block_end,
-                    incompressible_hint,
-                ),
+                super::strategy::BackendTag::Simple => {
+                    self.simple_mut()
+                        .skip_matching_borrowed(block_start, block_end, staged_hint)
+                }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
-                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
+                    .skip_matching_borrowed(block_start, block_end, staged_hint),
                 super::strategy::BackendTag::Row => self.row_matcher_mut().skip_matching_borrowed(
                     block_start,
                     block_end,
-                    incompressible_hint,
+                    staged_hint,
                 ),
+                // The block was staged with `set_borrowed_block`; the skip
+                // indexes it like an owned one, and the last one not at all:
+                // the tree has no "staged only" form short of leaving it alone.
                 super::strategy::BackendTag::HashChain => {
-                    unreachable!("`borrowed_supported` refuses the optimal parsers")
+                    if !last_block {
+                        self.skip_backend::<K>(incompressible_hint)
+                    }
                 }
             }
             return;
@@ -2392,9 +2418,9 @@ impl MatchGeneratorDriver {
                         &mut sink,
                     );
                 }
-                super::strategy::BackendTag::HashChain => {
-                    unreachable!("`borrowed_supported` refuses the optimal parsers")
-                }
+                // Staged with `set_borrowed_block`; the parse reads the block
+                // range and its bytes through the in-place window.
+                super::strategy::BackendTag::HashChain => self.start_matching_owned::<K>(&mut sink),
             }
             return;
         }

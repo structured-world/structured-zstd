@@ -106,10 +106,12 @@ fn main() {
 
     // One reused compressor: matcher tables + any dictionary parse happen
     // once here, mirroring a consumer that reuses a context across N
-    // independent per-block frames.
+    // independent per-block frames. `FRESH=1` builds a new one for every
+    // frame instead, the shape of the benchmark's `compress` cells.
     // `Level(n)`, as the benchmark builds it: the named presets `from_level`
     // returns for some levels take paths of their own.
     let compression_level = CompressionLevel::Level(level);
+    let fresh = env::var("FRESH").is_ok_and(|v| v == "1");
     let mut cctx: FrameCompressor = FrameCompressor::new(compression_level);
     // `RAW_SKIP=0` searches every block, as libzstd does, so the encode does
     // the same work as `ffi_loop_dict` on input that looks incompressible.
@@ -126,19 +128,21 @@ fn main() {
     // `LITERALS=raw` writes every literals section raw, the floor a frame
     // reaches with no time spent on its Huffman table.
     let raw_literals = env::var("LITERALS").is_ok_and(|v| v == "raw");
-    if raw_skip_off || attach.is_some() || raw_literals {
+    let params = (raw_skip_off || attach.is_some() || raw_literals).then(|| {
         let literal_mode = if raw_literals {
             structured_zstd::encoding::LiteralCompressionMode::Disable
         } else {
             structured_zstd::encoding::LiteralCompressionMode::default()
         };
-        let params = CompressionParameters::builder(compression_level)
+        CompressionParameters::builder(compression_level)
             .raw_skip(!raw_skip_off)
             .literal_compression(literal_mode)
             .dictionary_attach(attach.unwrap_or_default())
             .build()
-            .expect("a level, the raw skip and the attach mode are always valid parameters");
-        cctx.set_parameters(&params);
+            .expect("a level, the raw skip and the attach mode are always valid parameters")
+    });
+    if let Some(params) = &params {
+        cctx.set_parameters(params);
     }
     if let Some(path) = dict_path {
         let dict = std::fs::read(path).expect("read dict file");
@@ -149,6 +153,10 @@ fn main() {
         cctx.set_dictionary_from_bytes(&dict)
             .expect("dictionary should attach");
     }
+    assert!(
+        !(fresh && dict_path.is_some()),
+        "FRESH=1 measures frames without a dictionary"
+    );
 
     // Output buffer reused across iterations (allocated once, replaced in
     // place by `compress_independent_frame_into`), so steady-state iters do
@@ -169,7 +177,15 @@ fn main() {
             (None, Some(short), 1) => short.as_slice(),
             _ => src.as_slice(),
         };
-        cctx.compress_independent_frame_into(frame, &mut out);
+        if fresh {
+            let mut cctx: FrameCompressor = FrameCompressor::new(compression_level);
+            if let Some(params) = &params {
+                cctx.set_parameters(params);
+            }
+            cctx.compress_independent_frame_into(frame, &mut out);
+        } else {
+            cctx.compress_independent_frame_into(frame, &mut out);
+        }
         sink = sink.wrapping_add(out.len());
         core::hint::black_box(&out);
     }

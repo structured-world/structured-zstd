@@ -28,6 +28,44 @@ fn opened_with(leading: usize, trailing: usize) -> Workspace {
     ws
 }
 
+/// Room asked for on fresh pages joins only a layout that lands on fresh pages
+/// without it: a smaller one would grow by it on every frame, and a layout
+/// kept in the allocation it had holds no zeros to hand out. Where it is
+/// given, it is zero bytes.
+#[test]
+fn fresh_page_room_is_given_only_where_the_layout_is_fresh() {
+    let room = region_bytes::<u64>(16);
+    // Below the fresh-page size: no room, and the layout is not grown by it.
+    let mut ws = Workspace::new();
+    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+    ws.reserve_on_fresh_pages(room);
+    ws.open(4096, usize::MAX);
+    assert_eq!(ws.capacity(), 4096);
+    assert!(ws.fresh_room::<u64>(16).is_none());
+    // A fresh allocation from the fresh-page size up: the room, zeroed. An
+    // application-supplied allocator (no `std`) makes no fresh-page promise,
+    // so there the room is never given.
+    let mut ws = Workspace::new();
+    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+    ws.reserve_on_fresh_pages(room);
+    ws.open(FRESH_PAGES_FROM, usize::MAX);
+    if SYSTEM_ALLOCATOR {
+        assert_eq!(ws.capacity(), FRESH_PAGES_FROM + room);
+        let given = ws
+            .fresh_room::<u64>(16)
+            .expect("a fresh layout gives the room");
+        assert!(given.as_slice().iter().all(|&value| value == 0));
+    } else {
+        assert_eq!(ws.capacity(), FRESH_PAGES_FROM);
+        assert!(ws.fresh_room::<u64>(16).is_none());
+    }
+    // The same layout again stays in that allocation: no zeros to give.
+    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+    ws.reserve_on_fresh_pages(room);
+    ws.open(FRESH_PAGES_FROM, usize::MAX);
+    assert!(ws.fresh_room::<u64>(16).is_none());
+}
+
 // Every region begins on the workspace alignment, from either end.
 #[test]
 fn regions_start_aligned_from_both_ends() {

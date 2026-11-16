@@ -9,11 +9,10 @@
 //! Methods that operate on these types stay on `HcMatchGenerator` for
 //! now and migrate in later phases.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 
 use super::super::cost_model::HcOptimalCostProfile;
+use super::super::workspace::{RegionVec, Table};
 
 /// One candidate match produced by a match-finder probe. Carries the
 /// absolute starting position and the upstream zstd-style offset/length pair.
@@ -122,7 +121,7 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// the transition that makes its cell reachable, and read only while its
     /// price in [`Self::node_prices`] is finite, so unreached cells are never
     /// touched.
-    pub(crate) nodes: Box<[MaybeUninit<HcOptimalNode>]>,
+    pub(crate) nodes: Table<MaybeUninit<HcOptimalNode>>,
     /// SoA price companion to `nodes` (see `BtMatcher::opt_node_prices_scratch`):
     /// `node_prices[i]` mirrors node `i`'s running DP price as a contiguous
     /// `u32` so the inner price-set loop can SIMD-compare a run of node prices.
@@ -131,8 +130,12 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// the frontier reaches but no transition does.
     ///
     /// [`BtMatcher::reset_opt_node_prices`]: crate::encoding::bt::BtMatcher::reset_opt_node_prices
-    pub(crate) node_prices: Box<[MaybeUninit<u32>]>,
-    pub(crate) candidates: Vec<MatchCandidate>,
+    pub(crate) node_prices: Table<MaybeUninit<u32>>,
+    /// The candidates of the position being parsed, written in place in
+    /// [`Self::candidate_room`].
+    pub(crate) candidates: RegionVec<MatchCandidate>,
+    /// Backs [`Self::candidates`]; untouched while the buffers are out.
+    pub(crate) candidate_room: Table<MaybeUninit<MatchCandidate>>,
     /// Single backing allocation for the LL/ML price caches as `[price,
     /// generation]` pairs, laid out as two fixed-stride `HC_OPT_NUM + 1`
     /// regions (LL pairs, ML pairs). One base pointer + fixed offsets,
@@ -141,7 +144,7 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// code keeps each cache probe on one line. Fixed stride (not
     /// `frontier_limit`-dependent) so the generation stamps land in the
     /// same cell across calls with different frontiers.
-    pub(crate) price_arena: Box<[[u32; 2]]>,
+    pub(crate) price_arena: Table<[u32; 2]>,
     /// `(position, literal length)` the candidates in [`Self::candidates`] were
     /// searched for, when they are still the answer to that exact query.
     ///

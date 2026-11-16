@@ -374,10 +374,7 @@ fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size:
 /// Mirrors `compress_block_encoded`'s RLE / raw-fast-path / compressed
 /// branch selection and shares the heavy `compress_block` machinery; the
 /// only differences are how the block is acquired (borrowed slice, no
-/// copy) and that raw/RLE bodies are emitted straight from `block`. The
-/// post-split branch is unreachable here (it needs an optimal-band
-/// strategy, and the borrowed path is gated to the fast one), so it is
-/// omitted.
+/// copy) and that raw/RLE bodies are emitted straight from `block`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -393,14 +390,11 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
-    // The borrowed one-shot path emits ONE block per staged range (no
-    // pre-split partition loop). `borrowed_supported()` is the single source
-    // of truth for which backend + search configs have a borrowed scan
-    // (Simple / Dfast / Row, and HashChain's lazy CHAIN parser + btlazy2); the
-    // optimal BT search stays on the owned path. `borrowed_eligible` gates on
-    // the same predicate, so this only ever fires on a wiring bug. Checked at
-    // entry (not per-branch) so RLE / raw-fast / compressed paths all stage
-    // their borrowed range under the same invariant.
+    // `borrowed_supported()` is the single source of truth for which backends
+    // have a borrowed scan, and the reset gates on the same predicate, so
+    // this only ever fires on a wiring bug. Checked at entry (not per-branch)
+    // so RLE / raw-fast / compressed paths all stage their borrowed range
+    // under the same invariant.
     debug_assert!(
         state.matcher.borrowed_supported(),
         "borrowed one-shot path reached for an unsupported backend/search config",
@@ -501,12 +495,33 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no copy into the history).
         state.matcher.set_borrowed_block(block_start, block_end);
-        // No post-split branch here: the optimal levels (16-22), the only
-        // strategies that post-split, are NOT borrowed-eligible
-        // (`borrowed_supported` keeps them owned because the borrowed
-        // continuous-index scan yields ratio-worse candidates for their
-        // cost-based DP). btlazy2 (L13-15) and every other borrowed backend
-        // emit a single block per staged range, handled by the path below.
+        // As on the owned path: the optimal strategies cut the parsed block
+        // along its sequences, emitting one physical block per partition with
+        // its own sidecar entries. Its bytes come from the staged range.
+        if state.post_split_allowed
+            && state.sequence_capture.is_none()
+            && !searched_rle
+            && post_split_enabled(state.split_strategy, window_size)
+        {
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            compress_block_with_post_split::<MatchGeneratorDriver, K>(
+                state,
+                last_block,
+                output,
+                block_decompressed_sizes,
+                block_checksums,
+            );
+            #[cfg(all(feature = "lsm", not(feature = "hash")))]
+            compress_block_with_post_split::<MatchGeneratorDriver, K>(
+                state,
+                last_block,
+                output,
+                block_decompressed_sizes,
+            );
+            #[cfg(not(feature = "lsm"))]
+            compress_block_with_post_split::<MatchGeneratorDriver, K>(state, last_block, output);
+            return BlockType::Compressed;
+        }
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);

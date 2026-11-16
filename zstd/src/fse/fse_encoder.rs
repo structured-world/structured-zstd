@@ -195,7 +195,9 @@ pub(crate) struct SymbolTT {
 /// never exceeds `1 << 9` entries.
 pub(super) const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
 
-#[derive(Debug, Clone)]
+// `Copy`: plain arrays only, so a table can sit in workspace room
+// (`workspace::Table`); it is still passed by reference everywhere.
+#[derive(Debug, Clone, Copy)]
 pub struct FSETable {
     /// Each symbol's normalized probability (`0` absent, `-1` less than one),
     /// what the table header describes. A symbol's start state and widest

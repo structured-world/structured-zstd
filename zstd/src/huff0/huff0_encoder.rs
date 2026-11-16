@@ -1,7 +1,8 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
+
+use crate::encoding::workspace::{Table, Workspace};
 
 /// Cache primitive for `HuffmanTable::cached_encoded_weight_description`,
 /// std-only. `std::sync::OnceLock` is `Sync` (atomic-init), so wrapping
@@ -1920,9 +1921,14 @@ pub(crate) struct WeightScratch {
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
     spare_table: Option<HuffmanTable>,
-    /// Where each table's weight description builds its FSE table. Taken on
-    /// first use and kept, so a description costs no table allocation or copy.
-    weight_fse_table: Option<Box<fse_encoder::FSETable>>,
+    /// Where each table's weight description builds its FSE table: room in the
+    /// context's workspace, as upstream builds it in its own
+    /// (`HUF_writeCTable_wksp`), so a context built per frame takes no
+    /// allocation for it and grows by nothing. Cleared on first use in the
+    /// frame (`weight_fse_ready`); a scratch used outside a context takes room
+    /// of its own then.
+    weight_fse_table: Table<MaybeUninit<fse_encoder::FSETable>>,
+    weight_fse_ready: bool,
 }
 
 impl WeightScratch {
@@ -1933,20 +1939,20 @@ impl WeightScratch {
     ///
     /// A parked table contributes its own heap bytes only: the table object
     /// sits inline here, as the two buffers' headers do, and none of them
-    /// are an allocation of this scratch's making.
+    /// are an allocation of this scratch's making. The weight FSE table counts
+    /// only when it holds an allocation of its own; room in the workspace is
+    /// counted with the workspace.
     pub(crate) fn heap_size(&self) -> usize {
         self.leaves.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
             + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
-            + self
-                .weight_fse_table
-                .as_ref()
-                .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
+            + self.weight_fse_table.owned_bytes()
     }
 
-    /// The most heap this scratch keeps: the tree over the byte values, at most
-    /// twice the 256 values, a weight per value, a parked table, and the FSE
-    /// table weight descriptions build into.
+    /// The most memory this scratch keeps beyond its buffers' headers: the
+    /// tree over the byte values, at most twice the 256 values, a weight per
+    /// value, a parked table, and the FSE table weight descriptions build into
+    /// (inline, but budgeted here with the rest of the entropy scratch).
     pub(crate) const fn max_heap_size() -> usize {
         512 * core::mem::size_of::<HuffNode>()
             + 256 * core::mem::size_of::<usize>()
@@ -1961,8 +1967,50 @@ impl WeightScratch {
 
     /// The storage a weight description builds its FSE table in.
     pub(crate) fn weight_fse_table(&mut self) -> &mut fse_encoder::FSETable {
-        self.weight_fse_table
-            .get_or_insert_with(|| Box::new(fse_encoder::FSETable::blank()))
+        if !self.weight_fse_ready {
+            if self.weight_fse_table.is_empty() {
+                self.weight_fse_table = Table::owned_unwritten(1);
+            }
+            self.weight_fse_table[0].write(fse_encoder::FSETable::blank());
+            self.weight_fse_ready = true;
+        }
+        // SAFETY: written above or by an earlier call since the room was
+        // last laid out (`weight_fse_ready`).
+        unsafe { self.weight_fse_table[0].assume_init_mut() }
+    }
+
+    /// Lays the description's FSE table out in the open `workspace`, for the
+    /// frame being laid out, when the layout took the fresh-page room asked
+    /// for it ([`Self::workspace_bytes`]): there it already reads as a blank
+    /// table (every field of [`fse_encoder::FSETable::blank`] is zero) and is
+    /// not written first, since clearing four kibibytes faults in pages the
+    /// description's few symbols never reach. Otherwise the table keeps the
+    /// allocation it has, as before, cleared on first use.
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace) {
+        if self.weight_fse_table.bind_fresh_room(workspace, 1) {
+            // Zero bytes are a blank table.
+            self.weight_fse_ready = true;
+        } else if self.weight_fse_table.owned_bytes() == 0 {
+            // No room this frame: a room of an earlier layout must not outlive
+            // it, so the table takes one of its own on first use and keeps it.
+            self.weight_fse_table = Table::empty();
+            self.weight_fse_ready = false;
+        }
+    }
+
+    /// Drops the workspace room, for a frame that lays none out; a region of
+    /// an earlier layout must not outlive it.
+    pub(crate) fn unbind(&mut self) {
+        if !self.weight_fse_table.is_empty() && self.weight_fse_table.owned_bytes() == 0 {
+            self.weight_fse_table = Table::empty();
+            self.weight_fse_ready = false;
+        }
+    }
+
+    /// Fresh-page room [`Self::bind`] carves
+    /// ([`Workspace::reserve_on_fresh_pages`]).
+    pub(crate) fn workspace_bytes() -> usize {
+        crate::encoding::workspace::region_bytes::<fse_encoder::FSETable>(1)
     }
 }
 

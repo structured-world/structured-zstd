@@ -1124,6 +1124,100 @@ fn a_copied_dictionary_frame_read_in_place_writes_the_owned_frame() {
     }
 }
 
+/// An optimal-level frame given as one slice that fits the window is scanned
+/// in place and writes the frame the owned path writes: one block, several
+/// blocks, and a compressor reused across frames, whose floor has to clear
+/// the input the previous frame read where it lay.
+#[test]
+fn an_optimal_frame_read_in_place_writes_the_owned_frame() {
+    let mut seed = 0x9E37_79B9u32;
+    let random: Vec<u8> = (0..10 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let logs: Vec<u8> = b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo\n"
+        .repeat(4096 / 68 + 1)[..4096]
+        .to_vec();
+    // Three blocks, all inside the window.
+    let long_logs: Vec<u8> = random
+        .chunks(53)
+        .flat_map(|chunk| {
+            chunk.iter().copied().chain(
+                b"op=put key=17 value=aaaaabbbbbcccccdddddeeeee\n"
+                    .iter()
+                    .copied(),
+            )
+        })
+        .cycle()
+        .take(300 * 1024)
+        .collect();
+    for level in [16, 17, 18, 19, 20, 22] {
+        for (name, payload) in [("random", &random), ("logs", &logs), ("long", &long_logs)] {
+            let level = super::CompressionLevel::Level(level);
+            let mut owned_frame = Vec::new();
+            let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+            owned.set_source_size_hint(payload.len() as u64);
+            owned.set_source(payload.as_slice());
+            owned.set_drain(&mut owned_frame);
+            owned.compress();
+
+            let mut compressor: FrameCompressor = FrameCompressor::new(level);
+            for round in 0..3 {
+                let frame = compressor.compress_independent_frame(payload.as_slice());
+                assert!(
+                    compressor.state.matcher.frame_scans_in_place(),
+                    "{level:?} {name}: the frame is read in place"
+                );
+                assert!(
+                    frame == owned_frame,
+                    "{level:?} {name} frame {round}: {} bytes in place, {} owned",
+                    frame.len(),
+                    owned_frame.len(),
+                );
+            }
+            let mut decoded = Vec::with_capacity(payload.len());
+            FrameDecoder::new()
+                .decode_all_to_vec(&owned_frame, &mut decoded)
+                .unwrap();
+            assert!(decoded == *payload, "{level:?} {name}: round trip");
+        }
+    }
+}
+
+/// The decodecorpus file, a frame of several blocks that fits the window and
+/// whose blocks the post-split cuts: read in place it writes the owned frame
+/// at each optimal strategy, which the synthetic payloads above never cut.
+#[test]
+fn an_optimal_corpus_frame_read_in_place_writes_the_owned_frame() {
+    let corpus: &[u8] = include_bytes!("../../../decodecorpus_files/z000033");
+    for level in [16, 19, 22] {
+        let level = super::CompressionLevel::Level(level);
+        let mut owned_frame = Vec::new();
+        let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+        owned.set_source_size_hint(corpus.len() as u64);
+        owned.set_source(corpus);
+        owned.set_drain(&mut owned_frame);
+        owned.compress();
+
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        let frame = compressor.compress_independent_frame(corpus);
+        assert!(
+            compressor.state.matcher.frame_scans_in_place(),
+            "{level:?}: the frame is read in place"
+        );
+        assert!(
+            frame == owned_frame,
+            "{level:?}: {} bytes in place, {} owned",
+            frame.len(),
+            owned_frame.len(),
+        );
+    }
+}
+
 /// The owned frame of a copied dictionary `dict` and `payload` at `level`,
 /// and the same frame read in place, fresh and from a restored snapshot.
 fn copied_dictionary_frames(
@@ -1599,6 +1693,46 @@ fn reused_compressor_matches_a_fresh_one_across_dictionaries_and_sizes() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// A binary-tree level told to attach its dictionary keeps a snapshot of the
+/// dictionary's state without the live tree, and a reused compressor restoring
+/// it frame after frame writes what a fresh compressor with the same
+/// dictionary and mode writes.
+#[test]
+fn an_attached_tree_dictionary_restores_as_a_fresh_compressor_primes_it() {
+    use crate::encoding::{CompressionParameters, DictionaryAttachMode};
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let dict = &corpus[100_000..152_000];
+    let prepare = || super::EncoderDictionary::from_serialized_or_raw_content(dict).unwrap();
+    for level in [13, 16, 19, 22] {
+        let compression_level = super::CompressionLevel::Level(level);
+        let params = CompressionParameters::builder(compression_level)
+            .dictionary_attach(DictionaryAttachMode::Attach)
+            .build()
+            .unwrap();
+        let mut compressor: FrameCompressor = FrameCompressor::new(compression_level);
+        compressor.set_parameters(&params);
+        compressor.set_encoder_dictionary(prepare()).unwrap();
+        for (start, size) in [(200_000, 3_000), (400_000, 6_000), (600_000, 1_500)] {
+            let input = &corpus[start..start + size];
+            let frame = compressor.compress_independent_frame(input);
+            let mut fresh: FrameCompressor = FrameCompressor::new(compression_level);
+            fresh.set_parameters(&params);
+            fresh.set_encoder_dictionary(prepare()).unwrap();
+            assert!(
+                frame == fresh.compress_independent_frame(input),
+                "level {level}, {size} bytes at {start}"
+            );
+            let handle =
+                crate::decoding::DictionaryHandle::from_serialized_or_raw_content(dict).unwrap();
+            let mut out = vec![0u8; size];
+            let written = FrameDecoder::new()
+                .decode_all_with_dict_handle(&frame, &mut out, &handle)
+                .unwrap();
+            assert_eq!(&out[..written], input);
         }
     }
 }

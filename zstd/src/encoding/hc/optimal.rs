@@ -21,6 +21,7 @@ use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 use crate::encoding::hc::priceset::{
     priceset_avx2, priceset_neon, priceset_scalar, priceset_simd128, priceset_sse2, priceset_sse41,
 };
+use crate::encoding::workspace::{RegionVec, Table};
 use alloc::vec::Vec;
 
 // The DP body macros reference these opt-parser types and cost-model constants
@@ -58,7 +59,7 @@ type OptimalCollectFn = unsafe fn(
     usize,
     &[u32; 3],
     bool,
-    &mut Vec<MatchCandidate>,
+    &mut RegionVec<MatchCandidate>,
 );
 
 macro_rules! build_optimal_plan_impl_body {
@@ -134,6 +135,7 @@ macro_rules! build_optimal_plan_impl_body {
             nodes,
             node_prices,
             candidates,
+            candidate_room: _,
             price_arena,
             candidates_searched_at: searched_at,
             pass,
@@ -370,7 +372,7 @@ macro_rules! build_optimal_plan_impl_body {
                     // the raw slices are confined to this priced path and never
                     // outlive `price_arena` (owned by the caller for the whole
                     // call).
-                    let arena_base = price_arena.as_mut_ptr();
+                    let arena_base: *mut [u32; 2] = price_arena.as_mut_ptr();
                     ll_cache = unsafe {
                         core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE)
                     };
@@ -1375,8 +1377,16 @@ impl HcMatchGenerator {
         debug_assert_eq!(profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
-        let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
-        best_plan.clear();
+        // The block's plan, written in place in the room the frame laid out
+        // (`BtMatcher::bind_scratch`); a matcher driven without a workspace
+        // takes room of its own the first time a block needs it.
+        let mut plan_room = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
+        if plan_room.len() < BtMatcher::plan_room_len(current_len) {
+            plan_room = Table::owned_unwritten(BtMatcher::plan_room_len(current_len));
+        }
+        // SAFETY: `plan_room` is touched only through `best_plan` until both
+        // are put back below.
+        let mut best_plan = unsafe { RegionVec::over(&mut plan_room) };
         let plan_reps = self.table.offset_hist;
         let (cursor, plan_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
         // Frame-constant LDM presence, resolved once per block (not per segment
@@ -1545,8 +1555,8 @@ impl HcMatchGenerator {
 
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
-        best_plan.clear();
-        self.bt.opt_segment_plan_scratch = best_plan;
+        // `best_plan` is not read past here, so the room goes back.
+        self.bt.opt_segment_plan_scratch = plan_room;
         let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
         self.bt.opt_state = opt_state;
     }
@@ -1577,8 +1587,9 @@ impl HcMatchGenerator {
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
         let seed_reps = self.table.offset_hist;
         let (cursor, seed_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
-        let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
-        seed_plan.clear();
+        // The seed pass keeps no plan (`KEEP_PLAN = false`), so it writes into
+        // none.
+        let mut seed_plan = RegionVec::empty();
         let has_ldm = !self.bt.ldm_sequences.is_empty();
         // SIMD tier resolved ONCE (see start_matching_optimal): the seed pass
         // runs as one kernel-monomorphized block pass. It keeps the statistics
@@ -1739,8 +1750,7 @@ impl HcMatchGenerator {
         {
             run_seed_loop!(run_optimal_block_scalar);
         }
-        seed_plan.clear();
-        self.bt.opt_seed_plan_scratch = seed_plan;
+        debug_assert!(seed_plan.is_empty(), "the seed pass keeps no plan");
         // The DP scratch buffers are owned by the caller (start_matching_optimal)
         // and shared across both passes, so the seed pass leaves them in place
         // (`plan_buffers` is a borrow) instead of restoring them here.
@@ -1775,26 +1785,36 @@ impl HcMatchGenerator {
         let bt = &mut *self.bt;
         let mut nodes = core::mem::take(&mut bt.opt_nodes_scratch);
         let mut node_prices = core::mem::take(&mut bt.opt_node_prices_scratch);
-        let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);
+        let mut candidate_room = core::mem::take(&mut bt.opt_candidates_scratch);
         let mut price_arena = core::mem::take(&mut bt.opt_price_arena);
-        // Allocated, never filled: the DP reads only cells it wrote in the same
-        // call, so a frame whose frontier stays short touches only what it
-        // reaches.
+        // A frame lays these out in its workspace (`BtMatcher::bind_scratch`);
+        // a matcher driven without one allocates them here once. Never
+        // filled: the DP reads only cells it wrote in the same call, so a
+        // frame whose frontier stays short touches only what it reaches.
         if nodes.len() < HC_OPT_NODE_LEN {
-            nodes = alloc::boxed::Box::new_uninit_slice(HC_OPT_NODE_LEN);
+            nodes = Table::owned_unwritten(HC_OPT_NODE_LEN);
         }
         if node_prices.len() < HC_OPT_NODE_LEN {
-            node_prices = alloc::boxed::Box::new_uninit_slice(HC_OPT_NODE_LEN);
+            node_prices = Table::owned_unwritten(HC_OPT_NODE_LEN);
         }
-        candidates.clear();
-        candidates.reserve_exact(HC_OPT_CANDIDATE_CAPACITY);
+        if candidate_room.len() < HC_OPT_CANDIDATE_CAPACITY {
+            candidate_room = Table::owned_unwritten(HC_OPT_CANDIDATE_CAPACITY);
+        }
         if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
-            price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
+            // A new arena holds no stamp, so the stamps start over with it.
+            price_arena = Table::owned(alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN]);
+            bt.opt_ll_price_stamp = 0;
+            bt.opt_ml_price_stamp = 0;
         }
+        // SAFETY: `candidate_room` travels beside `candidates` in the buffers
+        // and is touched again only when `finish_optimal_plan` drops the
+        // buffer and puts the room back.
+        let candidates = unsafe { RegionVec::over(&mut candidate_room) };
         HcOptimalPlanBuffers {
             nodes,
             node_prices,
             candidates,
+            candidate_room,
             price_arena,
             // Nothing in the buffer answers a query yet: the block that filled
             // it is over, and the parser is about to start another.
@@ -1828,7 +1848,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1873,7 +1893,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1918,7 +1938,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -1960,7 +1980,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -2017,7 +2037,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -2066,7 +2086,7 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
-        plan: &mut Vec<HcOptimalSequence>,
+        plan: &mut RegionVec<HcOptimalSequence>,
         buffers: &mut HcOptimalPlanBuffers,
     ) {
         optimal_block_body!(
@@ -2106,7 +2126,12 @@ impl HcMatchGenerator {
             .skip_insert_until_abs
             .max(self.table.history_abs_start);
         out.clear();
-        out.reserve_exact(HC_OPT_CANDIDATE_CAPACITY);
+        // The room the search writes into, as the block's pass holds it; the
+        // candidates are copied out for the caller at the end.
+        let mut room =
+            crate::encoding::workspace::Table::owned_unwritten(HC_OPT_CANDIDATE_CAPACITY);
+        // SAFETY: `room` is used only through `found` until it drops below.
+        let mut found = unsafe { RegionVec::over(&mut room) };
         let reps = &query.reps;
         let ll0 = query.lit_len == 0;
         // Dispatch purely from `self.strategy_tag` (set by
@@ -2124,7 +2149,7 @@ impl HcMatchGenerator {
                         sufficient_match_len,
                         reps,
                         ll0,
-                        out,
+                        &mut found,
                     ),
                     5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
                         abs_pos,
@@ -2132,7 +2157,7 @@ impl HcMatchGenerator {
                         sufficient_match_len,
                         reps,
                         ll0,
-                        out,
+                        &mut found,
                     ),
                     6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
                         abs_pos,
@@ -2140,7 +2165,7 @@ impl HcMatchGenerator {
                         sufficient_match_len,
                         reps,
                         ll0,
-                        out,
+                        &mut found,
                     ),
                     _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
                         abs_pos,
@@ -2148,7 +2173,7 @@ impl HcMatchGenerator {
                         sufficient_match_len,
                         reps,
                         ll0,
-                        out,
+                        &mut found,
                     ),
                 }
             };
@@ -2172,8 +2197,9 @@ impl HcMatchGenerator {
             }
         }
         if let Some(ldm) = query.ldm_candidate {
-            BtMatcher::push_ldm_candidate(out, ldm, self.table.opt_min_match());
+            BtMatcher::push_ldm_candidate(&mut found, ldm, self.table.opt_min_match());
         }
+        out.extend_from_slice(&found);
     }
 
     /// Cross-platform entry. Picks the kernel-specific variant so the per-
@@ -2208,7 +2234,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         #[cfg(all(
             target_arch = "aarch64",
@@ -2339,7 +2365,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2373,7 +2399,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2413,7 +2439,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2447,7 +2473,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2488,7 +2514,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2525,7 +2551,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut RegionVec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,

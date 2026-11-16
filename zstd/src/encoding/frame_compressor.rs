@@ -1643,6 +1643,11 @@ impl<M: Matcher> CompressState<M> {
         };
         self.workspace
             .begin_layout(block_target, trailing_for, ingest);
+        if ingest != crate::encoding::workspace::IngestPlan::Raw {
+            self.workspace.reserve_on_fresh_pages(
+                crate::huff0::huff0_encoder::WeightScratch::workspace_bytes(),
+            );
+        }
         self.matcher.reset_in_workspace(level, &mut self.workspace);
     }
 
@@ -1668,8 +1673,10 @@ impl<M: Matcher> CompressState<M> {
         );
         if self.workspace.ingest() == crate::encoding::workspace::IngestPlan::Raw {
             self.block_scratch.unbind();
+            self.huff_weights.unbind();
         } else {
             self.block_scratch.bind(&mut self.workspace, reserved);
+            self.huff_weights.bind(&mut self.workspace);
         }
         // Everything is laid out in the current allocation by now.
         self.workspace.release_retired();

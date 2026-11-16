@@ -540,3 +540,26 @@ fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
         "clone_from must adopt the source's uncommitted count"
     );
 }
+
+/// An empty block staged from the caller's input claims nothing: a chunk of
+/// length zero would become the block every later read takes as the current
+/// one, so the window, its chunks and the staged extent stay as they were.
+#[test]
+fn staging_an_empty_borrowed_block_changes_nothing() {
+    let input = vec![7u8; 48];
+    let mut t = new_table(64);
+    // SAFETY: `input` outlives the table's use of it and is not modified.
+    unsafe { t.set_borrowed_window(&input) };
+    t.stage_borrowed_block(0, 16);
+    let window = t.window_size;
+    let chunks = t.chunk_lens.len();
+    t.stage_borrowed_block(16, 16);
+    assert_eq!(t.window_size, window);
+    assert_eq!(t.chunk_lens.len(), chunks);
+    assert_eq!(t.borrowed_end, 16);
+    // The next block still stages from where the last real one ended.
+    t.stage_borrowed_block(16, 48);
+    assert_eq!(t.window_size, 48);
+    assert_eq!(t.chunk_lens.back(), Some(&32));
+    t.clear_borrowed_window();
+}

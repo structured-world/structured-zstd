@@ -423,7 +423,9 @@ impl MatchGeneratorDriver {
             // rooms the reset laid out in the workspace. An ATTACH-mode
             // snapshot holds no tree (see `capture_primed_dictionary`), so the
             // laid-out tables are emptied where they are, reproducing the
-            // post-prime state (all `HC_EMPTY`) without an allocation.
+            // post-prime state (all `HC_EMPTY`) without an allocation. The
+            // optimal parser's state stays the frame's, its scratch where the
+            // reset laid it out.
             (MatcherStorage::HashChain(live), MatcherStorage::HashChain(snap)) => {
                 let snapshot_tables = core::mem::take(&mut snap.table.tables);
                 let snapshot_history = core::mem::take(&mut snap.table.history);
@@ -434,7 +436,7 @@ impl MatchGeneratorDriver {
                 if tree_in_snapshot {
                     tables.clone_from(&snapshot_tables);
                 }
-                *live = snap.clone();
+                live.restore_dictionary_state(snap);
                 live.table.tables = tables;
                 live.table.history = history;
                 if !tree_in_snapshot {
@@ -524,12 +526,9 @@ impl MatchGeneratorDriver {
             let tables = core::mem::take(&mut hc.table.tables);
             let chain_off = core::mem::take(&mut hc.table.chain_off);
             let hash3_off = core::mem::take(&mut hc.table.hash3_off);
-            // Clone the dict-state-only storage (live tables now empty Vecs).
-            let snapshot = self.storage.clone();
+            // Copy the dictionary's state alone (live tables now empty).
+            let snapshot = MatcherStorage::HashChain(hc.dictionary_snapshot());
             // Move the live tables back into the working storage.
-            let MatcherStorage::HashChain(hc) = &mut self.storage else {
-                unreachable!("storage variant is stable across the take/put");
-            };
             hc.table.tables = tables;
             hc.table.chain_off = chain_off;
             hc.table.hash3_off = hash3_off;
@@ -553,6 +552,9 @@ impl MatchGeneratorDriver {
                 (Some(MatcherStorage::Row(mut snapshot)), MatcherStorage::Row(live)) => {
                     snapshot.restore_snapshot(live);
                     MatcherStorage::Row(snapshot)
+                }
+                (_, MatcherStorage::HashChain(live)) => {
+                    MatcherStorage::HashChain(live.dictionary_snapshot())
                 }
                 (_, live) => live.clone(),
             };
