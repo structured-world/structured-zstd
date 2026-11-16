@@ -24,20 +24,6 @@ pub(crate) struct MatchCandidate {
     pub(crate) match_len: usize,
 }
 
-/// The insert cursors the per-position search moves on every call: the next
-/// position the binary tree takes (`skip_insert_until_abs`) and the next the
-/// hash3 table takes (`next_to_update3`). A block's pass holds them in its own
-/// frame and writes them back to the table when it ends, so the search's
-/// per-position stores land beside the frame that reloads its spills rather
-/// than in the context, which the caller places, possibly a whole number of
-/// pages away from it: a store and a later load whose addresses agree in
-/// their low twelve bits stall the load on 4K aliasing.
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct HcSearchCursors {
-    pub(crate) tree: usize,
-    pub(crate) hash3: usize,
-}
-
 /// DP cell in the optimal parser table. Stores the chosen offset/match-length,
 /// the literal-run length, and the rep-code history that would be active after
 /// committing this cell.
