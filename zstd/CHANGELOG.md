@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/structured-world/structured-zstd/compare/v0.4.1...v0.4.2) - 2026-11-16
+
+### Performance
+
+- *(decoding)* far match copies by CPU family ([#677](https://github.com/structured-world/structured-zstd/pull/677))
+- *(encode)* carve fresh-context scratch from the workspace ([#675](https://github.com/structured-world/structured-zstd/pull/675))
+
 ## [0.4.1](https://github.com/structured-world/structured-zstd/compare/v0.4.0...v0.4.1) - 2026-11-15
 
 ### Performance
