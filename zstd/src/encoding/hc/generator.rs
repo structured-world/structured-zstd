@@ -486,6 +486,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         $out:ident,
         $reps:ident,
         $ll0:ident,
+        // The pass's insert cursors (`&mut HcSearchCursors`).
+        $cursors:ident,
         $use_hash3:expr,
         // The tree's key width, a const of the search the block chose.
         $mls:expr,
@@ -659,7 +661,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 $table.bt_coords(),
                 "block coordinates are stale"
             );
-            let h3_start = $table.next_to_update3;
+            let h3_start = $cursors.hash3;
             // A strategy that uses the table has it configured (asserted at the
             // top), and this position's four bytes were checked on entry.
             debug_assert!(h3_log != 0 && idx + 4 <= clen);
@@ -694,10 +696,13 @@ macro_rules! bt_insert_and_collect_matches_body {
                         cursor += 1;
                     }
                 }
-                $table.next_to_update3 = $abs_pos;
+                $cursors.hash3 = $abs_pos;
                 table3
             } else {
+                // The general catch-up keeps its cursor on the table.
+                $table.next_to_update3 = $cursors.hash3;
                 $table.update_hash3_until($abs_pos);
+                $cursors.hash3 = $table.next_to_update3;
                 table3_base
             };
             // hash3 short-match probe folded inline (was a separate per-kernel
@@ -807,7 +812,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 if !rep_len_candidate_found
                     && (h3.match_len > $sufficient_len || h3.match_len >= tail_limit)
                 {
-                    $table.skip_insert_until_abs = $abs_pos + 1;
+                    $cursors.tree = $abs_pos + 1;
                     skip_further_match_search = true;
                 }
             }
@@ -1175,7 +1180,7 @@ macro_rules! bt_insert_and_collect_matches_body {
 
         // `match_end_abs >= abs_pos + 9 >= 9` (initialized and monotonic),
         // so `match_end_abs - 8 >= 1` cannot underflow.
-        $table.skip_insert_until_abs = match_end_abs - 8;
+        $cursors.tree = match_end_abs - 8;
     }};
 }
 pub(crate) use bt_insert_and_collect_matches_body;

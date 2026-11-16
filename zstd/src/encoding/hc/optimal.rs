@@ -45,7 +45,7 @@ use crate::encoding::{
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
         HcBlockPass, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
-        MatchCandidate,
+        HcSearchCursors, MatchCandidate,
     },
 };
 
@@ -60,6 +60,7 @@ type OptimalCollectFn = unsafe fn(
     &[u32; 3],
     bool,
     &mut RegionVec<MatchCandidate>,
+    &mut HcSearchCursors,
 );
 
 macro_rules! build_optimal_plan_impl_body {
@@ -74,6 +75,8 @@ macro_rules! build_optimal_plan_impl_body {
         $out:ident,
         $buffers:expr,
         $collect:ident,
+        // The pass's insert cursors (`&mut HcSearchCursors`).
+        $cursors:ident,
         // The tier's price-set macro (`priceset::priceset_<tier>`).
         $priceset:ident,
         // The whole block and its statistics: the traceback records each
@@ -244,6 +247,7 @@ macro_rules! build_optimal_plan_impl_body {
                         &initial_reps,
                         no_literals_before,
                         &mut *candidates,
+                        &mut *$cursors,
                     )
                 };
                 if !candidates.is_empty() {
@@ -349,6 +353,7 @@ macro_rules! build_optimal_plan_impl_body {
                         &initial_reps,
                         initial_litlen == 0,
                         &mut *candidates,
+                        &mut *$cursors,
                     )
                 };
                 // The long-distance candidate joins after the search, as
@@ -753,6 +758,7 @@ macro_rules! build_optimal_plan_impl_body {
                     &(*nodes.add(pos)).reps,
                     (*nodes.add(pos)).litlen == 0,
                     &mut *candidates,
+                    &mut *$cursors,
                 )
             };
             if HAS_LDM {
@@ -1125,11 +1131,17 @@ macro_rules! optimal_block_body {
         // The block is armed, so the tree's coordinates hold for the whole pass.
         $self.table.capture_block_coords();
         // The tree's insert cursor starts inside the history, so no search has
-        // to pull it up: within the pass it only moves forward.
-        $self.table.skip_insert_until_abs = $self
-            .table
-            .skip_insert_until_abs
-            .max($self.table.history_abs_start);
+        // to pull it up: within the pass it only moves forward. The pass holds
+        // both cursors in its frame and hands them back at its end (see
+        // `HcSearchCursors`); nothing else reads them during the pass.
+        let mut cursors = HcSearchCursors {
+            tree: $self
+                .table
+                .skip_insert_until_abs
+                .max($self.table.history_abs_start),
+            hash3: $self.table.next_to_update3,
+        };
+        let cursors_ref = &mut cursors;
         // The search's key width is fixed for the block, so the search built
         // for it is chosen once here and every position calls it directly, as
         // upstream picks `ZSTD_btGetAllMatches_<dictMode>_<mls>` per block
@@ -1180,6 +1192,7 @@ macro_rules! optimal_block_body {
                     $plan,
                     $buffers,
                     collect,
+                    cursors_ref,
                     $priceset,
                     $current,
                     $opt_state,
@@ -1192,6 +1205,8 @@ macro_rules! optimal_block_body {
             pass.litlen = end_litlen;
             pass.cursor += consumed_len;
         }
+        $self.table.skip_insert_until_abs = cursors.tree;
+        $self.table.next_to_update3 = cursors.hash3;
     }};
 }
 
@@ -1213,6 +1228,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $reps:ident,
         $ll0:ident,
         $out:ident,
+        $cursors:ident,
         $mls:expr,
         $bt_insert_range:ident,
         $cpl:path,
@@ -1243,7 +1259,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         // (mls == 3) ? 3 : 4`, the floor every candidate has to beat.
         let min_match_len = if use_hash3 { 3 } else { 4 };
         $out.clear();
-        if $abs_pos < $self.table.skip_insert_until_abs {
+        if $abs_pos < $cursors.tree {
             return;
         }
         {
@@ -1253,7 +1269,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             // with no clamp (a long match skips the positions it covers),
             // exactly as upstream. The pass starts the cursor inside the
             // history and only ever moves it forward.
-            let update_abs = $self.table.skip_insert_until_abs;
+            let update_abs = $cursors.tree;
             debug_assert!(update_abs >= $self.table.history_abs_start);
             // No rebase guard: `arm_block_positions` cleared every position in
             // this block before the parse began, and the catch-up only inserts
@@ -1271,7 +1287,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     )
                 };
             }
-            $self.table.skip_insert_until_abs = $abs_pos;
+            $cursors.tree = $abs_pos;
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
         // Every probe below reads up to eight bytes at the position; the parser
@@ -1303,6 +1319,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $out,
                 $reps,
                 $ll0,
+                $cursors,
                 use_hash3,
                 key_mls,
                 $cpl,
@@ -2121,10 +2138,13 @@ impl HcMatchGenerator {
         self.table.capture_block_coords();
         // As a block's pass starts it (see `optimal_block_body!`), and with
         // the room the search writes its candidates into.
-        self.table.skip_insert_until_abs = self
-            .table
-            .skip_insert_until_abs
-            .max(self.table.history_abs_start);
+        let mut cursors = HcSearchCursors {
+            tree: self
+                .table
+                .skip_insert_until_abs
+                .max(self.table.history_abs_start),
+            hash3: self.table.next_to_update3,
+        };
         out.clear();
         // The room the search writes into, as the block's pass holds it; the
         // candidates are copied out for the caller at the end.
@@ -2150,6 +2170,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         &mut found,
+                        &mut cursors,
                     ),
                     5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
                         abs_pos,
@@ -2158,6 +2179,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         &mut found,
+                        &mut cursors,
                     ),
                     6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
                         abs_pos,
@@ -2166,6 +2188,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         &mut found,
+                        &mut cursors,
                     ),
                     _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
                         abs_pos,
@@ -2174,6 +2197,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         &mut found,
+                        &mut cursors,
                     ),
                 }
             };
@@ -2196,6 +2220,8 @@ impl HcMatchGenerator {
                 )
             }
         }
+        self.table.skip_insert_until_abs = cursors.tree;
+        self.table.next_to_update3 = cursors.hash3;
         if let Some(ldm) = query.ldm_candidate {
             BtMatcher::push_ldm_candidate(&mut found, ldm, self.table.opt_min_match());
         }
@@ -2222,6 +2248,7 @@ impl HcMatchGenerator {
     /// and a `--no-default-features --features kernel-scalar` build are what
     /// cover the rest.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub(crate) fn collect_optimal_candidates_initialized<
         S: crate::encoding::strategy::Strategy,
@@ -2235,6 +2262,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         #[cfg(all(
             target_arch = "aarch64",
@@ -2249,6 +2277,7 @@ impl HcMatchGenerator {
                 reps,
                 ll0,
                 out,
+                cursors,
             )
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2264,6 +2293,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         out,
+                        cursors,
                     )
                 },
                 #[cfg(feature = "kernel-sse")]
@@ -2275,6 +2305,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         out,
+                        cursors,
                     )
                 },
                 #[cfg(feature = "kernel-sse")]
@@ -2286,6 +2317,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         out,
+                        cursors,
                     )
                 },
                 FastpathKernel::Scalar => self
@@ -2296,6 +2328,7 @@ impl HcMatchGenerator {
                         reps,
                         ll0,
                         out,
+                        cursors,
                     ),
             })
         }
@@ -2316,6 +2349,7 @@ impl HcMatchGenerator {
                 reps,
                 ll0,
                 out,
+                cursors,
             )
         }
         #[cfg(not(any(
@@ -2340,6 +2374,7 @@ impl HcMatchGenerator {
                 reps,
                 ll0,
                 out,
+                cursors,
             )
         }
     }
@@ -2355,6 +2390,7 @@ impl HcMatchGenerator {
     ))]
     #[target_feature(enable = "neon")]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
@@ -2366,6 +2402,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2376,6 +2413,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
@@ -2389,6 +2427,7 @@ impl HcMatchGenerator {
     ))]
     #[target_feature(enable = "sse4.2")]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
@@ -2400,6 +2439,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2410,6 +2450,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
@@ -2429,6 +2470,7 @@ impl HcMatchGenerator {
     ))]
     #[target_feature(enable = "sse2")]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn collect_optimal_candidates_initialized_sse2<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
@@ -2440,6 +2482,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2450,6 +2493,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
@@ -2463,6 +2507,7 @@ impl HcMatchGenerator {
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
@@ -2474,6 +2519,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2484,6 +2530,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
@@ -2504,6 +2551,7 @@ impl HcMatchGenerator {
     ))]
     #[target_feature(enable = "simd128")]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn collect_optimal_candidates_initialized_simd128<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
@@ -2515,6 +2563,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2525,6 +2574,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_simd128,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
@@ -2540,6 +2590,7 @@ impl HcMatchGenerator {
     // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
     // callees are safe so the blocks are redundant here only.
     #[allow(unused_unsafe)]
+    #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
@@ -2552,6 +2603,7 @@ impl HcMatchGenerator {
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<MatchCandidate>,
+        cursors: &mut HcSearchCursors,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2562,6 +2614,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            cursors,
             MLS,
             bt_insert_range_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
