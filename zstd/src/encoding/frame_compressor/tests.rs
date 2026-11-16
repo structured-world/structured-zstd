@@ -1697,6 +1697,46 @@ fn reused_compressor_matches_a_fresh_one_across_dictionaries_and_sizes() {
     }
 }
 
+/// A binary-tree level told to attach its dictionary keeps a snapshot of the
+/// dictionary's state without the live tree, and a reused compressor restoring
+/// it frame after frame writes what a fresh compressor with the same
+/// dictionary and mode writes.
+#[test]
+fn an_attached_tree_dictionary_restores_as_a_fresh_compressor_primes_it() {
+    use crate::encoding::{CompressionParameters, DictionaryAttachMode};
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let dict = &corpus[100_000..152_000];
+    let prepare = || super::EncoderDictionary::from_serialized_or_raw_content(dict).unwrap();
+    for level in [13, 16, 19, 22] {
+        let compression_level = super::CompressionLevel::Level(level);
+        let params = CompressionParameters::builder(compression_level)
+            .dictionary_attach(DictionaryAttachMode::Attach)
+            .build()
+            .unwrap();
+        let mut compressor: FrameCompressor = FrameCompressor::new(compression_level);
+        compressor.set_parameters(&params);
+        compressor.set_encoder_dictionary(prepare()).unwrap();
+        for (start, size) in [(200_000, 3_000), (400_000, 6_000), (600_000, 1_500)] {
+            let input = &corpus[start..start + size];
+            let frame = compressor.compress_independent_frame(input);
+            let mut fresh: FrameCompressor = FrameCompressor::new(compression_level);
+            fresh.set_parameters(&params);
+            fresh.set_encoder_dictionary(prepare()).unwrap();
+            assert!(
+                frame == fresh.compress_independent_frame(input),
+                "level {level}, {size} bytes at {start}"
+            );
+            let handle =
+                crate::decoding::DictionaryHandle::from_serialized_or_raw_content(dict).unwrap();
+            let mut out = vec![0u8; size];
+            let written = FrameDecoder::new()
+                .decode_all_with_dict_handle(&frame, &mut out, &handle)
+                .unwrap();
+            assert_eq!(&out[..written], input);
+        }
+    }
+}
+
 /// A dictionary index built with one key width or search depth is not taken
 /// back for parameters that hash or sort it differently: after
 /// `set_parameters` moves `min_match` or `search_log` with the table

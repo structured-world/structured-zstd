@@ -821,6 +821,49 @@ fn reused_buffers_stay_within_their_maximums() {
     }
 }
 
+/// A scratch given no workspace room builds the weight description's FSE table
+/// in an allocation of its own and keeps it across frames, so its footprint,
+/// which `ZSTD_sizeof_CCtx` reports, has to count that table.
+#[test]
+fn an_owned_weight_fse_table_counts_in_the_footprint() {
+    let mut scratch = WeightScratch::default();
+    let before = scratch.heap_size();
+    let _ = scratch.weight_fse_table();
+    assert_eq!(
+        scratch.heap_size(),
+        before + core::mem::size_of::<fse_encoder::FSETable>()
+    );
+    assert!(scratch.heap_size() <= WeightScratch::max_heap_size());
+}
+
+/// The weight FSE table bound to a frame's workspace room is the workspace's,
+/// not the scratch's, and a frame that lays out no room (a raw frame) drops
+/// it: the table must not outlive the layout it was carved from, so the next
+/// use takes an allocation of its own.
+#[cfg(feature = "std")]
+#[test]
+fn an_unbound_weight_fse_table_leaves_the_workspace_room() {
+    use crate::encoding::workspace::{FRESH_PAGES_FROM, IngestPlan, Workspace, no_trailing};
+    let mut ws = Workspace::new();
+    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+    ws.reserve_on_fresh_pages(WeightScratch::workspace_bytes());
+    ws.open(FRESH_PAGES_FROM, usize::MAX);
+    let mut scratch = WeightScratch::default();
+    scratch.bind(&mut ws);
+    let _ = scratch.weight_fse_table();
+    assert_eq!(
+        scratch.heap_size(),
+        0,
+        "workspace room is not the scratch's"
+    );
+    scratch.unbind();
+    let _ = scratch.weight_fse_table();
+    assert_eq!(
+        scratch.heap_size(),
+        core::mem::size_of::<fse_encoder::FSETable>()
+    );
+}
+
 /// The single-build path reads its table off the limited leaves, and the
 /// weight route builds it from a weight per symbol; for the same code the two
 /// must give identical codes, packed codes and table log, or the literals the

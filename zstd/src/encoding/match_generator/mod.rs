@@ -2270,29 +2270,32 @@ impl MatchGeneratorDriver {
             // block would index: no later block follows, and the next frame
             // starts a window past it or, behind a dictionary, verifies every
             // candidate it takes. Unsearched, that block is then only staged.
-            let incompressible_hint = if block_end == self.borrowed_len {
+            let last_block = block_end == self.borrowed_len;
+            let staged_hint = if last_block {
                 None
             } else {
                 incompressible_hint
             };
             match self.active_backend() {
-                super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
-                    block_start,
-                    block_end,
-                    incompressible_hint,
-                ),
+                super::strategy::BackendTag::Simple => {
+                    self.simple_mut()
+                        .skip_matching_borrowed(block_start, block_end, staged_hint)
+                }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
-                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
+                    .skip_matching_borrowed(block_start, block_end, staged_hint),
                 super::strategy::BackendTag::Row => self.row_matcher_mut().skip_matching_borrowed(
                     block_start,
                     block_end,
-                    incompressible_hint,
+                    staged_hint,
                 ),
                 // The block was staged with `set_borrowed_block`; the skip
-                // indexes it like an owned one.
+                // indexes it like an owned one, and the last one not at all:
+                // the tree has no "staged only" form short of leaving it alone.
                 super::strategy::BackendTag::HashChain => {
-                    self.skip_backend::<K>(incompressible_hint)
+                    if !last_block {
+                        self.skip_backend::<K>(incompressible_hint)
+                    }
                 }
             }
             return;

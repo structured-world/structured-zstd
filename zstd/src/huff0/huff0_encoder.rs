@@ -1939,11 +1939,14 @@ impl WeightScratch {
     ///
     /// A parked table contributes its own heap bytes only: the table object
     /// sits inline here, as the two buffers' headers do, and none of them
-    /// are an allocation of this scratch's making.
+    /// are an allocation of this scratch's making. The weight FSE table counts
+    /// only when it holds an allocation of its own; room in the workspace is
+    /// counted with the workspace.
     pub(crate) fn heap_size(&self) -> usize {
         self.leaves.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
             + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
+            + self.weight_fse_table.owned_bytes()
     }
 
     /// The most memory this scratch keeps beyond its buffers' headers: the

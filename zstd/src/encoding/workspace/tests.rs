@@ -42,16 +42,23 @@ fn fresh_page_room_is_given_only_where_the_layout_is_fresh() {
     ws.open(4096, usize::MAX);
     assert_eq!(ws.capacity(), 4096);
     assert!(ws.fresh_room::<u64>(16).is_none());
-    // A fresh allocation from the fresh-page size up: the room, zeroed.
+    // A fresh allocation from the fresh-page size up: the room, zeroed. An
+    // application-supplied allocator (no `std`) makes no fresh-page promise,
+    // so there the room is never given.
     let mut ws = Workspace::new();
     ws.begin_layout(0, no_trailing, IngestPlan::Stream);
     ws.reserve_on_fresh_pages(room);
     ws.open(FRESH_PAGES_FROM, usize::MAX);
-    assert_eq!(ws.capacity(), FRESH_PAGES_FROM + room);
-    let given = ws
-        .fresh_room::<u64>(16)
-        .expect("a fresh layout gives the room");
-    assert!(given.as_slice().iter().all(|&value| value == 0));
+    if SYSTEM_ALLOCATOR {
+        assert_eq!(ws.capacity(), FRESH_PAGES_FROM + room);
+        let given = ws
+            .fresh_room::<u64>(16)
+            .expect("a fresh layout gives the room");
+        assert!(given.as_slice().iter().all(|&value| value == 0));
+    } else {
+        assert_eq!(ws.capacity(), FRESH_PAGES_FROM);
+        assert!(ws.fresh_room::<u64>(16).is_none());
+    }
     // The same layout again stays in that allocation: no zeros to give.
     ws.begin_layout(0, no_trailing, IngestPlan::Stream);
     ws.reserve_on_fresh_pages(room);

@@ -150,11 +150,11 @@ const TOO_LARGE_MAX_LAYOUTS: u32 = 128;
 /// (`malloc/malloc.c`): 512 KiB on 32-bit targets, 32 MiB on 64-bit ones.
 /// Other allocators take the glibc 64-bit ceiling, the one that assumes least.
 #[cfg(target_env = "musl")]
-const FRESH_PAGES_FROM: usize = 128 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 128 * 1024;
 #[cfg(all(not(target_env = "musl"), target_pointer_width = "32"))]
-const FRESH_PAGES_FROM: usize = 512 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 512 * 1024;
 #[cfg(all(not(target_env = "musl"), not(target_pointer_width = "32")))]
-const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
+pub(crate) const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
 
 /// The page a fault maps, the unit [`Workspace::table_after`] reasons about.
 const PAGE_BYTES: usize = 4096;
