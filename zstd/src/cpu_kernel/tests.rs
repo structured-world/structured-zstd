@@ -366,7 +366,8 @@ fn far_copies_take_string_moves_on_intel_and_zen5_with_erms() {
 }
 
 /// The vendor string's three words name Intel and AMD and nothing else:
-/// Hygon (a Zen 1 derivative) and an unknown string are other vendors.
+/// Hygon (a Zen 1 derivative), Zhaoxin (whose string is padded with spaces)
+/// and an unknown string are other vendors.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[test]
 fn the_vendor_string_names_intel_amd_or_another() {
@@ -379,6 +380,7 @@ fn the_vendor_string_names_intel_amd_or_another() {
         (b"GenuineIntel", CpuVendor::Intel),
         (b"AuthenticAMD", CpuVendor::Amd),
         (b"HygonGenuine", CpuVendor::Other),
+        (b"  Shanghai  ", CpuVendor::Other),
         (b"GenuineIotel", CpuVendor::Other),
     ] {
         let (ebx, edx, ecx) = words(name);
@@ -436,7 +438,8 @@ fn string_moves_win_on_intel_and_amd_from_zen5() {
 }
 
 /// The CPUID read returns the registers in place: leaf 0 reports at least leaf
-/// 1, and its EBX, EDX, ECX spell a vendor string of twelve printable bytes.
+/// 1, and its EBX, EDX, ECX spell a vendor string of twelve printable bytes,
+/// spaces included (Zhaoxin's is "  Shanghai  ").
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[test]
 fn cpuid_leaf_zero_spells_a_vendor_string() {
@@ -447,7 +450,7 @@ fn cpuid_leaf_zero_spells_a_vendor_string() {
     name[..4].copy_from_slice(&ebx.to_le_bytes());
     name[4..8].copy_from_slice(&edx.to_le_bytes());
     name[8..].copy_from_slice(&ecx.to_le_bytes());
-    assert!(name.iter().all(|b| b.is_ascii_graphic()));
+    assert!(name.iter().all(|&b| b == b' ' || b.is_ascii_graphic()));
     // Leaf 1's family is never zero.
     assert!(cpu_family() != 0);
 }
