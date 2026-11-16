@@ -1031,11 +1031,48 @@ enum CpuVendor {
     Other,
 }
 
+/// EAX, EBX, ECX and EDX of CPUID `leaf` (subleaf 0).
+///
+/// `core::arch::x86_64::__cpuid` is an `unsafe fn` on the crate's minimum
+/// compiler and a safe one on later ones, so calling it would need an `unsafe`
+/// block on the first and trip `unused_unsafe` on the second; the instruction
+/// is issued here instead, the way `__cpuid` issues it.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn cpuid(leaf: u32) -> [u32; 4] {
+    let eax: u32;
+    let ebx: u64;
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: every x86_64 CPU has CPUID, which writes only EAX-EDX. RBX is
+    // reserved by the compiler, so it is kept in a scratch register around the
+    // instruction and swapped back, leaving the leaf's EBX in the scratch one.
+    unsafe {
+        core::arch::asm!(
+            "mov {ebx}, rbx",
+            "cpuid",
+            "xchg {ebx}, rbx",
+            ebx = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => ecx,
+            out("edx") edx,
+            options(nostack, preserves_flags),
+        );
+    }
+    // The upper half of RBX after CPUID is zero; EBX is the low half.
+    [eax, ebx as u32, ecx, edx]
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 fn cpu_vendor() -> CpuVendor {
-    let id = core::arch::x86_64::__cpuid(0);
-    // The vendor string's three words, in EBX, EDX, ECX order.
-    match (id.ebx, id.edx, id.ecx) {
+    let [_, ebx, ecx, edx] = cpuid(0);
+    vendor_from_cpuid(ebx, edx, ecx)
+}
+
+/// The vendor named by CPUID leaf 0's vendor string, its three words in EBX,
+/// EDX, ECX order.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn vendor_from_cpuid(ebx: u32, edx: u32, ecx: u32) -> CpuVendor {
+    match (ebx, edx, ecx) {
         // "Genu" "ineI" "ntel"
         (0x756e_6547, 0x4965_6e69, 0x6c65_746e) => CpuVendor::Intel,
         // "Auth" "enti" "cAMD"
@@ -1044,11 +1081,16 @@ fn cpu_vendor() -> CpuVendor {
     }
 }
 
-/// The CPU's display family (CPUID leaf 1 EAX): the base family, plus the
-/// extended family when the base is 0xF.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 fn cpu_family() -> u32 {
-    let eax = core::arch::x86_64::__cpuid(1).eax;
+    let [eax, ..] = cpuid(1);
+    display_family(eax)
+}
+
+/// The display family in CPUID leaf 1 EAX: the base family, plus the extended
+/// family when the base is 0xF.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn display_family(eax: u32) -> u32 {
     let base = (eax >> 8) & 0xf;
     if base == 0xf {
         base + ((eax >> 20) & 0xff)
@@ -1061,11 +1103,17 @@ fn cpu_family() -> u32 {
 /// far source (see [`detect_far_copy_by_string_moves`]).
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 fn string_moves_win_far_copies() -> bool {
+    string_moves_win_on(cpu_vendor(), cpu_family())
+}
+
+/// [`string_moves_win_far_copies`] for a given vendor and display family.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn string_moves_win_on(vendor: CpuVendor, family: u32) -> bool {
     /// AMD family 0x1A, Zen 5.
     const AMD_ZEN5_FAMILY: u32 = 0x1a;
-    match cpu_vendor() {
+    match vendor {
         CpuVendor::Intel => true,
-        CpuVendor::Amd => cpu_family() >= AMD_ZEN5_FAMILY,
+        CpuVendor::Amd => family >= AMD_ZEN5_FAMILY,
         CpuVendor::Other => false,
     }
 }
