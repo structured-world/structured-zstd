@@ -230,7 +230,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // Answered here, where the scratch is built, and kept across frame
         // resets: a frame pays nothing for it.
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        buffer.set_fast_string_moves(crate::cpu_kernel::detect_fast_string_moves());
+        buffer.set_far_copy_by_string_moves(crate::cpu_kernel::detect_far_copy_by_string_moves());
         DecoderScratch {
             #[cfg(not(feature = "caller-workspace"))]
             huf: HuffmanScratch {

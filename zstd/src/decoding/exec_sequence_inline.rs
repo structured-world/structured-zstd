@@ -114,9 +114,9 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
 ///
-/// `$fast_string_moves` is expanded only on the long-match and tight-tail
-/// paths, so the caller can name the buffer's kept answer there without the
-/// sequence loop carrying it.
+/// `$far_copy_by_string_moves` is expanded only on the long-match and
+/// tight-tail paths, so the caller can name the buffer's kept answer there
+/// without the sequence loop carrying it.
 ///
 /// # Safety
 /// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
@@ -124,7 +124,7 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// must be readable for the literal length rounded up to 16.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline_at {
-    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr, $fast_string_moves:expr) => {{
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr, $far_copy_by_string_moves:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
@@ -160,7 +160,7 @@ macro_rules! exec_sequence_avx2_inline_at {
                         lit_length_v,
                         offset_v,
                         match_length_v,
-                        $fast_string_moves,
+                        $far_copy_by_string_moves,
                     );
                 }
                 total
@@ -191,7 +191,7 @@ macro_rules! exec_sequence_avx2_inline_at {
                         op_match,
                         offset_v,
                         match_length_v,
-                        $fast_string_moves,
+                        $far_copy_by_string_moves,
                     );
                 } else if offset_v >= 16 {
                     wildcopy_no_overlap(op_match, match_src, match_length_v);
@@ -511,8 +511,8 @@ pub(crate) mod x86 {
     /// Out of line: it runs on rare long matches, where a call costs nothing
     /// beside the copy, and keeps its loops out of the sequence loop's code.
     ///
-    /// `fast_string_moves` is the decoder's kept answer to
-    /// [`crate::cpu_kernel::detect_fast_string_moves`].
+    /// `far_copy_by_string_moves` is the decoder's kept answer to
+    /// [`crate::cpu_kernel::detect_far_copy_by_string_moves`].
     ///
     /// # Safety
     /// The CPU has AVX2; `offset >= 1` bytes of output are in place before
@@ -525,16 +525,17 @@ pub(crate) mod x86 {
         dst: *mut u8,
         offset: usize,
         length: usize,
-        fast_string_moves: bool,
+        far_copy_by_string_moves: bool,
     ) {
         // Above the bytes a store buffer of a few dozen 32-byte entries holds.
         const DOUBLING_DISTANCE_LIMIT: usize = 2048;
         // A piece this long from a source this far back (a long-distance match,
-        // whose source lies beyond the caches) goes, with fast string moves,
-        // by `rep movsb`, as libc memcpy moves it (glibc's
-        // `__x86_rep_movsb_threshold` for 32-byte vectors). A short-offset
-        // match never gets there: its distance stops doubling below it, and
-        // the vector loop over a near source outruns `rep movsb`.
+        // whose source lies beyond the caches) goes by `rep movsb` where the
+        // decoder chose it, as libc memcpy moves it (glibc's
+        // `__x86_rep_movsb_threshold` for 32-byte vectors), and by the vector
+        // loop elsewhere. A short-offset match never gets there: its distance
+        // stops doubling below it, and the vector loop over a near source
+        // outruns `rep movsb`.
         const REP_MOVSB_MIN: usize = 4096;
         unsafe {
             let mut written = 0usize;
@@ -552,7 +553,7 @@ pub(crate) mod x86 {
             while written < length {
                 let piece = distance.min(length - written);
                 let at = dst.add(written);
-                if fast_string_moves && distance >= REP_MOVSB_MIN && piece >= REP_MOVSB_MIN {
+                if far_copy_by_string_moves && distance >= REP_MOVSB_MIN && piece >= REP_MOVSB_MIN {
                     // As glibc does, the string move starts on a 64-byte
                     // boundary of the destination, where its microcode runs
                     // fastest; the head goes by two vector moves first.
@@ -591,7 +592,7 @@ pub(crate) mod x86 {
     /// doubled piece.
     ///
     /// Out of line: it runs once at the end of such a frame.
-    /// `fast_string_moves` goes to [`match_copy_doubling_avx2`].
+    /// `far_copy_by_string_moves` goes to [`match_copy_doubling_avx2`].
     ///
     /// # Safety
     /// The CPU has AVX2; `base` is valid for writes through
@@ -612,7 +613,7 @@ pub(crate) mod x86 {
         lit_length: usize,
         offset: usize,
         match_length: usize,
-        fast_string_moves: bool,
+        far_copy_by_string_moves: bool,
     ) {
         unsafe {
             let match_at = tail + lit_length;
@@ -639,7 +640,7 @@ pub(crate) mod x86 {
             let rest = match_length - head;
             let op_match = base.add(match_at);
             if head >= 256 {
-                match_copy_doubling_avx2(op_match, offset, head, fast_string_moves);
+                match_copy_doubling_avx2(op_match, offset, head, far_copy_by_string_moves);
             } else if head > 0 {
                 wildcopy_no_overlap(op_match, op_match.sub(offset), head);
             }

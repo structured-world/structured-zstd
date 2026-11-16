@@ -5024,9 +5024,9 @@ impl FrameDecoder {
         // The scratch's buffer took the string-move answer when it was built;
         // this frame's buffer over the caller's slice copies it from there.
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        let fast_string_moves = match &state.decoder_scratch {
-            DecoderScratchKind::Flat(s) => s.buffer.fast_string_moves(),
-            DecoderScratchKind::Ring(s) => s.buffer.fast_string_moves(),
+        let far_copy_by_string_moves = match &state.decoder_scratch {
+            DecoderScratchKind::Flat(s) => s.buffer.far_copy_by_string_moves(),
+            DecoderScratchKind::Ring(s) => s.buffer.far_copy_by_string_moves(),
         };
         let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
@@ -5051,7 +5051,7 @@ impl FrameDecoder {
         let mut buffer = DecodeBuffer::from_backend(backend, window_size);
         buffer.set_block_limit(block_limit);
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        buffer.set_fast_string_moves(fast_string_moves);
+        buffer.set_far_copy_by_string_moves(far_copy_by_string_moves);
         let mut direct = DirectScratch {
             huf,
             fse,

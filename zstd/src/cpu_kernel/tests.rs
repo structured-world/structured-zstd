@@ -314,3 +314,53 @@ fn active_kernel_name_is_stable_across_calls() {
     // return the identical static string.
     assert_eq!(active_cpu_kernel_name(), active_cpu_kernel_name());
 }
+
+/// A far long match goes by `rep movsb` with ERMS on Intel and on AMD from
+/// Zen 5 (family 26) on, and by the vector loop on Zen 3 and Zen 4 (family 25,
+/// which report ERMS) and other vendors: the vendor and family read from CPUID
+/// agree with the kernel's `vendor_id` and `cpu family`, and the decision
+/// follows them and the ERMS flag.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "kernel-avx2",
+    feature = "std"
+))]
+#[test]
+fn far_copies_take_string_moves_on_intel_and_zen5_with_erms() {
+    /// The first `name : value` line's value.
+    fn field<'a>(cpuinfo: &'a str, name: &str) -> &'a str {
+        cpuinfo
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim() == name)
+            .map(|(_, value)| value.trim())
+            .unwrap_or_else(|| panic!("{name} in /proc/cpuinfo"))
+    }
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").expect("read /proc/cpuinfo");
+    let vendor = field(&cpuinfo, "vendor_id");
+    let family: u32 = field(&cpuinfo, "cpu family")
+        .parse()
+        .expect("cpu family is a number");
+    let expected_vendor = match vendor {
+        "GenuineIntel" => CpuVendor::Intel,
+        "AuthenticAMD" => CpuVendor::Amd,
+        _ => CpuVendor::Other,
+    };
+    assert_eq!(cpu_vendor(), expected_vendor, "vendor {vendor}");
+    assert_eq!(cpu_family(), family, "vendor {vendor}");
+    let erms = std::arch::is_x86_feature_detected!("ermsb");
+    let wins = match expected_vendor {
+        CpuVendor::Intel => true,
+        CpuVendor::Amd => family >= 26,
+        CpuVendor::Other => false,
+    };
+    assert_eq!(
+        detect_far_copy_by_string_moves(),
+        wins && erms,
+        "vendor {vendor} family {family} erms {erms}"
+    );
+    if expected_vendor == CpuVendor::Amd && family == 25 {
+        assert!(!detect_far_copy_by_string_moves(), "Zen 3 and Zen 4");
+    }
+}
