@@ -578,19 +578,28 @@ jobs:
     needs: lint
     timeout-minutes: 15
     runs-on: ubuntu-latest
+    env:
+      # The crate's `rust-version`.
+      MSRV: "1.92.0"
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
+          toolchain: ${{ env.MSRV }}
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: msrv
+      # The repository's rust-toolchain.toml selects stable for every cargo run
+      # in the checkout, over the toolchain installed above, so the MSRV is
+      # named on each command; the version line proves which one built.
       - name: Test (MSRV)
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
+        run: |
+          cargo +"$MSRV" --version
+          rustc +"$MSRV" --version
+          cargo +"$MSRV" nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
 
   no-std:
     # Build-only smoke test that the crate compiles under no_std + alloc.
