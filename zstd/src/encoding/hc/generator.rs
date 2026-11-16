@@ -1321,6 +1321,39 @@ impl HcMatchGenerator {
         self.bt.reset();
     }
 
+    /// A copy of the dictionary's state (tables, window, search knobs) for a
+    /// primed snapshot, without the optimal parser's per-frame state: a
+    /// restore keeps that from the frame it restores into.
+    pub(crate) fn dictionary_snapshot(&self) -> Self {
+        let Self {
+            table,
+            hc,
+            bt: _,
+            strategy_tag,
+        } = self;
+        Self {
+            table: table.clone(),
+            hc: hc.clone(),
+            bt: alloc::boxed::Box::new(crate::encoding::bt::BtMatcher::new()),
+            strategy_tag: *strategy_tag,
+        }
+    }
+
+    /// Takes the dictionary's state from `snapshot` and keeps this frame's
+    /// optimal parser state, whose scratch the reset laid out in the
+    /// workspace.
+    pub(crate) fn restore_dictionary_state(&mut self, snapshot: &Self) {
+        let Self {
+            table,
+            hc,
+            bt: _,
+            strategy_tag,
+        } = snapshot;
+        self.table = table.clone();
+        self.hc = hc.clone();
+        self.strategy_tag = *strategy_tag;
+    }
+
     /// Index the last committed block without searching it.
     pub(crate) fn skip_matching<K: EncodeTier>(&mut self, incompressible_hint: Option<bool>) {
         self.table.skip_matching::<K>(incompressible_hint);

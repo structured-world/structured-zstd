@@ -5904,3 +5904,46 @@ fn a_driver_counts_its_own_workspace_and_not_a_contexts() {
         );
     }
 }
+
+/// A primed binary-tree dictionary is restored into the frame's own optimal
+/// parser state: the reset laid its scratch out in the workspace, and the
+/// restore takes only the dictionary's state from the snapshot. A restore that
+/// replaced the parser with the snapshot's would allocate and copy its scratch
+/// on every frame of a reused dictionary context, and the snapshot would keep
+/// a copy of scratch it never reads.
+#[test]
+fn a_primed_tree_dictionary_restores_into_the_frames_parser_state() {
+    for level in [16, 19, 22] {
+        let level = CompressionLevel::Level(level);
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(10 * 1024);
+        driver.reset(level);
+        driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnopqrstuvwx", [1, 4, 8]);
+        driver.capture_primed_dictionary(level);
+        let Some((MatcherStorage::HashChain(snapshot), ..)) = &driver.primed else {
+            panic!("{level:?}: a binary-tree snapshot was captured");
+        };
+        assert_eq!(
+            snapshot.bt.heap_size(),
+            0,
+            "{level:?}: the snapshot holds parser scratch"
+        );
+
+        driver.set_source_size_hint(10 * 1024);
+        driver.reset(level);
+        let parser: *const crate::encoding::bt::BtMatcher = &*driver.hc_matcher().bt;
+        assert!(
+            driver.restore_primed_dictionary(level),
+            "{level:?}: restored"
+        );
+        assert!(
+            core::ptr::eq(parser, &*driver.hc_matcher().bt),
+            "{level:?}: the restore replaced the frame's parser state"
+        );
+        assert_eq!(
+            driver.hc_matcher().bt.heap_size(),
+            0,
+            "{level:?}: the parser scratch left the workspace"
+        );
+    }
+}
