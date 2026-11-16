@@ -1188,6 +1188,36 @@ fn an_optimal_frame_read_in_place_writes_the_owned_frame() {
     }
 }
 
+/// The decodecorpus file, a frame of several blocks that fits the window and
+/// whose blocks the post-split cuts: read in place it writes the owned frame
+/// at each optimal strategy, which the synthetic payloads above never cut.
+#[test]
+fn an_optimal_corpus_frame_read_in_place_writes_the_owned_frame() {
+    let corpus: &[u8] = include_bytes!("../../../decodecorpus_files/z000033");
+    for level in [16, 19, 22] {
+        let level = super::CompressionLevel::Level(level);
+        let mut owned_frame = Vec::new();
+        let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+        owned.set_source_size_hint(corpus.len() as u64);
+        owned.set_source(corpus);
+        owned.set_drain(&mut owned_frame);
+        owned.compress();
+
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        let frame = compressor.compress_independent_frame(corpus);
+        assert!(
+            compressor.state.matcher.frame_scans_in_place(),
+            "{level:?}: the frame is read in place"
+        );
+        assert!(
+            frame == owned_frame,
+            "{level:?}: {} bytes in place, {} owned",
+            frame.len(),
+            owned_frame.len(),
+        );
+    }
+}
+
 /// The owned frame of a copied dictionary `dict` and `payload` at `level`,
 /// and the same frame read in place, fresh and from a restored snapshot.
 fn copied_dictionary_frames(
