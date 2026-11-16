@@ -64,11 +64,11 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// block out of its window buffer (`zstd_decompress.c`, `zdss_flush`).
     delivered: usize,
     /// Whether long matches from far back may go by `rep movsb`, see
-    /// [`crate::cpu_kernel::detect_fast_string_moves`]. Set by whoever builds
-    /// the buffer and kept across `reset`; read only on the rare long match
-    /// path, so it is never a live value in the sequence loop.
+    /// [`crate::cpu_kernel::detect_far_copy_by_string_moves`]. Set by whoever
+    /// builds the buffer and kept across `reset`; read only on the rare long
+    /// match path, so it is never a live value in the sequence loop.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-    fast_string_moves: bool,
+    far_copy_by_string_moves: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -135,7 +135,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-            fast_string_moves: false,
+            far_copy_by_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -168,7 +168,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             delivered: 0,
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-            fast_string_moves: false,
+            far_copy_by_string_moves: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -248,18 +248,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.block_limit = limit.min(crate::common::MAX_BLOCK_SIZE as usize);
     }
 
-    /// Apply the decoder's answer to [`crate::cpu_kernel::detect_fast_string_moves`].
+    /// Apply the decoder's answer to
+    /// [`crate::cpu_kernel::detect_far_copy_by_string_moves`].
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     #[inline]
-    pub(crate) fn set_fast_string_moves(&mut self, fast: bool) {
-        self.fast_string_moves = fast;
+    pub(crate) fn set_far_copy_by_string_moves(&mut self, by_string_moves: bool) {
+        self.far_copy_by_string_moves = by_string_moves;
     }
 
-    /// Whether long matches from far back may go by `rep movsb`.
+    /// Whether long matches from far back go by `rep movsb`.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     #[inline]
-    pub(crate) fn fast_string_moves(&self) -> bool {
-        self.fast_string_moves
+    pub(crate) fn far_copy_by_string_moves(&self) -> bool {
+        self.far_copy_by_string_moves
     }
 
     /// What the frame says it will produce in total, when it says so. The

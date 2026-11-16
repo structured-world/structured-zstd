@@ -993,19 +993,129 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     CpuKernelTag::Scalar
 }
 
-/// Whether the CPU moves strings fast (ERMS), for the AVX2 decoder's long
-/// matches from far back. Answered when a decoder is built and kept in it, as
-/// the kernel tier is; the decode reads the kept answer.
+/// Whether the AVX2 decoder copies a long match from far back by `rep movsb`
+/// rather than by its 32-byte vector loop: with fast string moves (ERMS), on
+/// Intel and on AMD from Zen 5 (family 0x1A) on. Answered when a decoder is
+/// built and kept in it, as the kernel tier is; the decode reads the kept
+/// answer.
+///
+/// The microarchitecture decides it, not the cache or the ERMS flag alone.
+/// Decoding 16 MiB copied as 128 KiB matches from 1-4 MiB back, `rep movsb`
+/// ran at 1.09-1.13 of libzstd against 0.93-0.95 for the vector loop on
+/// Broadwell, 1.7-1.9 against 1.10 on Ice Lake, level with it on Granite and
+/// Emerald Rapids, and 1.54-1.55 against 1.09-1.10 on Zen 5; Zen 3 and Zen 4
+/// report ERMS too and lost with it, 0.39-0.45 against 1.01-1.12 and 0.68-0.79
+/// against 1.09-1.36. Other vendors take the vector loop, the copy libzstd
+/// makes.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", feature = "std"))]
-pub(crate) fn detect_fast_string_moves() -> bool {
+pub(crate) fn detect_far_copy_by_string_moves() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::arch::is_x86_feature_detected!("ermsb"))
+    *CACHED.get_or_init(|| {
+        string_moves_win_far_copies() && std::arch::is_x86_feature_detected!("ermsb")
+    })
 }
 
-/// Without std the build's baseline answers.
+/// Without std the ERMS flag comes from the build's baseline; the CPU is
+/// still read for its vendor and family.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", not(feature = "std")))]
-pub(crate) fn detect_fast_string_moves() -> bool {
-    cfg!(target_feature = "ermsb")
+pub(crate) fn detect_far_copy_by_string_moves() -> bool {
+    cfg!(target_feature = "ermsb") && string_moves_win_far_copies()
+}
+
+/// The CPU's vendor, from the CPUID leaf 0 vendor string.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuVendor {
+    Intel,
+    Amd,
+    Other,
+}
+
+/// EAX, EBX, ECX and EDX of CPUID `leaf` (subleaf 0).
+///
+/// `core::arch::x86_64::__cpuid` is an `unsafe fn` on the crate's minimum
+/// compiler and a safe one on later ones, so calling it would need an `unsafe`
+/// block on the first and trip `unused_unsafe` on the second; the instruction
+/// is issued here instead, the way `__cpuid` issues it.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn cpuid(leaf: u32) -> [u32; 4] {
+    let eax: u32;
+    let ebx: u64;
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: every x86_64 CPU has CPUID, which writes only EAX-EDX. RBX is
+    // reserved by the compiler, so it is kept in a scratch register around the
+    // instruction and swapped back, leaving the leaf's EBX in the scratch one.
+    unsafe {
+        core::arch::asm!(
+            "mov {ebx}, rbx",
+            "cpuid",
+            "xchg {ebx}, rbx",
+            ebx = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => ecx,
+            out("edx") edx,
+            options(nostack, preserves_flags),
+        );
+    }
+    // The upper half of RBX after CPUID is zero; EBX is the low half.
+    [eax, ebx as u32, ecx, edx]
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn cpu_vendor() -> CpuVendor {
+    let [_, ebx, ecx, edx] = cpuid(0);
+    vendor_from_cpuid(ebx, edx, ecx)
+}
+
+/// The vendor named by CPUID leaf 0's vendor string, its three words in EBX,
+/// EDX, ECX order.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn vendor_from_cpuid(ebx: u32, edx: u32, ecx: u32) -> CpuVendor {
+    match (ebx, edx, ecx) {
+        // "Genu" "ineI" "ntel"
+        (0x756e_6547, 0x4965_6e69, 0x6c65_746e) => CpuVendor::Intel,
+        // "Auth" "enti" "cAMD"
+        (0x6874_7541, 0x6974_6e65, 0x444d_4163) => CpuVendor::Amd,
+        _ => CpuVendor::Other,
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn cpu_family() -> u32 {
+    let [eax, ..] = cpuid(1);
+    display_family(eax)
+}
+
+/// The display family in CPUID leaf 1 EAX: the base family, plus the extended
+/// family when the base is 0xF.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn display_family(eax: u32) -> u32 {
+    let base = (eax >> 8) & 0xf;
+    if base == 0xf {
+        base + ((eax >> 20) & 0xff)
+    } else {
+        base
+    }
+}
+
+/// Whether this microarchitecture's `rep movsb` outruns the vector loop on a
+/// far source (see [`detect_far_copy_by_string_moves`]).
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn string_moves_win_far_copies() -> bool {
+    string_moves_win_on(cpu_vendor(), cpu_family())
+}
+
+/// [`string_moves_win_far_copies`] for a given vendor and display family.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn string_moves_win_on(vendor: CpuVendor, family: u32) -> bool {
+    /// AMD family 0x1A, Zen 5.
+    const AMD_ZEN5_FAMILY: u32 = 0x1a;
+    match vendor {
+        CpuVendor::Intel => true,
+        CpuVendor::Amd => family >= AMD_ZEN5_FAMILY,
+        CpuVendor::Other => false,
+    }
 }
 
 impl CpuKernelTag {

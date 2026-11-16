@@ -314,3 +314,143 @@ fn active_kernel_name_is_stable_across_calls() {
     // return the identical static string.
     assert_eq!(active_cpu_kernel_name(), active_cpu_kernel_name());
 }
+
+/// A far long match goes by `rep movsb` with ERMS on Intel and on AMD from
+/// Zen 5 (family 26) on, and by the vector loop on Zen 3 and Zen 4 (family 25,
+/// which report ERMS) and other vendors: the vendor and family read from CPUID
+/// agree with the kernel's `vendor_id` and `cpu family`, and the decision
+/// follows them and the ERMS flag.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "kernel-avx2",
+    feature = "std"
+))]
+#[test]
+fn far_copies_take_string_moves_on_intel_and_zen5_with_erms() {
+    /// The first `name : value` line's value.
+    fn field<'a>(cpuinfo: &'a str, name: &str) -> &'a str {
+        cpuinfo
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim() == name)
+            .map(|(_, value)| value.trim())
+            .unwrap_or_else(|| panic!("{name} in /proc/cpuinfo"))
+    }
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").expect("read /proc/cpuinfo");
+    let vendor = field(&cpuinfo, "vendor_id");
+    let family: u32 = field(&cpuinfo, "cpu family")
+        .parse()
+        .expect("cpu family is a number");
+    let expected_vendor = match vendor {
+        "GenuineIntel" => CpuVendor::Intel,
+        "AuthenticAMD" => CpuVendor::Amd,
+        _ => CpuVendor::Other,
+    };
+    assert_eq!(cpu_vendor(), expected_vendor, "vendor {vendor}");
+    assert_eq!(cpu_family(), family, "vendor {vendor}");
+    let erms = std::arch::is_x86_feature_detected!("ermsb");
+    let wins = match expected_vendor {
+        CpuVendor::Intel => true,
+        CpuVendor::Amd => family >= 26,
+        CpuVendor::Other => false,
+    };
+    assert_eq!(
+        detect_far_copy_by_string_moves(),
+        wins && erms,
+        "vendor {vendor} family {family} erms {erms}"
+    );
+    if expected_vendor == CpuVendor::Amd && family == 25 {
+        assert!(!detect_far_copy_by_string_moves(), "Zen 3 and Zen 4");
+    }
+}
+
+/// The vendor string's three words name Intel and AMD and nothing else:
+/// Hygon (a Zen 1 derivative), Zhaoxin (whose string is padded with spaces)
+/// and an unknown string are other vendors.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[test]
+fn the_vendor_string_names_intel_amd_or_another() {
+    let words = |s: &[u8; 12]| {
+        let word = |i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
+        // EBX, EDX, ECX hold bytes 0-3, 4-7 and 8-11.
+        (word(0), word(4), word(8))
+    };
+    for (name, vendor) in [
+        (b"GenuineIntel", CpuVendor::Intel),
+        (b"AuthenticAMD", CpuVendor::Amd),
+        (b"HygonGenuine", CpuVendor::Other),
+        (b"  Shanghai  ", CpuVendor::Other),
+        (b"GenuineIotel", CpuVendor::Other),
+    ] {
+        let (ebx, edx, ecx) = words(name);
+        assert_eq!(
+            vendor_from_cpuid(ebx, edx, ecx),
+            vendor,
+            "{}",
+            core::str::from_utf8(name).unwrap()
+        );
+    }
+}
+
+/// The display family adds the extended family only when the base family is
+/// 0xF, read from the leaf 1 EAX of the hosts the rule was measured on.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[test]
+fn the_display_family_adds_the_extended_family_to_base_0xf() {
+    for (eax, family, host) in [
+        (0x0004_06f1, 0x06, "Broadwell"),
+        (0x0006_06a6, 0x06, "Ice Lake"),
+        (0x00a0_0f11, 0x19, "Zen 3 EPYC 7763"),
+        (0x00a1_0f11, 0x19, "Zen 4 EPYC 9V74"),
+        (0x00b0_0f21, 0x1a, "Zen 5 EPYC 9V45"),
+        (0x0090_0f01, 0x18, "Hygon Dhyana"),
+    ] {
+        assert_eq!(display_family(eax), family, "{host}");
+    }
+}
+
+/// `rep movsb` takes far copies on Intel and on AMD from Zen 5 on, and on no
+/// other: not on Zen 1 to Zen 4 (families 0x17-0x19, Zen 3 and Zen 4 being
+/// where it loses) and not on other vendors whatever their family.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[test]
+fn string_moves_win_on_intel_and_amd_from_zen5() {
+    for family in [0x06, 0x0f, 0x19] {
+        assert!(
+            string_moves_win_on(CpuVendor::Intel, family),
+            "Intel {family:#x}"
+        );
+    }
+    for (family, wins) in [(0x17, false), (0x19, false), (0x1a, true), (0x1b, true)] {
+        assert_eq!(
+            string_moves_win_on(CpuVendor::Amd, family),
+            wins,
+            "AMD {family:#x}"
+        );
+    }
+    for family in [0x18, 0x1a] {
+        assert!(
+            !string_moves_win_on(CpuVendor::Other, family),
+            "other {family:#x}"
+        );
+    }
+}
+
+/// The CPUID read returns the registers in place: leaf 0 reports at least leaf
+/// 1, and its EBX, EDX, ECX spell a vendor string of twelve printable bytes,
+/// spaces included (Zhaoxin's is "  Shanghai  ").
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[test]
+fn cpuid_leaf_zero_spells_a_vendor_string() {
+    let [max_leaf, ebx, ecx, edx] = cpuid(0);
+    // The conditions say what failed; the register values add nothing to them.
+    assert!(max_leaf >= 1);
+    let mut name = [0u8; 12];
+    name[..4].copy_from_slice(&ebx.to_le_bytes());
+    name[4..8].copy_from_slice(&edx.to_le_bytes());
+    name[8..].copy_from_slice(&ecx.to_le_bytes());
+    assert!(name.iter().all(|&b| b == b' ' || b.is_ascii_graphic()));
+    // Leaf 1's family is never zero.
+    assert!(cpu_family() != 0);
+}

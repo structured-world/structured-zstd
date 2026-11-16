@@ -684,7 +684,7 @@ pub struct WorkspaceDecoder<'w> {
     kernel: crate::cpu_kernel::CpuKernelTag,
     /// Resolved with `kernel`, applied to each frame's buffer.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-    fast_string_moves: bool,
+    far_copy_by_string_moves: bool,
     limits: DecodeLimits,
     phase: Phase,
     header: [u8; MAX_FRAME_HEADER],
@@ -777,7 +777,7 @@ impl<'w> WorkspaceDecoder<'w> {
             block_decoder: block_decoder::with_kernel(kernel),
             kernel,
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-            fast_string_moves: crate::cpu_kernel::detect_fast_string_moves(),
+            far_copy_by_string_moves: crate::cpu_kernel::detect_far_copy_by_string_moves(),
             limits,
             phase: Phase::Magic,
             header: [0; MAX_FRAME_HEADER],
@@ -1117,13 +1117,13 @@ impl<'w> WorkspaceDecoder<'w> {
             Window::Ring(DecodeBuffer::from_backend(ring, window))
         };
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        let fast_string_moves = self.fast_string_moves;
+        let far_copy_by_string_moves = self.far_copy_by_string_moves;
         with_window!(&mut self.window, buffer => {
             buffer.set_declared_content(declared_size);
             #[cfg(feature = "hash")]
             buffer.set_compute_hash(has_checksum);
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-            buffer.set_fast_string_moves(fast_string_moves);
+            buffer.set_far_copy_by_string_moves(far_copy_by_string_moves);
         }, idle => {});
         self.offset_hist = [1, 4, 8];
         self.literals.clear();

@@ -319,7 +319,7 @@ macro_rules! execute_one_body {
                         seq_ll_v as usize,
                         offset,
                         seq_ml_v as usize,
-                        $buffer.fast_string_moves()
+                        $buffer.far_copy_by_string_moves()
                     );
                     match r {
                         Ok(total) => {

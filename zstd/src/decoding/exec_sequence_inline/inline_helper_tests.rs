@@ -42,7 +42,7 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
                         out.as_mut_ptr().add(dst),
                         offset,
                         length,
-                        crate::cpu_kernel::detect_fast_string_moves(),
+                        crate::cpu_kernel::detect_far_copy_by_string_moves(),
                     )
                 };
                 assert_eq!(
@@ -59,11 +59,12 @@ fn match_copy_doubling_repeats_matches_like_a_byte_copy() {
     }
 }
 
-/// A match from 4 KiB or more back goes, on a CPU with fast string moves, by a
-/// vector head up to a 64-byte destination boundary and `rep movsb` for the
-/// rest; it writes what a byte-by-byte copy writes for every destination
+/// A match from 4 KiB or more back goes, when the decoder chose string moves,
+/// by a vector head up to a 64-byte destination boundary and `rep movsb` for
+/// the rest; it writes what a byte-by-byte copy writes for every destination
 /// alignment, lengths around the 4 KiB threshold, and stays within its
-/// overshoot. Without fast string moves the same cases run the vector loop.
+/// overshoot. Otherwise the same cases run the vector loop. Both run on any
+/// host with ERMS, whatever the decoder would choose there.
 #[cfg(all(feature = "std", feature = "kernel-avx2"))]
 #[test]
 fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
@@ -72,7 +73,7 @@ fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
     }
     const PREFIX: usize = 9000;
     let erms = std::arch::is_x86_feature_detected!("ermsb");
-    for fast_string_moves in [false, erms] {
+    for far_copy_by_string_moves in [false, erms] {
         for skew in 0..64usize {
             let prefix: alloc::vec::Vec<u8> = (0..(PREFIX + skew) as u32)
                 .map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -94,11 +95,11 @@ fn match_copy_doubling_from_far_back_repeats_like_a_byte_copy() {
                             out.as_mut_ptr().add(dst),
                             offset,
                             length,
-                            fast_string_moves,
+                            far_copy_by_string_moves,
                         )
                     };
                     let what = alloc::format!(
-                        "string moves {fast_string_moves} skew {skew} offset {offset} length {length}"
+                        "string moves {far_copy_by_string_moves} skew {skew} offset {offset} length {length}"
                     );
                     assert_eq!(out[..expected.len()], expected[..], "{what}");
                     assert!(
@@ -157,7 +158,7 @@ fn tight_tail_writes_the_sequence_like_a_byte_copy() {
                             lit_length,
                             offset,
                             match_length,
-                            crate::cpu_kernel::detect_fast_string_moves(),
+                            crate::cpu_kernel::detect_far_copy_by_string_moves(),
                         )
                     };
                     let what = alloc::format!(
@@ -205,7 +206,7 @@ fn match_copy_doubling_reads_only_written_bytes() {
                     out.as_mut_ptr().add(PREFIX),
                     offset,
                     length,
-                    crate::cpu_kernel::detect_fast_string_moves(),
+                    crate::cpu_kernel::detect_far_copy_by_string_moves(),
                 )
             };
             // SAFETY: the copy wrote every byte of the match.
