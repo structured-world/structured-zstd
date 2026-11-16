@@ -441,15 +441,13 @@ fn string_moves_win_on_intel_and_amd_from_zen5() {
 #[test]
 fn cpuid_leaf_zero_spells_a_vendor_string() {
     let [max_leaf, ebx, ecx, edx] = cpuid(0);
-    assert!(max_leaf >= 1, "max leaf {max_leaf}");
+    // The conditions say what failed; the register values add nothing to them.
+    assert!(max_leaf >= 1);
     let mut name = [0u8; 12];
     name[..4].copy_from_slice(&ebx.to_le_bytes());
     name[4..8].copy_from_slice(&edx.to_le_bytes());
     name[8..].copy_from_slice(&ecx.to_le_bytes());
-    assert!(
-        name.iter().all(|b| b.is_ascii_graphic()),
-        "vendor bytes {name:?}"
-    );
+    assert!(name.iter().all(|b| b.is_ascii_graphic()));
     // Leaf 1's family is never zero.
-    assert_ne!(cpu_family(), 0);
+    assert!(cpu_family() != 0);
 }
