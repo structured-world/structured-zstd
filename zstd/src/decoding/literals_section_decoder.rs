@@ -744,6 +744,18 @@ fn burst_word(container: u64) -> BurstWord {
     (container >> 32) as u32
 }
 
+/// A decoder state taken from the top of a burst word, as the decoder holds it.
+#[cfg(target_pointer_width = "64")]
+#[inline(always)]
+fn burst_state(state: BurstWord) -> u64 {
+    state
+}
+#[cfg(not(target_pointer_width = "64"))]
+#[inline(always)]
+fn burst_state(state: BurstWord) -> u64 {
+    u64::from(state)
+}
+
 /// Loop-invariant constants for [`run_4stream_burst_loop`]. Derived
 /// once per `decompress_literals` call; `Copy` so the burst can
 /// destructure `*bounds` for register-resident reads.
@@ -1141,7 +1153,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
             // it here instead of carrying a per-stream `nbl` register across the
             // whole burst loop — four fewer loop-live values.
             brs[$i].bits_consumed = $b.trailing_zeros() as u8 + max_num_bits;
-            decoders[$i].state = $b >> table_shift;
+            decoders[$i].state = burst_state($b >> table_shift);
         }};
     }
     writeback!(0, b0, ip0, src0);
