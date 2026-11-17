@@ -59,7 +59,19 @@ fn main() {
     for page in arena.chunks_mut(4096) {
         page[0] = 1;
     }
-    let mut decoder = FrameDecoder::new();
+    // Ours as detected, and ours with far long matches copied by the vector
+    // loop: each decoder takes the far-copy choice when its scratch is built,
+    // on its first frame.
+    let mut build = |mode: u8| {
+        structured_zstd::EXP_FAR_COPY.store(mode, std::sync::atomic::Ordering::Relaxed);
+        let mut d = FrameDecoder::new();
+        let dst = &mut arena[base..base + room];
+        d.decode_all(&frame, dst).expect("warm decode");
+        d
+    };
+    let mut decoder = build(0);
+    let mut vector = build(2);
+    structured_zstd::EXP_FAR_COPY.store(0, std::sync::atomic::Ordering::Relaxed);
     let dctx = unsafe { zstd_sys::ZSTD_createDCtx() };
     assert!(!dctx.is_null());
 
@@ -67,10 +79,11 @@ fn main() {
         .map(|k| k * 8)
         .chain([1, 3, 31, 4096, 4096 + 32, 8192, 12288])
         .collect();
-    println!("offset  rust_min  rust_med  ffi_min  ffi_med  (ns per frame)");
+    println!("offset  auto_min  auto_med   vec_min   vec_med  ffi_min  ffi_med  (ns per frame)");
     for &offset in &offsets {
         let start = base + offset;
         let mut rust_ns = Vec::with_capacity(iters);
+        let mut vec_ns = Vec::with_capacity(iters);
         let mut ffi_ns = Vec::with_capacity(iters);
         for _ in 0..iters {
             let dst = &mut arena[start..start + room];
@@ -79,6 +92,13 @@ fn main() {
                 .decode_all(std::hint::black_box(&frame), dst)
                 .expect("decode");
             rust_ns.push(t.elapsed().as_nanos());
+            assert_eq!(n, len);
+            let dst = &mut arena[start..start + room];
+            let t = Instant::now();
+            let n = vector
+                .decode_all(std::hint::black_box(&frame), dst)
+                .expect("decode");
+            vec_ns.push(t.elapsed().as_nanos());
             assert_eq!(n, len);
             let dst = &mut arena[start..start + room];
             let t = Instant::now();
@@ -95,10 +115,12 @@ fn main() {
             assert_eq!(n, len);
         }
         let rust_min = *rust_ns.iter().min().unwrap();
+        let vec_min = *vec_ns.iter().min().unwrap();
         let ffi_min = *ffi_ns.iter().min().unwrap();
         println!(
-            "{offset:>6}  {rust_min:>8}  {:>8}  {ffi_min:>7}  {:>7}",
+            "{offset:>6}  {rust_min:>8}  {:>8}  {vec_min:>8}  {:>8}  {ffi_min:>7}  {:>7}",
             median(rust_ns),
+            median(vec_ns),
             median(ffi_ns)
         );
     }

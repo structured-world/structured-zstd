@@ -126,6 +126,10 @@ pub use common::MIN_MAX_BLOCK_SIZE;
 /// (`set_target_block_size`) and the C ABI parameter surface.
 pub use common::MIN_TARGET_BLOCK_SIZE;
 mod cpu_kernel;
+/// Experiment only: how a decoder built from now on copies a far long match
+/// on x86_64 (0 = as detected, 1 = `rep movsb`, 2 = the vector loop).
+#[doc(hidden)]
+pub static EXP_FAR_COPY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub mod decoding;
 #[cfg(feature = "dict-builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict-builder")))]

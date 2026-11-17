@@ -1,0 +1,37 @@
+name: exp 678 destination placement
+
+# Experiment: decode time of the large-log-stream frame by destination
+# offset, ours as detected, ours with far long matches copied by the vector
+# loop, and libzstd, on the hosted runners the benchmark dashboard runs on
+# (AMD and Intel, drawn per job). Lives only on its experiment branch.
+on:
+  push:
+    branches: ['exp/678-*']
+
+permissions:
+  contents: read
+
+jobs:
+  placement:
+    name: placement (${{ matrix.draw }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Host
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          for f in erms fsrm; do grep -qw "$f" /proc/cpuinfo && echo "flag $f"; done
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+        run: cargo build --profile bench -p ffi-bench --example dst_align
+      - name: Placement
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          target/release/examples/dst_align 12 200
+          target/release/examples/dst_align 15 200
