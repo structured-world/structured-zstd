@@ -751,21 +751,13 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         //
         // Only the counters of this table's alphabet are set, not all 256: the
         // spread holds only symbols below `nb_symbols`, so no other counter is
-        // read, and a table build no longer clears 512 bytes it never uses.
+        // read.
         let mut symbol_next = [core::mem::MaybeUninit::<u16>::uninit(); 256];
-        for counter in &mut symbol_next[..nb_symbols] {
-            counter.write(0);
-        }
 
-        // Pass 1: place -1 probability symbols at the top of the
-        // table AND initialise `symbol_next` for them. Upstream zstd:
-        // `tableDecode[highThreshold--].baseValue = s; symbolNext[s]
-        // = 1;`.
-        //
-        // Index loop (not `iter().enumerate().take()`) — LLVM emits
-        // a tighter scalar loop without the Iterator::next state
-        // machine. The enumerate+take iterator chain was visible as
-        // ~1.8% combined self-time on the decode flamegraph.
+        // One pass over the alphabet, upstream's: every counter starts at its
+        // probability, and a -1 symbol takes a slot at the top of the table
+        // with a counter of 1. A zero-probability counter is set but never
+        // read, since the spread holds no such symbol.
         let probs = symbol_probabilities.as_slice();
         let mut negative_idx = table_size;
         for symbol in 0..nb_symbols {
@@ -774,6 +766,9 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
                 symbol_next[symbol].write(1);
+            } else {
+                debug_assert!(prob >= 0);
+                symbol_next[symbol].write(prob as u16);
             }
         }
 
@@ -794,19 +789,19 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // positions are read.
             let mut in_order = [core::mem::MaybeUninit::<u8>::uninit(); FSE_FAST_SPREAD_BUF];
             let mut pos = 0usize;
-            for symbol in 0..nb_symbols {
-                let prob = probs[symbol];
-                if prob <= 0 {
-                    continue;
-                }
-                symbol_next[symbol].write(prob as u16);
+            // 8 copies of the symbol byte, stepped with the symbol.
+            let mut word = 0u64;
+            for &prob in &probs[..nb_symbols] {
+                // No -1 on this path. A zero probability writes its word and
+                // leaves `pos` in place, as upstream's lay-down does, so the
+                // loop takes no branch on the probability; the next symbol
+                // overwrites those bytes.
+                debug_assert!(prob >= 0);
                 let n = prob as usize;
-                // 8 copies of the symbol byte; lay down 8 at a time (counts are
-                // mostly <= 8 on small table-logs, so the inner loop rarely runs).
-                let word = ((symbol as u8) as u64).wrapping_mul(0x0101_0101_0101_0101);
                 // The probabilities sum to `table_size <= CAP <= MAX_SPREAD`, so
                 // `pos + n` stays within it and each 8-byte write within the 8
-                // bytes of slack past it.
+                // bytes of slack past it. Lay down 8 at a time: counts are mostly
+                // <= 8 on small table-logs, so the inner loop rarely runs.
                 assert!(pos + n <= table_size, "FSE lay-down past the table");
                 let lay = in_order.as_mut_ptr().cast::<u8>();
                 // SAFETY: `pos + i + 8 <= pos + n + 8 <= table_size + 8 <=
@@ -820,6 +815,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                     }
                 }
                 pos += n;
+                word = word.wrapping_add(0x0101_0101_0101_0101);
             }
             debug_assert_eq!(pos, table_size, "lay-down covers the table");
             let table_mask = table_size - 1;
@@ -843,12 +839,10 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             }
         } else {
             let mut position = 0usize;
-            for symbol in 0..nb_symbols {
-                let prob = probs[symbol];
+            for (symbol, &prob) in probs[..nb_symbols].iter().enumerate() {
                 if prob <= 0 {
                     continue;
                 }
-                symbol_next[symbol].write(prob as u16);
                 let symbol_u8 = symbol as u8;
                 for _ in 0..prob {
                     spread[position] = symbol_u8;
