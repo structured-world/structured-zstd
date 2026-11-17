@@ -25,7 +25,9 @@ jobs:
       - name: Host
         run: |
           grep -m1 'model name' /proc/cpuinfo
-          for f in erms fsrm; do grep -qw "$f" /proc/cpuinfo && echo "flag $f"; done
+          for f in erms fsrm; do
+            if grep -qw "$f" /proc/cpuinfo; then echo "flag $f"; else echo "no $f"; fi
+          done
       - name: Build
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
