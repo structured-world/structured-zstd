@@ -454,29 +454,29 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         let mut cursors = starts;
 
         // Upstream zstd-parity 4-stream HUF decode. `bits[s]` is the fused
-        // state+stream+sentinel u64 register (see `run_4stream_burst_loop`).
+        // state+stream+sentinel word (`BurstWord`, see `run_4stream_burst_loop`).
         // Each iter decodes `symbols_per_burst` symbols × 4 streams,
         // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
         // MEM_read64(ip[s]) | 1`.
         let max_num_bits = table.max_num_bits;
         // Safety constraint per upstream zstd `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
         // before each `bits[s] >> table_shift` read, the sentinel-bit position
-        // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
-        // `max_num_bits` read region). After `s` shifts the sentinel is at bit
-        // `padding_skip + s*max_num_bits`. The N-th read happens after (N-1)
-        // shifts, so the inclusive bound is
-        //   padding_skip + (N-1)*max_num_bits < 64 - max_num_bits
+        // must be strictly below bit `W - max_num_bits` (i.e. outside the top
+        // `max_num_bits` read region), `W` the word's width. After `s` shifts
+        // the sentinel is at bit `padding_skip + s*max_num_bits`. The N-th read
+        // happens after (N-1) shifts, so the inclusive bound is
+        //   padding_skip + (N-1)*max_num_bits < W - max_num_bits
         // i.e.
-        //   padding_skip + N*max_num_bits <= 63
+        //   padding_skip + N*max_num_bits <= W - 1
         // Solving for N with padding_skip ≤ 8:
-        //   N <= (63 - 8) / max_num_bits = 55 / max_num_bits
+        //   N <= (W - 9) / max_num_bits
         // (Letter `s` is used here for shift-count to avoid colliding with
         // the surrounding generic parameter `K: CpuKernel`.)
-        // For max=11: 5 symbols (upstream zstd parity — was 4 with the old off-by-one
-        // formula). For max=8: 6 symbols. For max=4: 13.
-        let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
+        // A 64-bit word takes 5 symbols at max=10 or 11 and 6 at max=8; a
+        // 32-bit word takes 2 at max=8 to 11, as upstream's 32-bit loop does.
+        let symbols_per_burst: usize = (BURST_WORD_BITS as usize - 9) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
-        let table_shift = (64 - max_num_bits) as u32;
+        let table_shift = BURST_WORD_BITS - u32::from(max_num_bits);
         let packed = table.packed_decode.as_slice();
 
         // Lockstep cursor invariant: every burst iter advances all 4
@@ -717,6 +717,45 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
     Ok(bytes_read)
 }
 
+/// One stream's register in [`run_4stream_burst_loop`]: state, pending stream
+/// bits and sentinel fused in a machine word, as upstream zstd's four-stream
+/// loops keep a stream in a `size_t`. A 32-bit target holds it in one register
+/// rather than a pair, and decodes fewer symbols per reload.
+#[cfg(target_pointer_width = "64")]
+type BurstWord = u64;
+#[cfg(not(target_pointer_width = "64"))]
+type BurstWord = u32;
+const BURST_WORD_BITS: u32 = BurstWord::BITS;
+/// Bytes from the start of the reader's eight-byte window to the start of the
+/// burst word's window: both end at the same byte, so they share the count of
+/// bits consumed from the top.
+const BURST_WINDOW_SKIP: usize = 8 - core::mem::size_of::<BurstWord>();
+
+/// A reader's container as a burst word: its top, the bytes that end its
+/// window, with the same count of bits consumed from the top.
+#[cfg(target_pointer_width = "64")]
+#[inline(always)]
+fn burst_word(container: u64) -> BurstWord {
+    container
+}
+#[cfg(not(target_pointer_width = "64"))]
+#[inline(always)]
+fn burst_word(container: u64) -> BurstWord {
+    (container >> 32) as u32
+}
+
+/// A decoder state taken from the top of a burst word, as the decoder holds it.
+#[cfg(target_pointer_width = "64")]
+#[inline(always)]
+fn burst_state(state: BurstWord) -> u64 {
+    state
+}
+#[cfg(not(target_pointer_width = "64"))]
+#[inline(always)]
+fn burst_state(state: BurstWord) -> u64 {
+    u64::from(state)
+}
+
 /// Loop-invariant constants for [`run_4stream_burst_loop`]. Derived
 /// once per `decompress_literals` call; `Copy` so the burst can
 /// destructure `*bounds` for register-resident reads.
@@ -790,23 +829,23 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
         burst_eligible,
         alloc_upper_bound,
     } = *bounds;
-    debug_assert!(TABLE_BITS == 0 || table_shift == 64 - u32::from(TABLE_BITS));
+    debug_assert!(TABLE_BITS == 0 || table_shift == BURST_WORD_BITS - u32::from(TABLE_BITS));
     let table_shift = if TABLE_BITS == 0 {
         table_shift
     } else {
-        64 - u32::from(TABLE_BITS)
+        BURST_WORD_BITS - u32::from(TABLE_BITS)
     };
     let symbols_per_burst = if TABLE_BITS == 0 {
         symbols_per_burst
     } else {
-        55 / usize::from(TABLE_BITS)
+        (BURST_WORD_BITS as usize - 9) / usize::from(TABLE_BITS)
     };
     let burst_bits = if TABLE_BITS == 0 {
         burst_bits
     } else {
         symbols_per_burst as u8 * TABLE_BITS
     };
-    let max_num_bits = (64 - table_shift) as u8;
+    let max_num_bits = (BURST_WORD_BITS - table_shift) as u8;
 
     // Skip burst entirely if min_seg_len < symbols_per_burst — drain
     // (the single-symbol tail outside this function) handles ALL
@@ -816,6 +855,13 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // is then too small to hold even one burst, but the drain path
     // handles symbol-by-symbol decode within the segment ends).
     if !burst_eligible {
+        return;
+    }
+    // A narrower word starts `BURST_WINDOW_SKIP` bytes into the reader's
+    // window, which only a stream of eight bytes or more has; a shorter one is
+    // left to the drain, as the input budget below leaves it on any width.
+    #[cfg(not(target_pointer_width = "64"))]
+    if brs.iter().any(|br| br.source.len() < 8) {
         return;
     }
 
@@ -835,9 +881,9 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
          cursors stay within bounds across a full burst",
     );
 
-    // Upstream zstd-parity burst loop. `bits[s]` is the unified u64 register
-    // that fuses state + unconsumed stream + sentinel:
-    //   bits 63..(64-max_num_bits): current state (next index into `packed`)
+    // Upstream zstd-parity burst loop. `bits[s]` is the unified `BurstWord`
+    // register (width `W`) that fuses state + unconsumed stream + sentinel:
+    //   bits W-1..(W-max_num_bits): current state (next index into `packed`)
     //   below:                       upcoming stream bits, top-aligned
     //   bottom:                      sentinel `1`, position grows upward
     //                                with each consumed bit
@@ -887,10 +933,10 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // `(MEM_read64(ip) | 1) << padding_skip`. `nbl{s}` is the sub-byte phase
     // carried into the writeback so the single-symbol drain resumes with
     // `bits_consumed = nbl + max_num_bits`.
-    let mut b0 = (brs[0].bit_container | 1) << (brs[0].bits_consumed - max_num_bits);
-    let mut b1 = (brs[1].bit_container | 1) << (brs[1].bits_consumed - max_num_bits);
-    let mut b2 = (brs[2].bit_container | 1) << (brs[2].bits_consumed - max_num_bits);
-    let mut b3 = (brs[3].bit_container | 1) << (brs[3].bits_consumed - max_num_bits);
+    let mut b0 = (burst_word(brs[0].bit_container) | 1) << (brs[0].bits_consumed - max_num_bits);
+    let mut b1 = (burst_word(brs[1].bit_container) | 1) << (brs[1].bits_consumed - max_num_bits);
+    let mut b2 = (burst_word(brs[2].bit_container) | 1) << (brs[2].bits_consumed - max_num_bits);
+    let mut b3 = (burst_word(brs[3].bit_container) | 1) << (brs[3].bits_consumed - max_num_bits);
     // Each stream reads and writes through a pointer, as upstream's fast loop
     // does: an input slice base plus an index, and an output base plus a
     // cursor, would carry eight more values through a loop that already fills
@@ -903,11 +949,13 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     let src2 = brs[2].source;
     let src3 = brs[3].source;
     // SAFETY: `index <= source.len() - 8` for a stream the reader refilled
-    // on the fast path, and 0 otherwise; either way inside the slice.
-    let mut ip0 = unsafe { src0.as_ptr().add(brs[0].index) };
-    let mut ip1 = unsafe { src1.as_ptr().add(brs[1].index) };
-    let mut ip2 = unsafe { src2.as_ptr().add(brs[2].index) };
-    let mut ip3 = unsafe { src3.as_ptr().add(brs[3].index) };
+    // on the fast path, and 0 otherwise; either way inside the slice, and
+    // `BURST_WINDOW_SKIP` further on is too: a nonzero skip returned above
+    // unless every stream holds eight bytes.
+    let mut ip0 = unsafe { src0.as_ptr().add(brs[0].index + BURST_WINDOW_SKIP) };
+    let mut ip1 = unsafe { src1.as_ptr().add(brs[1].index + BURST_WINDOW_SKIP) };
+    let mut ip2 = unsafe { src2.as_ptr().add(brs[2].index + BURST_WINDOW_SKIP) };
+    let mut ip3 = unsafe { src3.as_ptr().add(brs[3].index + BURST_WINDOW_SKIP) };
     // SAFETY: every cursor lies in `[base, base + regen)`, inside the
     // caller's reserved allocation (see `alloc_upper_bound`).
     let mut op0 = unsafe { target_ptr.add(cursors[0]) };
@@ -935,16 +983,20 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
         }};
     }
     // Reload one stream (upstream zstd `HUF_4X1_RELOAD_STREAM`):
-    // `ip -= ctz>>3; b = (MEM_read64(ip) | 1) << (ctz & 7)`. SAFETY: the
-    // batch bound below keeps `ip - nb_bytes` at or above the stream's start
-    // and the 8-byte window inside the stream (see the budget note).
+    // `ip -= ctz>>3; b = (MEM_readLEST(ip) | 1) << (ctz & 7)`. SAFETY: the
+    // batch bound below keeps `ip - nb_bytes` at or above `BURST_WINDOW_SKIP`
+    // past the stream's start and the word's window inside the stream (see
+    // the budget note).
     macro_rules! reload1 {
         ($b:ident, $ip:ident) => {{
-            let ctz = $b.trailing_zeros();
+            // SAFETY: the sentinel keeps a bit set in `$b` until the reload
+            // replaces it, so the count needs no zero case (a bare `bsf` on
+            // x86 rather than one guarded by a conditional move).
+            let ctz = unsafe { core::num::NonZero::new_unchecked($b) }.trailing_zeros();
             let nb_bits = (ctz & 7) as u8;
             let new_window = unsafe {
                 $ip = $ip.sub((ctz >> 3) as usize);
-                u64::from_le($ip.cast::<u64>().read_unaligned())
+                BurstWord::from_le($ip.cast::<BurstWord>().read_unaligned())
             };
             // Reload order `(MEM_read64 | 1) << nb_bits` (NOT `(.. << nb_bits)
             // | 1`): the sentinel must land at bit `nb_bits` so the next
@@ -982,9 +1034,13 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     let ceil = unsafe { target_ptr.add(cursor_burst_ceil) };
     // Iterations a stream can still start under the budget at worst-case
     // consumption: one per `bytes_per_iter_upper` bytes above the floor.
+    // `index` is where the reader's eight-byte window would start, so the
+    // budget is the same on every word width and keeps the writeback's window
+    // inside the stream.
     let input_iters = |ip: *const u8, src: &[u8]| -> usize {
-        // SAFETY: `ip` points into `src` (see above).
-        let index = unsafe { ip.offset_from(src.as_ptr()) } as usize;
+        // SAFETY: `ip` points into `src`, `BURST_WINDOW_SKIP` or more past
+        // its start (see above).
+        let index = unsafe { ip.offset_from(src.as_ptr()) } as usize - BURST_WINDOW_SKIP;
         if index < bytes_per_iter_upper {
             0
         } else {
@@ -1034,14 +1090,38 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
             continue;
         }
 
+        #[cfg(target_arch = "x86")]
+        if TABLE_BITS == 10 || TABLE_BITS == 11 {
+            // SAFETY: both widths take two symbols per stream an iteration
+            // on the 32-bit word; the batch bound above admits `iters`
+            // iterations at worst-case consumption, and the loop runs exactly
+            // that many (it stops when `op0` reaches `olimit`).
+            unsafe {
+                burst_batch_asm_x86::<TABLE_BITS>(
+                    [&mut b0, &mut b1, &mut b2, &mut b3],
+                    [&mut ip0, &mut ip1, &mut ip2, &mut ip3],
+                    [&mut op0, &mut op1, &mut op2, &mut op3],
+                    olimit,
+                    packed.as_ptr(),
+                );
+            }
+            continue;
+        }
+
         while op0 < olimit {
             // Dispatch on the compile-time symbol count so the dominant cases
             // get a fully-unrolled body. `symbols_per_burst` is loop-invariant,
             // so loop-unswitching hoists the match out of the loop; each arm
-            // expands `burst!` to straight-line scalar code. SPB=5 covers
-            // `max_num_bits ∈ {10, 11}`; 6 covers {8, 9}, 7 covers {7}. Rarer
-            // small-max tables fall through to the dynamic loop.
+            // expands `burst!` to straight-line scalar code. On a 64-bit word
+            // SPB=5 covers `max_num_bits ∈ {10, 11}`; 6 covers {8, 9}, 7 covers
+            // {7}. A 32-bit word gives 2 for {8..11} and 3 for {6, 7}, counts
+            // a 64-bit word never reaches, so those arms exist only there.
+            // Rarer small-max tables fall through to the dynamic loop.
             match symbols_per_burst {
+                #[cfg(not(target_pointer_width = "64"))]
+                2 => burst!(2),
+                #[cfg(not(target_pointer_width = "64"))]
+                3 => burst!(3),
                 5 => burst!(5),
                 6 => burst!(6),
                 7 => burst!(7),
@@ -1083,8 +1163,10 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // for the state just extracted), `state = b >> table_shift`.
     macro_rules! writeback {
         ($i:literal, $b:ident, $ip:ident, $src:expr) => {{
-            // SAFETY: `$ip` points into `$src` with 8 readable bytes.
-            let index = unsafe { $ip.offset_from($src.as_ptr()) } as usize;
+            // SAFETY: `$ip` points into `$src`, `BURST_WINDOW_SKIP` or more
+            // past its start, and the eight bytes from `index` end where the
+            // word's window does.
+            let index = unsafe { $ip.offset_from($src.as_ptr()) } as usize - BURST_WINDOW_SKIP;
             brs[$i].index = index;
             brs[$i].bit_container = u64::from_le_bytes(unsafe {
                 $src.get_unchecked(index..index + 8)
@@ -1097,7 +1179,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
             // it here instead of carrying a per-stream `nbl` register across the
             // whole burst loop — four fewer loop-live values.
             brs[$i].bits_consumed = $b.trailing_zeros() as u8 + max_num_bits;
-            decoders[$i].state = $b >> table_shift;
+            decoders[$i].state = burst_state($b >> table_shift);
         }};
     }
     writeback!(0, b0, ip0, src0);
@@ -1284,6 +1366,227 @@ unsafe fn burst_batch_asm(
     *ip1 = slots[0];
     *ip2 = slots[1];
     *ip3 = slots[2];
+}
+
+/// One symbol of one stream in [`burst_batch_asm_x86`]: the table entry the
+/// top `32 - $shift` bits of word `$b` index (`ebp` holds the table), the word
+/// advanced by the entry's low byte (`cl`), the symbol (its high byte, `ch`)
+/// stored `$k` past the output pointer in the stack slot `$op`.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_symbol_x86 {
+    ($b:literal, $shift:literal, $op:literal, $k:literal) => {
+        concat!(
+            "mov ecx, ",
+            $b,
+            "\n",
+            "shr ecx, ",
+            $shift,
+            "\n",
+            "movzx ecx, word ptr [ebp + ecx*2]\n",
+            "shl ",
+            $b,
+            ", cl\n",
+            "mov eax, dword ptr [esp + ",
+            $op,
+            "]\n",
+            "mov byte ptr [eax + ",
+            $k,
+            "], ch\n",
+        )
+    };
+}
+
+/// Symbol `$k` of all four streams.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_round_x86 {
+    ($shift:literal, $k:literal) => {
+        concat!(
+            huf_x1_symbol_x86!("ebx", $shift, "16", $k),
+            huf_x1_symbol_x86!("edx", $shift, "20", $k),
+            huf_x1_symbol_x86!("esi", $shift, "24", $k),
+            huf_x1_symbol_x86!("edi", $shift, "28", $k),
+        )
+    };
+}
+
+/// Reload word `$b` from the input pointer in stack slot `$ip` (upstream zstd
+/// `HUF_4X1_RELOAD_STREAM` on a 32-bit word): step back over the whole bytes
+/// consumed, read four, set the sentinel and skip the sub-byte phase. The word
+/// is never zero (the sentinel), so a bare `bsf` counts it.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_reload_x86 {
+    ($b:literal, $ip:literal) => {
+        concat!(
+            "bsf ecx, ",
+            $b,
+            "\n",
+            "mov eax, dword ptr [esp + ",
+            $ip,
+            "]\n",
+            "mov ",
+            $b,
+            ", ecx\n",
+            "shr ",
+            $b,
+            ", 3\n",
+            "and ecx, 7\n",
+            "sub eax, ",
+            $b,
+            "\n",
+            "mov dword ptr [esp + ",
+            $ip,
+            "], eax\n",
+            "mov ",
+            $b,
+            ", dword ptr [eax]\n",
+            "or ",
+            $b,
+            ", 1\n",
+            "shl ",
+            $b,
+            ", cl\n",
+        )
+    };
+}
+
+/// Runs whole iterations of the four-stream loop on 32-bit x86 until `op[0]`
+/// reaches `olimit`, each decoding two symbols per stream and reloading all
+/// four. Seven registers cannot hold four words, four input and four output
+/// pointers, and the compiler kept some words on the stack, which put a store
+/// and a reload on every symbol's dependency chain. Here the four words stay
+/// in registers (`ebx`, `edx`, `esi`, `edi`), with the table in `ebp` and the
+/// entry in `ecx`; the pointers and the bound sit on the stack, read off the
+/// chains. `ebx`, `esi` and `ebp` are saved and restored inside the block,
+/// which therefore uses the stack.
+///
+/// # Safety
+/// `packed` holds `1 << TABLE_BITS` entries and `TABLE_BITS` is 10 or 11, so
+/// two symbols fit an iteration of a 32-bit word. At least one iteration
+/// remains before `op[0]` reaches `olimit`, and every iteration up to it keeps
+/// each stream's reads inside its input and its writes inside its output
+/// segment (the caller's batch bound).
+#[cfg(target_arch = "x86")]
+#[inline(always)]
+unsafe fn burst_batch_asm_x86<const TABLE_BITS: u8>(
+    b: [&mut u32; 4],
+    ip: [&mut *const u8; 4],
+    op: [&mut *mut u8; 4],
+    olimit: *mut u8,
+    packed: *const u16,
+) {
+    let [b0, b1, b2, b3] = b;
+    let [ip0, ip1, ip2, ip3] = ip;
+    let [op0, op1, op2, op3] = op;
+    let word = |w: u32| core::ptr::without_provenance::<u8>(w as usize);
+    // Words, input pointers, output pointers, the bound and the table, in the
+    // order the block reads and writes them (four bytes each).
+    let mut slots: [*const u8; 14] = [
+        word(*b0),
+        word(*b1),
+        word(*b2),
+        word(*b3),
+        *ip0,
+        *ip1,
+        *ip2,
+        *ip3,
+        op0.cast_const(),
+        op1.cast_const(),
+        op2.cast_const(),
+        op3.cast_const(),
+        olimit.cast_const(),
+        packed.cast(),
+    ];
+    // Stack frame inside the block, from `esp`: input pointers at 0-12,
+    // output pointers at 16-28, the bound at 32, the slots' address at 36.
+    macro_rules! run {
+        ($shift:literal) => {
+            // SAFETY: the caller's contract; the block reads the table and the
+            // input windows, writes the output segments named there and the
+            // slots, and leaves every register but its outputs as it found it.
+            unsafe {
+                core::arch::asm!(
+                    "push ebp",
+                    "push esi",
+                    "push ebx",
+                    "push eax",
+                    "push dword ptr [eax + 48]",
+                    "push dword ptr [eax + 44]",
+                    "push dword ptr [eax + 40]",
+                    "push dword ptr [eax + 36]",
+                    "push dword ptr [eax + 32]",
+                    "push dword ptr [eax + 28]",
+                    "push dword ptr [eax + 24]",
+                    "push dword ptr [eax + 20]",
+                    "push dword ptr [eax + 16]",
+                    "mov ebx, dword ptr [eax]",
+                    "mov edx, dword ptr [eax + 4]",
+                    "mov esi, dword ptr [eax + 8]",
+                    "mov edi, dword ptr [eax + 12]",
+                    "mov ebp, dword ptr [eax + 52]",
+                    "2:",
+                    huf_x1_round_x86!($shift, "0"),
+                    huf_x1_round_x86!($shift, "1"),
+                    huf_x1_reload_x86!("ebx", "0"),
+                    huf_x1_reload_x86!("edx", "4"),
+                    huf_x1_reload_x86!("esi", "8"),
+                    huf_x1_reload_x86!("edi", "12"),
+                    "add dword ptr [esp + 16], 2",
+                    "add dword ptr [esp + 20], 2",
+                    "add dword ptr [esp + 24], 2",
+                    "add dword ptr [esp + 28], 2",
+                    "mov eax, dword ptr [esp + 16]",
+                    "cmp eax, dword ptr [esp + 32]",
+                    "jb 2b",
+                    "mov eax, dword ptr [esp + 36]",
+                    "mov dword ptr [eax], ebx",
+                    "mov dword ptr [eax + 4], edx",
+                    "mov dword ptr [eax + 8], esi",
+                    "mov dword ptr [eax + 12], edi",
+                    "mov ecx, dword ptr [esp]",
+                    "mov dword ptr [eax + 16], ecx",
+                    "mov ecx, dword ptr [esp + 4]",
+                    "mov dword ptr [eax + 20], ecx",
+                    "mov ecx, dword ptr [esp + 8]",
+                    "mov dword ptr [eax + 24], ecx",
+                    "mov ecx, dword ptr [esp + 12]",
+                    "mov dword ptr [eax + 28], ecx",
+                    "mov ecx, dword ptr [esp + 16]",
+                    "mov dword ptr [eax + 32], ecx",
+                    "mov ecx, dword ptr [esp + 20]",
+                    "mov dword ptr [eax + 36], ecx",
+                    "mov ecx, dword ptr [esp + 24]",
+                    "mov dword ptr [eax + 40], ecx",
+                    "mov ecx, dword ptr [esp + 28]",
+                    "mov dword ptr [eax + 44], ecx",
+                    "add esp, 40",
+                    "pop ebx",
+                    "pop esi",
+                    "pop ebp",
+                    inout("eax") slots.as_mut_ptr() => _,
+                    out("ecx") _,
+                    out("edx") _,
+                    out("edi") _,
+                );
+            }
+        };
+    }
+    if TABLE_BITS == 10 {
+        run!("22");
+    } else {
+        run!("21");
+    }
+    *b0 = slots[0].addr() as u32;
+    *b1 = slots[1].addr() as u32;
+    *b2 = slots[2].addr() as u32;
+    *b3 = slots[3].addr() as u32;
+    *ip0 = slots[4];
+    *ip1 = slots[5];
+    *ip2 = slots[6];
+    *ip3 = slots[7];
+    *op0 = slots[8].cast_mut();
+    *op1 = slots[9].cast_mut();
+    *op2 = slots[10].cast_mut();
+    *op3 = slots[11].cast_mut();
 }
 
 #[cfg(test)]
