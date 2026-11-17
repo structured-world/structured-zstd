@@ -57,6 +57,21 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    feature = "kernel-avx2",
+    not(feature = "fuzz-exports")
+))]
+impl<'t> FSEDecoderImpl<'t, SeqSymbol, 512> {
+    /// The table's first entry, each entry read as the eight-byte word
+    /// [`SeqSymbol::to_word`] gives. Only the `1 << accuracy_log` entries the
+    /// build wrote may be read through it.
+    pub(crate) fn entry_words(&self) -> *const u64 {
+        self.table.decode.as_ptr().cast()
+    }
+}
+
 impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
     /// Returns the byte associated with the symbol the internal cursor is pointing at.
     pub fn decode_symbol(&self) -> u8 {
@@ -1214,6 +1229,31 @@ const _: [(); 3] = [(); core::mem::offset_of!(SeqSymbol, num_additional_bits)];
 const _: [(); 4] = [(); core::mem::offset_of!(SeqSymbol, base_value)];
 #[cfg(target_endian = "little")]
 const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    feature = "kernel-avx2",
+    not(feature = "fuzz-exports")
+))]
+impl SeqSymbol {
+    /// The entry as one little-endian word: `new_state` in bits 0-15,
+    /// `num_bits` in 16-23, `num_additional_bits` in 24-31, `base_value` in
+    /// 32-63, the layout the assertions above fix.
+    #[inline(always)]
+    pub(crate) fn to_word(self) -> u64 {
+        // SAFETY: `repr(C)`, eight bytes, no padding (2 + 1 + 1 + 4), and
+        // every bit pattern of each field is a valid value.
+        unsafe { core::mem::transmute::<SeqSymbol, u64>(self) }
+    }
+
+    /// The inverse of [`Self::to_word`].
+    #[inline(always)]
+    pub(crate) fn from_word(word: u64) -> Self {
+        // SAFETY: as for `to_word`; any eight bytes are a valid `SeqSymbol`.
+        unsafe { core::mem::transmute::<u64, SeqSymbol>(word) }
+    }
+}
 
 /// Common interface every FSE-table entry type must provide to
 /// participate in [`FSETable`] / [`FSEDecoder`]. Both [`Entry`]

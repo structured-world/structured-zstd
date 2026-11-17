@@ -734,11 +734,21 @@ pub(crate) mod scratch;
 // settled.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) mod seq_decoder_avx2;
+// The AVX2 loop's common path in assembly. Its table reads are unchecked, so a
+// `fuzz-exports` build, where a caller may hand in a table built elsewhere,
+// keeps the checked Rust loop.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 pub(crate) mod seq_decoder_bmi2;
 pub(crate) mod seq_decoder_scalar;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 pub(crate) mod seq_decoder_vbmi2;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    feature = "kernel-avx2",
+    not(feature = "fuzz-exports")
+))]
+mod seq_loop_asm;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;

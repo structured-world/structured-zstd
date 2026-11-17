@@ -23,6 +23,8 @@ use super::exec_sequence_inline::{
     exec_sequence_avx2_inline_at,
 };
 use super::scratch::FSEScratch;
+#[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
+use super::seq_loop_asm::{Exit, Out};
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
 };
@@ -716,6 +718,89 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         // calls in only for a section with sequences.
         debug_assert!(num_sequences > 0, "sequence section without sequences");
         'short: {
+            // Where the cursor holds for the whole block, the common path runs
+            // in assembly (`seq_loop_asm`); a sequence it leaves is executed
+            // here, decoded here first when it left before decoding.
+            #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
+            if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+                let mut left = num_sequences - 1;
+                while left != 0 {
+                    let mut out = Out {
+                        base: cur.base,
+                        op: cur.op,
+                        cap_w: cur.cap_w,
+                        live_base: cur.live_base.0,
+                    };
+                    // SAFETY: the reader was refilled after its last read (before
+                    // the loop, or at the end of the last step), the states come
+                    // from validated tables, the cursor's base is a linear output
+                    // writable through `cap_w + 31` with its live bytes written,
+                    // and the literals carry their 32 bytes of read slack (the
+                    // assertion at the top of this function).
+                    let exit = unsafe {
+                        super::seq_loop_asm::run(
+                            &mut br,
+                            &mut ll_dec,
+                            &mut ml_dec,
+                            &mut of_dec,
+                            &mut shadow_hist,
+                            &mut out,
+                            literals_buffer.as_ptr(),
+                            &mut lit_cur,
+                            literals_buffer_len,
+                            &mut left,
+                        )
+                    };
+                    let ran = out.op - cur.op;
+                    cur.op = out.op;
+                    seq_sum = seq_sum.wrapping_add(ran as u32);
+                    if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                        buffer.advance_output_counter(ran as u64);
+                    }
+                    let (seq_ll, seq_ml, resolved_offset) = match exit {
+                        Exit::Done => break,
+                        Exit::Pending { ll, ml, offset } => (ll, ml, offset),
+                        Exit::Boundary => {
+                            // SAFETY: as in `short_step!`.
+                            let seq = unsafe {
+                                super::seq_decoder_scalar::decode_resolved(
+                                    &ll_dec,
+                                    &ml_dec,
+                                    &of_dec,
+                                    &mut br,
+                                    &mut shadow_hist,
+                                )
+                            };
+                            ll_dec.update_state_fast(&mut br);
+                            ml_dec.update_state_fast(&mut br);
+                            of_dec.update_state_fast(&mut br);
+                            // SAFETY: as before the loop.
+                            unsafe { br.refill_sequence() };
+                            (seq.ll, seq.ml, seq.of)
+                        }
+                    };
+                    let r = execute_one_body!(
+                        &mut cur,
+                        buffer,
+                        dict,
+                        dict_content,
+                        literals_buffer,
+                        &mut lit_cur,
+                        literals_buffer_len,
+                        seq_ll,
+                        seq_ml,
+                        resolved_offset
+                    );
+                    if let Err(e) = r {
+                        fallback_err = Some(e);
+                        break 'short;
+                    }
+                    seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+                    left -= 1;
+                }
+                short_step!(false, 'short);
+                break 'short;
+            }
             for _ in 1..num_sequences {
                 short_step!(true, 'short);
             }
