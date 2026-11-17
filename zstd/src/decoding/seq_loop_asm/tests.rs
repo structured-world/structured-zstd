@@ -20,7 +20,7 @@ fn shapes() -> Vec<Vec<u8>> {
         let start = long_runs
             .len()
             .saturating_sub(4096 + (state as usize % 4096));
-        if long_runs.len() > 8192 && state % 3 == 0 {
+        if long_runs.len() > 8192 && state.is_multiple_of(3) {
             let len = 256 + (state as usize >> 8) % 900;
             for k in 0..len {
                 let b = long_runs[start + k];
