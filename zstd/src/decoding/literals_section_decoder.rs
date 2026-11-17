@@ -988,7 +988,10 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // the budget note).
     macro_rules! reload1 {
         ($b:ident, $ip:ident) => {{
-            let ctz = $b.trailing_zeros();
+            // SAFETY: the sentinel keeps a bit set in `$b` until the reload
+            // replaces it, so the count needs no zero case (a bare `bsf` on
+            // x86 rather than one guarded by a conditional move).
+            let ctz = unsafe { core::num::NonZero::new_unchecked($b) }.trailing_zeros();
             let nb_bits = (ctz & 7) as u8;
             let new_window = unsafe {
                 $ip = $ip.sub((ctz >> 3) as usize);
@@ -1081,6 +1084,24 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
                     olimit,
                     packed.as_ptr(),
                     table_shift,
+                );
+            }
+            continue;
+        }
+
+        #[cfg(target_arch = "x86")]
+        if TABLE_BITS == 10 || TABLE_BITS == 11 {
+            // SAFETY: both widths take two symbols per stream an iteration
+            // on the 32-bit word; the batch bound above admits `iters`
+            // iterations at worst-case consumption, and the loop runs exactly
+            // that many (it stops when `op0` reaches `olimit`).
+            unsafe {
+                burst_batch_asm_x86::<TABLE_BITS>(
+                    [&mut b0, &mut b1, &mut b2, &mut b3],
+                    [&mut ip0, &mut ip1, &mut ip2, &mut ip3],
+                    [&mut op0, &mut op1, &mut op2, &mut op3],
+                    olimit,
+                    packed.as_ptr(),
                 );
             }
             continue;
@@ -1340,6 +1361,227 @@ unsafe fn burst_batch_asm(
     *ip1 = slots[0];
     *ip2 = slots[1];
     *ip3 = slots[2];
+}
+
+/// One symbol of one stream in [`burst_batch_asm_x86`]: the table entry the
+/// top `32 - $shift` bits of word `$b` index (`ebp` holds the table), the word
+/// advanced by the entry's low byte (`cl`), the symbol (its high byte, `ch`)
+/// stored `$k` past the output pointer in the stack slot `$op`.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_symbol_x86 {
+    ($b:literal, $shift:literal, $op:literal, $k:literal) => {
+        concat!(
+            "mov ecx, ",
+            $b,
+            "\n",
+            "shr ecx, ",
+            $shift,
+            "\n",
+            "movzx ecx, word ptr [ebp + ecx*2]\n",
+            "shl ",
+            $b,
+            ", cl\n",
+            "mov eax, dword ptr [esp + ",
+            $op,
+            "]\n",
+            "mov byte ptr [eax + ",
+            $k,
+            "], ch\n",
+        )
+    };
+}
+
+/// Symbol `$k` of all four streams.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_round_x86 {
+    ($shift:literal, $k:literal) => {
+        concat!(
+            huf_x1_symbol_x86!("ebx", $shift, "16", $k),
+            huf_x1_symbol_x86!("edx", $shift, "20", $k),
+            huf_x1_symbol_x86!("esi", $shift, "24", $k),
+            huf_x1_symbol_x86!("edi", $shift, "28", $k),
+        )
+    };
+}
+
+/// Reload word `$b` from the input pointer in stack slot `$ip` (upstream zstd
+/// `HUF_4X1_RELOAD_STREAM` on a 32-bit word): step back over the whole bytes
+/// consumed, read four, set the sentinel and skip the sub-byte phase. The word
+/// is never zero (the sentinel), so a bare `bsf` counts it.
+#[cfg(target_arch = "x86")]
+macro_rules! huf_x1_reload_x86 {
+    ($b:literal, $ip:literal) => {
+        concat!(
+            "bsf ecx, ",
+            $b,
+            "\n",
+            "mov eax, dword ptr [esp + ",
+            $ip,
+            "]\n",
+            "mov ",
+            $b,
+            ", ecx\n",
+            "shr ",
+            $b,
+            ", 3\n",
+            "and ecx, 7\n",
+            "sub eax, ",
+            $b,
+            "\n",
+            "mov dword ptr [esp + ",
+            $ip,
+            "], eax\n",
+            "mov ",
+            $b,
+            ", dword ptr [eax]\n",
+            "or ",
+            $b,
+            ", 1\n",
+            "shl ",
+            $b,
+            ", cl\n",
+        )
+    };
+}
+
+/// Runs whole iterations of the four-stream loop on 32-bit x86 until `op[0]`
+/// reaches `olimit`, each decoding two symbols per stream and reloading all
+/// four. Seven registers cannot hold four words, four input and four output
+/// pointers, and the compiler kept some words on the stack, which put a store
+/// and a reload on every symbol's dependency chain. Here the four words stay
+/// in registers (`ebx`, `edx`, `esi`, `edi`), with the table in `ebp` and the
+/// entry in `ecx`; the pointers and the bound sit on the stack, read off the
+/// chains. `ebx`, `esi` and `ebp` are saved and restored inside the block,
+/// which therefore uses the stack.
+///
+/// # Safety
+/// `packed` holds `1 << TABLE_BITS` entries and `TABLE_BITS` is 10 or 11, so
+/// two symbols fit an iteration of a 32-bit word. At least one iteration
+/// remains before `op[0]` reaches `olimit`, and every iteration up to it keeps
+/// each stream's reads inside its input and its writes inside its output
+/// segment (the caller's batch bound).
+#[cfg(target_arch = "x86")]
+#[inline(always)]
+unsafe fn burst_batch_asm_x86<const TABLE_BITS: u8>(
+    b: [&mut u32; 4],
+    ip: [&mut *const u8; 4],
+    op: [&mut *mut u8; 4],
+    olimit: *mut u8,
+    packed: *const u16,
+) {
+    let [b0, b1, b2, b3] = b;
+    let [ip0, ip1, ip2, ip3] = ip;
+    let [op0, op1, op2, op3] = op;
+    let word = |w: u32| core::ptr::without_provenance::<u8>(w as usize);
+    // Words, input pointers, output pointers, the bound and the table, in the
+    // order the block reads and writes them (four bytes each).
+    let mut slots: [*const u8; 14] = [
+        word(*b0),
+        word(*b1),
+        word(*b2),
+        word(*b3),
+        *ip0,
+        *ip1,
+        *ip2,
+        *ip3,
+        op0.cast_const(),
+        op1.cast_const(),
+        op2.cast_const(),
+        op3.cast_const(),
+        olimit.cast_const(),
+        packed.cast(),
+    ];
+    // Stack frame inside the block, from `esp`: input pointers at 0-12,
+    // output pointers at 16-28, the bound at 32, the slots' address at 36.
+    macro_rules! run {
+        ($shift:literal) => {
+            // SAFETY: the caller's contract; the block reads the table and the
+            // input windows, writes the output segments named there and the
+            // slots, and leaves every register but its outputs as it found it.
+            unsafe {
+                core::arch::asm!(
+                    "push ebp",
+                    "push esi",
+                    "push ebx",
+                    "push eax",
+                    "push dword ptr [eax + 48]",
+                    "push dword ptr [eax + 44]",
+                    "push dword ptr [eax + 40]",
+                    "push dword ptr [eax + 36]",
+                    "push dword ptr [eax + 32]",
+                    "push dword ptr [eax + 28]",
+                    "push dword ptr [eax + 24]",
+                    "push dword ptr [eax + 20]",
+                    "push dword ptr [eax + 16]",
+                    "mov ebx, dword ptr [eax]",
+                    "mov edx, dword ptr [eax + 4]",
+                    "mov esi, dword ptr [eax + 8]",
+                    "mov edi, dword ptr [eax + 12]",
+                    "mov ebp, dword ptr [eax + 52]",
+                    "2:",
+                    huf_x1_round_x86!($shift, "0"),
+                    huf_x1_round_x86!($shift, "1"),
+                    huf_x1_reload_x86!("ebx", "0"),
+                    huf_x1_reload_x86!("edx", "4"),
+                    huf_x1_reload_x86!("esi", "8"),
+                    huf_x1_reload_x86!("edi", "12"),
+                    "add dword ptr [esp + 16], 2",
+                    "add dword ptr [esp + 20], 2",
+                    "add dword ptr [esp + 24], 2",
+                    "add dword ptr [esp + 28], 2",
+                    "mov eax, dword ptr [esp + 16]",
+                    "cmp eax, dword ptr [esp + 32]",
+                    "jb 2b",
+                    "mov eax, dword ptr [esp + 36]",
+                    "mov dword ptr [eax], ebx",
+                    "mov dword ptr [eax + 4], edx",
+                    "mov dword ptr [eax + 8], esi",
+                    "mov dword ptr [eax + 12], edi",
+                    "mov ecx, dword ptr [esp]",
+                    "mov dword ptr [eax + 16], ecx",
+                    "mov ecx, dword ptr [esp + 4]",
+                    "mov dword ptr [eax + 20], ecx",
+                    "mov ecx, dword ptr [esp + 8]",
+                    "mov dword ptr [eax + 24], ecx",
+                    "mov ecx, dword ptr [esp + 12]",
+                    "mov dword ptr [eax + 28], ecx",
+                    "mov ecx, dword ptr [esp + 16]",
+                    "mov dword ptr [eax + 32], ecx",
+                    "mov ecx, dword ptr [esp + 20]",
+                    "mov dword ptr [eax + 36], ecx",
+                    "mov ecx, dword ptr [esp + 24]",
+                    "mov dword ptr [eax + 40], ecx",
+                    "mov ecx, dword ptr [esp + 28]",
+                    "mov dword ptr [eax + 44], ecx",
+                    "add esp, 40",
+                    "pop ebx",
+                    "pop esi",
+                    "pop ebp",
+                    inout("eax") slots.as_mut_ptr() => _,
+                    out("ecx") _,
+                    out("edx") _,
+                    out("edi") _,
+                );
+            }
+        };
+    }
+    if TABLE_BITS == 10 {
+        run!("22");
+    } else {
+        run!("21");
+    }
+    *b0 = slots[0].addr() as u32;
+    *b1 = slots[1].addr() as u32;
+    *b2 = slots[2].addr() as u32;
+    *b3 = slots[3].addr() as u32;
+    *ip0 = slots[4];
+    *ip1 = slots[5];
+    *ip2 = slots[6];
+    *ip3 = slots[7];
+    *op0 = slots[8].cast_mut();
+    *op1 = slots[9].cast_mut();
+    *op2 = slots[10].cast_mut();
+    *op3 = slots[11].cast_mut();
 }
 
 #[cfg(test)]
