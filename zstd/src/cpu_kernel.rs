@@ -374,8 +374,9 @@ pub trait CpuKernel: Copy + 'static {
 
     /// Whether the running CPU has BMI2 whenever this kernel was selected, so
     /// code under the kernel may use its instructions directly (the literal
-    /// decoder's assembly loop does). Off unless a tier guarantees it.
-    #[cfg(target_arch = "x86_64")]
+    /// decoder's assembly loop does). Off unless a tier guarantees it. Read
+    /// only where that loop is built (eight-byte pointers).
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     const HAS_BMI2: bool = false;
 
     /// Width in bytes of [`Self::copy_chunks`]'s stores. The default is
@@ -559,7 +560,7 @@ impl CpuKernel for Bmi2Kernel {
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     const HAS_BMI2: bool = true;
 
     // Every BMI2 CPU has SSE2.
@@ -603,7 +604,7 @@ impl CpuKernel for Avx2Kernel {
     }
 
     // Selected only with BMI2 confirmed beside AVX2.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     const HAS_BMI2: bool = true;
 
     // 32 bytes, the width the buffers' trailing slack is sized for.
@@ -647,6 +648,7 @@ impl CpuKernel for Vbmi2Kernel {
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
 
+    #[cfg(target_pointer_width = "64")]
     const HAS_BMI2: bool = true;
 
     // The AVX2 width: a 64-byte store would need twice the buffers' trailing

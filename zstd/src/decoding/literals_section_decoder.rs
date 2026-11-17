@@ -1015,7 +1015,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
         // past `ceil`, inside the allocation.
         let olimit = unsafe { op0.add(iters * symbols_per_burst) };
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         if K::HAS_BMI2 && (TABLE_BITS == 10 || TABLE_BITS == 11) {
             // SAFETY: the kernel guarantees BMI2; both widths take five
             // symbols per stream an iteration, the batch bound above admits
@@ -1110,7 +1110,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
 /// bits index (`r15` holds the shift, `r12` the table), the stream advanced by
 /// the entry's low byte, the symbol (its high byte, `ch`) stored `$k` past the
 /// stream's output pointer.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 macro_rules! huf_x1_symbol {
     ($b:literal, $op:literal, $k:literal) => {
         concat!(
@@ -1133,7 +1133,7 @@ macro_rules! huf_x1_symbol {
 }
 
 /// Symbol `$k` of all four streams.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 macro_rules! huf_x1_round {
     ($k:literal) => {
         concat!(
@@ -1151,7 +1151,7 @@ macro_rules! huf_x1_round {
 /// pointer is read into `r15` ahead of the bit count and stepped there, and
 /// the store back is off the stream's chain: subtracting in memory and
 /// reading the result back put a store-forwarding wait on every iteration.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 macro_rules! huf_x1_reload_mem {
     ($b:literal, $slot:literal) => {
         concat!(
@@ -1204,7 +1204,9 @@ macro_rules! huf_x1_reload_mem {
 /// instruction with a REX prefix cannot address, so the four output pointers
 /// sit in registers without one (`rsi`, `rdi`, `rdx`, `rax`) and the entry in
 /// `rcx`; streams 1-3 keep their input pointers in memory and touch them once
-/// an iteration, as upstream does.
+/// an iteration, as upstream does. The slots are addressed as eight-byte words,
+/// so the loop exists only where pointers are eight bytes: the x32 ABI is
+/// `x86_64` with four-byte pointers and takes the Rust loop.
 ///
 /// # Safety
 /// The CPU has BMI2. `packed` holds `1 << (64 - table_shift)` entries and
@@ -1212,7 +1214,7 @@ macro_rules! huf_x1_reload_mem {
 /// iteration remains before `op[0]` reaches `olimit`, and every iteration up
 /// to it keeps each stream's reads inside its input and its writes inside its
 /// output segment (the caller's batch bound).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[inline(always)]
 unsafe fn burst_batch_asm(
     b: [&mut u64; 4],
