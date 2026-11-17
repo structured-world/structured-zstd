@@ -860,7 +860,8 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // A narrower word starts `BURST_WINDOW_SKIP` bytes into the reader's
     // window, which only a stream of eight bytes or more has; a shorter one is
     // left to the drain, as the input budget below leaves it on any width.
-    if BURST_WINDOW_SKIP != 0 && brs.iter().any(|br| br.source.len() < 8) {
+    #[cfg(not(target_pointer_width = "64"))]
+    if brs.iter().any(|br| br.source.len() < 8) {
         return;
     }
 
@@ -1111,11 +1112,15 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
             // Dispatch on the compile-time symbol count so the dominant cases
             // get a fully-unrolled body. `symbols_per_burst` is loop-invariant,
             // so loop-unswitching hoists the match out of the loop; each arm
-            // expands `burst!` to straight-line scalar code. SPB=5 covers
-            // `max_num_bits ∈ {10, 11}`; 6 covers {8, 9}, 7 covers {7}. Rarer
-            // small-max tables fall through to the dynamic loop.
+            // expands `burst!` to straight-line scalar code. On a 64-bit word
+            // SPB=5 covers `max_num_bits ∈ {10, 11}`; 6 covers {8, 9}, 7 covers
+            // {7}. A 32-bit word gives 2 for {8..11} and 3 for {6, 7}, counts
+            // a 64-bit word never reaches, so those arms exist only there.
+            // Rarer small-max tables fall through to the dynamic loop.
             match symbols_per_burst {
+                #[cfg(not(target_pointer_width = "64"))]
                 2 => burst!(2),
+                #[cfg(not(target_pointer_width = "64"))]
                 3 => burst!(3),
                 5 => burst!(5),
                 6 => burst!(6),
