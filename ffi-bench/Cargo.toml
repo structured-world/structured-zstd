@@ -327,3 +327,7 @@ path = "examples/periodic_presplit.rs"
 [[example]]
 name = "owned_check"
 path = "../zstd/examples/owned_check.rs"
+
+[[example]]
+name = "dst_align"
+path = "examples/dst_align.rs"
