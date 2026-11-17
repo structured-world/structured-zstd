@@ -891,34 +891,44 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     let mut b1 = (brs[1].bit_container | 1) << (brs[1].bits_consumed - max_num_bits);
     let mut b2 = (brs[2].bit_container | 1) << (brs[2].bits_consumed - max_num_bits);
     let mut b3 = (brs[3].bit_container | 1) << (brs[3].bits_consumed - max_num_bits);
-    let mut ip0 = brs[0].index;
-    let mut ip1 = brs[1].index;
-    let mut ip2 = brs[2].index;
-    let mut ip3 = brs[3].index;
-    let mut c0 = cursors[0];
-    let mut c1 = cursors[1];
-    let mut c2 = cursors[2];
-    let mut c3 = cursors[3];
+    // Each stream reads and writes through a pointer, as upstream's fast loop
+    // does: an input slice base plus an index, and an output base plus a
+    // cursor, would carry eight more values through a loop that already fills
+    // the registers, and the bases went to the stack.
     // `source` is `&[u8]` (a Copy slice reference), so caching it per stream
-    // takes no borrow of `brs` — the writeback below can still take `brs`
+    // takes no borrow of `brs`; the writeback below can still take `brs`
     // mutably while these stay live.
     let src0 = brs[0].source;
     let src1 = brs[1].source;
     let src2 = brs[2].source;
     let src3 = brs[3].source;
+    // SAFETY: `index <= source.len() - 8` for a stream the reader refilled
+    // on the fast path, and 0 otherwise; either way inside the slice.
+    let mut ip0 = unsafe { src0.as_ptr().add(brs[0].index) };
+    let mut ip1 = unsafe { src1.as_ptr().add(brs[1].index) };
+    let mut ip2 = unsafe { src2.as_ptr().add(brs[2].index) };
+    let mut ip3 = unsafe { src3.as_ptr().add(brs[3].index) };
+    // SAFETY: every cursor lies in `[base, base + regen)`, inside the
+    // caller's reserved allocation (see `alloc_upper_bound`).
+    let mut op0 = unsafe { target_ptr.add(cursors[0]) };
+    let mut op1 = unsafe { target_ptr.add(cursors[1]) };
+    let mut op2 = unsafe { target_ptr.add(cursors[2]) };
+    let mut op3 = unsafe { target_ptr.add(cursors[3]) };
 
     // Decode one symbol on one stream: index `packed` by the top
     // `max_num_bits` of the fused register, emit the byte, consume the code's
     // bit length. SAFETY: `idx = b >> table_shift` lands in
-    // `[0, 1<<max_num_bits) == packed.len()`; lockstep advance keeps every
-    // cursor `< cursor_burst_ceil + symbols_per_burst <= alloc_upper_bound`,
-    // so each `target_ptr.add(c)` write is in-bounds (caller's `reserve`).
+    // `[0, 1<<max_num_bits) == packed.len()`; the batch bound below keeps
+    // every output pointer under `cursor_burst_ceil + symbols_per_burst <=
+    // alloc_upper_bound` past `target_ptr` (caller's `reserve`).
     macro_rules! decode1 {
-        ($b:ident, $c:ident) => {{
+        ($b:ident, $op:ident) => {{
             let idx = ($b >> table_shift) as usize;
             let entry = unsafe { *packed.get_unchecked(idx) };
-            unsafe { target_ptr.add($c).write((entry >> 8) as u8) };
-            $c += 1;
+            unsafe {
+                $op.write((entry >> 8) as u8);
+                $op = $op.add(1);
+            }
             // The low byte is <=12 bits; wrapping_shl discards the symbol
             // byte while keeping the bit count on the dependent path.
             $b = $b.wrapping_shl(u32::from(entry));
@@ -926,18 +936,19 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     }
     // Reload one stream (upstream zstd `HUF_4X1_RELOAD_STREAM`):
     // `ip -= ctz>>3; b = (MEM_read64(ip) | 1) << (ctz & 7)`. SAFETY: the
-    // `min_ip >= bytes_per_iter_upper` gate at loop entry keeps `ip -=
-    // nb_bytes` and the 8-byte window read in-bounds (see the budget note).
+    // batch bound below keeps `ip - nb_bytes` at or above the stream's start
+    // and the 8-byte window inside the stream (see the budget note).
     macro_rules! reload1 {
-        ($b:ident, $ip:ident, $src:expr) => {{
+        ($b:ident, $ip:ident) => {{
             let ctz = $b.trailing_zeros();
-            $ip -= (ctz >> 3) as usize;
             let nb_bits = (ctz & 7) as u8;
-            let new_window = u64::from_le_bytes(unsafe {
-                $src.get_unchecked($ip..$ip + 8)
-                    .try_into()
-                    .unwrap_unchecked()
-            });
+            let new_window = unsafe {
+                $ip = $ip.sub((ctz >> 3) as usize);
+                u64::from_le($ip.cast::<u64>().read_unaligned())
+            };
+            // Reload order `(MEM_read64 | 1) << nb_bits` (NOT `(.. << nb_bits)
+            // | 1`): the sentinel must land at bit `nb_bits` so the next
+            // reload's `ctz` accumulates the sub-byte phase.
             $b = (new_window | 1) << nb_bits;
         }};
     }
@@ -946,10 +957,10 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     macro_rules! burst {
         ($n:literal) => {{
             for _ in 0..$n {
-                decode1!(b0, c0);
-                decode1!(b1, c1);
-                decode1!(b2, c2);
-                decode1!(b3, c3);
+                decode1!(b0, op0);
+                decode1!(b1, op1);
+                decode1!(b2, op2);
+                decode1!(b3, op3);
             }
         }};
     }
@@ -957,81 +968,108 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // Upstream zstd `iiters` safety budget. Worst-case `nb_bytes` per iter is
     // `floor(ctz_max / 8)` where `ctz_max = pad_max + burst_bits`; taking
     // `pad_max = 8` covers the first iter (sentinel at padding_skip ∈ [1,8])
-    // and subsequent iters (nb_bits ∈ [0,7]). The `min_ip >=
-    // bytes_per_iter_upper` gate before each iter keeps every stream's
-    // `ip -= nb_bytes` plus the `source[ip..ip+8]` read in-bounds without
-    // per-stream conditionals.
+    // and subsequent iters (nb_bits ∈ [0,7]). An iteration may start while
+    // every stream's index is at least `bytes_per_iter_upper`, which keeps its
+    // `ip -= nb_bytes` and 8-byte window read inside the stream.
+    //
+    // `ip + 8 <= source.end`: `BitReaderReversed::new()` starts with
+    // `bits_consumed = 64`, so the first `get_bits(1)` of the padding skip
+    // refills. For `source.len() >= 8` that leaves `index = source.len() - 8`,
+    // and `init_state` stays inside that window. The `refill_slow` path of a
+    // shorter stream leaves `index = 0`, so no iteration runs. Inside the
+    // loop `ip` only decreases.
     let bytes_per_iter_upper = (8 + burst_bits as usize) / 8;
+    let ceil = unsafe { target_ptr.add(cursor_burst_ceil) };
+    // Iterations a stream can still start under the budget at worst-case
+    // consumption: one per `bytes_per_iter_upper` bytes above the floor.
+    let input_iters = |ip: *const u8, src: &[u8]| -> usize {
+        // SAFETY: `ip` points into `src` (see above).
+        let index = unsafe { ip.offset_from(src.as_ptr()) } as usize;
+        if index < bytes_per_iter_upper {
+            0
+        } else {
+            (index - bytes_per_iter_upper) / bytes_per_iter_upper + 1
+        }
+    };
     let mut any_iter = false;
 
-    while c0 <= cursor_burst_ceil {
-        let min_ip = ip0.min(ip1).min(ip2).min(ip3);
-        if min_ip < bytes_per_iter_upper {
+    // Upstream's `olimit` shape: the bound is worked out once per batch of
+    // iterations that provably pass both gates (output under `ceil`, every
+    // stream above its byte budget), so the loop body tests one pointer. A
+    // batch runs exactly the iterations the per-iteration gates would admit:
+    // each iteration of it passes them at worst-case consumption, and the
+    // next batch re-reads the real positions.
+    while op0 <= ceil {
+        // SAFETY: both point into the target allocation and `op0 <= ceil`.
+        let output_iters = unsafe { ceil.offset_from(op0) } as usize / symbols_per_burst + 1;
+        let iters = output_iters
+            .min(input_iters(ip0, src0))
+            .min(input_iters(ip1, src1))
+            .min(input_iters(ip2, src2))
+            .min(input_iters(ip3, src3));
+        if iters == 0 {
             break;
         }
         any_iter = true;
+        // SAFETY: `iters` bursts from `op0` end at most `symbols_per_burst`
+        // past `ceil`, inside the allocation.
+        let olimit = unsafe { op0.add(iters * symbols_per_burst) };
 
-        // Dispatch on the compile-time symbol count so the dominant cases get
-        // a fully-unrolled body. `symbols_per_burst` is loop-invariant, so
-        // loop-unswitching hoists the match out of the `while`; each arm
-        // expands `burst!` to straight-line scalar code. SPB=5 covers
-        // `max_num_bits ∈ {10, 11}` (the large-alphabet, literal-heavy case
-        // that dominates decode cost); 6 covers {8, 9}, 7 covers {7}. Rarer
-        // small-max tables fall through to the dynamic loop.
-        match symbols_per_burst {
-            5 => burst!(5),
-            6 => burst!(6),
-            7 => burst!(7),
-            _ => {
-                for _ in 0..symbols_per_burst {
-                    decode1!(b0, c0);
-                    decode1!(b1, c1);
-                    decode1!(b2, c2);
-                    decode1!(b3, c3);
-                }
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if K::HAS_BMI2 && (TABLE_BITS == 10 || TABLE_BITS == 11) {
+            // SAFETY: the kernel guarantees BMI2; both widths take five
+            // symbols per stream an iteration, the batch bound above admits
+            // `iters` iterations at worst-case consumption, and the loop runs
+            // exactly that many (it stops when `op0` reaches `olimit`).
+            unsafe {
+                burst_batch_asm(
+                    [&mut b0, &mut b1, &mut b2, &mut b3],
+                    [&mut ip0, &mut ip1, &mut ip2, &mut ip3],
+                    [&mut op0, &mut op1, &mut op2, &mut op3],
+                    olimit,
+                    packed.as_ptr(),
+                    table_shift,
+                );
             }
+            continue;
         }
 
-        // Reload all 4 streams (upstream zstd `HUF_4X1_RELOAD_STREAM`).
-        //
-        // SAFETY:
-        //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
-        //     gate at outer-loop entry guarantees `nb_bytes <= bytes_per_iter_upper`
-        //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
-        //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
-        //     pre-computes).
-        //   * `ip[s] + 8 <= source.len()`: `BitReaderReversed::new()`
-        //     starts with `bits_consumed = 64`, so the very first
-        //     `get_bits(1)` in the per-stream padding-skip loop
-        //     above triggers `refill()`. For `source.len() >= 8` that
-        //     fast-path establishes `brs[s].index = source.len() - 8`;
-        //     `init_state`'s subsequent `get_bits(max_num_bits)`
-        //     stays inside the same 8-byte window without another
-        //     refill (only `bits_consumed` advances). The
-        //     `refill_slow` path used for shorter streams leaves
-        //     `index = 0` (with the partial bytes left-shifted into
-        //     `bit_container`), making `min_ip = 0 <
-        //     bytes_per_iter_upper` so the burst loop exits via
-        //     `any_iter = false` BEFORE reaching this reload (the
-        //     writeback below is unreachable on `source.len() < 8`).
-        //     Within the loop, `ip[s]` only decreases via the line
-        //     above this comment, preserving the upper bound.
-        // Reload order `(MEM_read64 | 1) << nb_bits` (NOT `(.. << nb_bits) | 1`):
-        // the sentinel must land at bit `nb_bits` so the next reload's `ctz`
-        // accumulates the sub-byte phase; resetting it to bit 0 loses the
-        // phase between reloads.
-        reload1!(b0, ip0, src0);
-        reload1!(b1, ip1, src1);
-        reload1!(b2, ip2, src2);
-        reload1!(b3, ip3, src3);
+        while op0 < olimit {
+            // Dispatch on the compile-time symbol count so the dominant cases
+            // get a fully-unrolled body. `symbols_per_burst` is loop-invariant,
+            // so loop-unswitching hoists the match out of the loop; each arm
+            // expands `burst!` to straight-line scalar code. SPB=5 covers
+            // `max_num_bits ∈ {10, 11}`; 6 covers {8, 9}, 7 covers {7}. Rarer
+            // small-max tables fall through to the dynamic loop.
+            match symbols_per_burst {
+                5 => burst!(5),
+                6 => burst!(6),
+                7 => burst!(7),
+                _ => {
+                    for _ in 0..symbols_per_burst {
+                        decode1!(b0, op0);
+                        decode1!(b1, op1);
+                        decode1!(b2, op2);
+                        decode1!(b3, op3);
+                    }
+                }
+            }
+            reload1!(b0, ip0);
+            reload1!(b1, ip1);
+            reload1!(b2, ip2);
+            reload1!(b3, ip3);
+        }
     }
 
     // Commit cursors to the caller's array (the drain phase reads them)
     // whether or not any burst iter ran.
-    cursors[0] = c0;
-    cursors[1] = c1;
-    cursors[2] = c2;
-    cursors[3] = c3;
+    // SAFETY: every output pointer stayed inside the target allocation.
+    unsafe {
+        cursors[0] = op0.offset_from(target_ptr) as usize;
+        cursors[1] = op1.offset_from(target_ptr) as usize;
+        cursors[2] = op2.offset_from(target_ptr) as usize;
+        cursors[3] = op3.offset_from(target_ptr) as usize;
+    }
 
     // No iter ran → `brs` / `decoders` untouched; the drain resumes from the
     // post-`init_state` reader.
@@ -1045,9 +1083,11 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // for the state just extracted), `state = b >> table_shift`.
     macro_rules! writeback {
         ($i:literal, $b:ident, $ip:ident, $src:expr) => {{
-            brs[$i].index = $ip;
+            // SAFETY: `$ip` points into `$src` with 8 readable bytes.
+            let index = unsafe { $ip.offset_from($src.as_ptr()) } as usize;
+            brs[$i].index = index;
             brs[$i].bit_container = u64::from_le_bytes(unsafe {
-                $src.get_unchecked($ip..$ip + 8)
+                $src.get_unchecked(index..index + 8)
                     .try_into()
                     .unwrap_unchecked()
             });
@@ -1064,6 +1104,186 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     writeback!(1, b1, ip1, src1);
     writeback!(2, b2, ip2, src2);
     writeback!(3, b3, ip3, src3);
+}
+
+/// One symbol of one stream in [`burst_batch_asm`]: the table entry the top
+/// bits index (`r15` holds the shift, `r12` the table), the stream advanced by
+/// the entry's low byte, the symbol (its high byte, `ch`) stored `$k` past the
+/// stream's output pointer.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! huf_x1_symbol {
+    ($b:literal, $op:literal, $k:literal) => {
+        concat!(
+            "shrx rcx, ",
+            $b,
+            ", r15\n",
+            "movzx ecx, word ptr [r12 + rcx*2]\n",
+            "shlx ",
+            $b,
+            ", ",
+            $b,
+            ", rcx\n",
+            "mov byte ptr [",
+            $op,
+            " + ",
+            $k,
+            "], ch\n",
+        )
+    };
+}
+
+/// Symbol `$k` of all four streams.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! huf_x1_round {
+    ($k:literal) => {
+        concat!(
+            huf_x1_symbol!("r8", "rsi", $k),
+            huf_x1_symbol!("r9", "rdi", $k),
+            huf_x1_symbol!("r10", "rdx", $k),
+            huf_x1_symbol!("r11", "rax", $k),
+        )
+    };
+}
+
+/// Reload a stream whose input pointer lives at `[r14 + $slot]`
+/// (upstream zstd `HUF_4X1_RELOAD_STREAM`): step back over the whole bytes
+/// consumed, read eight, set the sentinel and skip the sub-byte phase. The
+/// pointer is read into `r15` ahead of the bit count and stepped there, and
+/// the store back is off the stream's chain: subtracting in memory and
+/// reading the result back put a store-forwarding wait on every iteration.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! huf_x1_reload_mem {
+    ($b:literal, $slot:literal) => {
+        concat!(
+            "mov r15, qword ptr [r14 + ",
+            $slot,
+            "]\n",
+            "bsf ",
+            $b,
+            ", ",
+            $b,
+            "\n",
+            "mov rcx, ",
+            $b,
+            "\n",
+            "shr ",
+            $b,
+            ", 3\n",
+            "sub r15, ",
+            $b,
+            "\n",
+            "mov qword ptr [r14 + ",
+            $slot,
+            "], r15\n",
+            "mov ",
+            $b,
+            ", r15\n",
+            "and ecx, 7\n",
+            "mov ",
+            $b,
+            ", qword ptr [",
+            $b,
+            "]\n",
+            "or ",
+            $b,
+            ", 1\n",
+            "shlx ",
+            $b,
+            ", ",
+            $b,
+            ", rcx\n",
+        )
+    };
+}
+
+/// Runs whole iterations of the four-stream loop until `op[0]` reaches
+/// `olimit`, each decoding five symbols per stream and reloading all four:
+/// the shape of upstream zstd's `HUF_decompress4X1_usingDTable_internal_fast_asm_loop`
+/// (`huf_decompress_amd64.S`), in registers the compiler would not give the
+/// Rust loop. The symbol store writes a high byte register, which an
+/// instruction with a REX prefix cannot address, so the four output pointers
+/// sit in registers without one (`rsi`, `rdi`, `rdx`, `rax`) and the entry in
+/// `rcx`; streams 1-3 keep their input pointers in memory and touch them once
+/// an iteration, as upstream does. The slots are addressed as eight-byte words,
+/// so the loop exists only where pointers are eight bytes: the x32 ABI is
+/// `x86_64` with four-byte pointers and takes the Rust loop.
+///
+/// # Safety
+/// The CPU has BMI2. `packed` holds `1 << (64 - table_shift)` entries and
+/// `table_shift` is 53 or 54, so five symbols fit an iteration. At least one
+/// iteration remains before `op[0]` reaches `olimit`, and every iteration up
+/// to it keeps each stream's reads inside its input and its writes inside its
+/// output segment (the caller's batch bound).
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[inline(always)]
+unsafe fn burst_batch_asm(
+    b: [&mut u64; 4],
+    ip: [&mut *const u8; 4],
+    op: [&mut *mut u8; 4],
+    olimit: *mut u8,
+    packed: *const u16,
+    table_shift: u32,
+) {
+    let [b0, b1, b2, b3] = b;
+    let [ip0, ip1, ip2, ip3] = ip;
+    let [op0, op1, op2, op3] = op;
+    // Streams 1-3's input pointers, the loop bound and the table shift,
+    // addressed through r14. The reloads borrow r15 and take the shift back
+    // from its slot.
+    let mut slots: [*const u8; 5] = [
+        *ip1,
+        *ip2,
+        *ip3,
+        olimit.cast_const(),
+        core::ptr::without_provenance(table_shift as usize),
+    ];
+    // SAFETY: the caller's contract; the asm reads the table and the input
+    // windows and writes the output segments named there, and the slots.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            huf_x1_round!("0"),
+            huf_x1_round!("1"),
+            huf_x1_round!("2"),
+            huf_x1_round!("3"),
+            huf_x1_round!("4"),
+            "bsf r8, r8",
+            "mov rcx, r8",
+            "shr r8, 3",
+            "sub r13, r8",
+            "and ecx, 7",
+            "mov r8, qword ptr [r13]",
+            "or r8, 1",
+            "shlx r8, r8, rcx",
+            huf_x1_reload_mem!("r9", "0"),
+            huf_x1_reload_mem!("r10", "8"),
+            huf_x1_reload_mem!("r11", "16"),
+            "mov r15, qword ptr [r14 + 32]",
+            "add rsi, 5",
+            "add rdi, 5",
+            "add rdx, 5",
+            "add rax, 5",
+            "cmp rsi, qword ptr [r14 + 24]",
+            "jb 2b",
+            inout("r8") *b0,
+            inout("r9") *b1,
+            inout("r10") *b2,
+            inout("r11") *b3,
+            inout("rsi") *op0,
+            inout("rdi") *op1,
+            inout("rdx") *op2,
+            inout("rax") *op3,
+            inout("r13") *ip0,
+            in("r12") packed,
+            in("r14") slots.as_mut_ptr(),
+            inout("r15") u64::from(table_shift) => _,
+            out("rcx") _,
+            options(nostack),
+        );
+    }
+    *ip1 = slots[0];
+    *ip2 = slots[1];
+    *ip3 = slots[2];
 }
 
 #[cfg(test)]
