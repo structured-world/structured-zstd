@@ -718,18 +718,28 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         // calls in only for a section with sequences.
         debug_assert!(num_sequences > 0, "sequence section without sequences");
         'short: {
+            // Sequences before the last still to run in Rust: all of them,
+            // unless the assembly below takes them first.
+            #[cfg_attr(
+                not(all(target_pointer_width = "64", not(feature = "fuzz-exports"))),
+                allow(unused_mut)
+            )]
+            let mut rust_steps = num_sequences - 1;
             // Where the cursor holds for the whole block, the common path runs
-            // in assembly (`seq_loop_asm`); a sequence it leaves is executed
-            // here, decoded here first when it left before decoding.
+            // in assembly (`seq_loop_asm`); a sequence it leaves decoded is
+            // executed here. Near the start of the bit stream it leaves before
+            // decoding, and from there the Rust loop below finishes the block:
+            // every later pass would leave at once again.
             #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
             if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
-                let mut left = num_sequences - 1;
+                let mut left = rust_steps;
                 while left != 0 {
                     let mut out = Out {
                         base: cur.base,
                         op: cur.op,
                         cap_w: cur.cap_w,
                         live_base: cur.live_base.0,
+                        dict_end: cur.dict_end,
                     };
                     // SAFETY: the reader was refilled after its last read (before
                     // the loop, or at the end of the last step), the states come
@@ -748,6 +758,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                             literals_buffer.as_ptr(),
                             &mut lit_cur,
                             literals_buffer_len,
+                            dict_content,
                             &mut left,
                         )
                     };
@@ -758,26 +769,8 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                         buffer.advance_output_counter(ran as u64);
                     }
                     let (seq_ll, seq_ml, resolved_offset) = match exit {
-                        Exit::Done => break,
                         Exit::Pending { ll, ml, offset } => (ll, ml, offset),
-                        Exit::Boundary => {
-                            // SAFETY: as in `short_step!`.
-                            let seq = unsafe {
-                                super::seq_decoder_scalar::decode_resolved(
-                                    &ll_dec,
-                                    &ml_dec,
-                                    &of_dec,
-                                    &mut br,
-                                    &mut shadow_hist,
-                                )
-                            };
-                            ll_dec.update_state_fast(&mut br);
-                            ml_dec.update_state_fast(&mut br);
-                            of_dec.update_state_fast(&mut br);
-                            // SAFETY: as before the loop.
-                            unsafe { br.refill_sequence() };
-                            (seq.ll, seq.ml, seq.of)
-                        }
+                        Exit::Done | Exit::Boundary => break,
                     };
                     let r = execute_one_body!(
                         &mut cur,
@@ -798,10 +791,9 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                     seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
                     left -= 1;
                 }
-                short_step!(false, 'short);
-                break 'short;
+                rust_steps = left;
             }
-            for _ in 1..num_sequences {
+            for _ in 0..rust_steps {
                 short_step!(true, 'short);
             }
             short_step!(false, 'short);

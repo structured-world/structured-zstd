@@ -82,3 +82,67 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
         }
     }
 }
+
+/// The same comparison on frames made against a dictionary, whose matches
+/// reach into it: wholly inside it (the assembly copies those), running out of
+/// it into the output and ending too near its end for sixteen-byte reads (the
+/// Rust path executes those). Frames of 4 KiB, where nearly every match is a
+/// dictionary one, and of 64 KiB, where the dictionary's reach ends.
+#[cfg(feature = "std")]
+#[test]
+fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
+    use crate::decoding::{Dictionary, DictionaryHandle};
+    use crate::encoding::FrameCompressor;
+
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let dict_content = corpus[600 * 1024..632 * 1024].to_vec();
+    let dict_id = 0x5E0_D1C7;
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(dict_id, dict_content.clone()).expect("decoder dictionary"),
+    );
+    let inputs = [
+        corpus[610 * 1024..614 * 1024].to_vec(),
+        corpus[200 * 1024..204 * 1024].to_vec(),
+        corpus[300 * 1024..364 * 1024].to_vec(),
+    ];
+    for (shape, input) in inputs.iter().enumerate() {
+        for level in [1, 3, 9, 16, 19] {
+            let mut compressor: FrameCompressor =
+                FrameCompressor::new(CompressionLevel::from_level(level));
+            compressor
+                .set_dictionary(
+                    Dictionary::from_raw_content(dict_id, dict_content.clone())
+                        .expect("encoder dictionary"),
+                )
+                .expect("attach dictionary");
+            let frame = compressor.compress_independent_frame(input);
+            for slack in [0usize, 64] {
+                let mut target = alloc::vec![0u8; input.len() + slack];
+                let wrote = FrameDecoder::new()
+                    .decode_all_with_dict_handle(&frame, &mut target, &handle)
+                    .expect("slice decode");
+                assert_eq!(wrote, input.len(), "shape {shape} level {level}");
+                assert!(
+                    target[..wrote] == input[..],
+                    "slice decode differs: shape {shape} level {level} slack {slack}"
+                );
+            }
+            let mut decoder =
+                StreamingDecoder::new_with_dictionary_handle(frame.as_slice(), &handle)
+                    .unwrap_or_else(|_| panic!("dictionary refused"));
+            let mut streamed = Vec::new();
+            let mut piece = [0u8; 4096];
+            loop {
+                let n = std::io::Read::read(&mut decoder, &mut piece).expect("stream decode");
+                if n == 0 {
+                    break;
+                }
+                streamed.extend_from_slice(&piece[..n]);
+            }
+            assert!(
+                streamed == *input,
+                "stream decode differs: shape {shape} level {level}"
+            );
+        }
+    }
+}

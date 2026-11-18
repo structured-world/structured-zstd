@@ -9,8 +9,9 @@
 //!
 //! The assembly executes only what it can do without asking the buffer: the
 //! literals in bounds, a match from 16 or more bytes back inside the output
-//! written so far, shorter than 256 bytes, the write and its overshoot inside
-//! the output's room. Anything else leaves the loop with the sequence decoded
+//! written so far or wholly inside the dictionary with sixteen-byte reads to
+//! spare, shorter than 256 bytes, the write and its overshoot inside the
+//! output's room. Anything else leaves the loop with the sequence decoded
 //! and the states advanced ([`Exit::Pending`]), and the caller executes it on
 //! the Rust path, which handles every case. Near the start of the bit stream,
 //! where a refill could reach before it, the loop leaves before decoding
@@ -80,6 +81,12 @@ struct Slots {
     ll: u64,
     ml: u64,
     offset: u64,
+    /// A dictionary match's literals must end below this address for the
+    /// window to still hold the dictionary (112).
+    dict_limit: usize,
+    /// Dictionary content length (120) and the address one past its end (128).
+    dict_len: usize,
+    dict_end: usize,
 }
 
 /// Why the loop stopped.
@@ -104,6 +111,8 @@ pub(super) struct Out {
     pub(super) cap_w: usize,
     /// The cursor's `live_base`: the live output is `op - live_base`, modular.
     pub(super) live_base: usize,
+    /// The cursor's `dict_end`: a dictionary match's literals end below it.
+    pub(super) dict_end: usize,
 }
 
 /// Runs up to `*left` sequences, each advancing the states, decrementing
@@ -114,8 +123,9 @@ pub(super) struct Out {
 /// its window `source[index..index + 8]` is in bounds; the three decoders hold
 /// validated states of tables with `1 << accuracy_log` built entries. `out`
 /// describes a linear output writable through `cap_w + 31`, whose bytes from
-/// `live_base` to `op` are written. `literals` is readable `lit_len + 32` bytes
-/// from its start. `*left >= 1`.
+/// `live_base` to `op` are written, and the window holds `dict_content` for a
+/// match whose literals end below `dict_end`. `literals` is readable
+/// `lit_len + 32` bytes from its start. `*left >= 1`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(super) unsafe fn run(
@@ -128,6 +138,7 @@ pub(super) unsafe fn run(
     literals: *const u8,
     lit_cur: &mut usize,
     lit_len: usize,
+    dict_content: &[u8],
     left: &mut usize,
 ) -> Exit {
     debug_assert!(*left >= 1);
@@ -149,6 +160,12 @@ pub(super) unsafe fn run(
         ll: 0,
         ml: 0,
         offset: 0,
+        // A position past the address space means the window never runs out
+        // within this output, which the largest address says as well; zero
+        // (no dictionary room) gives `base`, below every write position.
+        dict_limit: base.checked_add(out.dict_end).unwrap_or(usize::MAX),
+        dict_len: dict_content.len(),
+        dict_end: dict_content.as_ptr() as usize + dict_content.len(),
     };
     let mut container = br.bit_container;
     let mut consumed = u64::from(br.bits_consumed);
@@ -247,8 +264,9 @@ pub(super) unsafe fn run(
             "lea rax, [r14 + rdx]",
             "sub rax, qword ptr [rsi + 72]",
             "cmp rcx, rax",
-            "ja 80f",
+            "ja 60f",
             // Literals: sixteen, then the rest sixteen at a time.
+            "33:",
             "vmovdqu xmm0, xmmword ptr [r15]",
             "vmovdqu xmmword ptr [r14], xmm0",
             "cmp rdx, 16",
@@ -330,6 +348,31 @@ pub(super) unsafe fn run(
             "cmp rdx, rdi",
             "jb 42b",
             "jmp 41b",
+            // A match reaching past the output (`rax` the output behind it):
+            // taken when its literals end below the dictionary limit and the
+            // match lies inside the dictionary with its reads rounded up to
+            // sixteen, as the Rust path's extDict branch takes it. `rcx`
+            // becomes the distance from the match's write position to its
+            // dictionary source, so the copies above run unchanged.
+            "60:",
+            "lea rdx, [r14 + rdx]",
+            "cmp rdx, qword ptr [rsi + 112]",
+            "jae 80f",
+            "neg rax",
+            "add rax, rcx",
+            "cmp rax, qword ptr [rsi + 120]",
+            "ja 80f",
+            "lea rdx, [rdi + 15]",
+            "and rdx, -16",
+            "cmp rdx, rax",
+            "ja 80f",
+            "mov rdx, qword ptr [rsi + 128]",
+            "sub rdx, rax",
+            "mov rcx, qword ptr [rsi + 88]",
+            "add rcx, r14",
+            "sub rcx, rdx",
+            "mov rdx, qword ptr [rsi + 88]",
+            "jmp 33b",
             "80:",
             "mov qword ptr [rsi + 96], rdi",
             "mov qword ptr [rsi + 104], rcx",
