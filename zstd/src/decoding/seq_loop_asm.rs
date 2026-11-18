@@ -58,13 +58,20 @@ macro_rules! seq_state_update {
 /// same way.
 const INPUT_FLOOR: usize = 16;
 
-/// Whether a pass can begin at the reader's position: the assembly's own first
-/// test, asked before the call so a stream shorter than the floor (a small
-/// frame of a few sequences) pays nothing for entering a loop that would leave
-/// at once.
+/// Fewest sequences a block must have for the loop to be entered. Entering
+/// costs about 150 instructions (the call, the loop state, the hand-back), and
+/// a pass saves some 15 a sequence against the Rust loop, which in any case
+/// runs the last sequences of the block below the floor. A 4 KiB frame of 13
+/// sequences against a dictionary decoded about 5% slower for entering; at 64
+/// the sequences the loop runs pay for the entry several times over.
+const MIN_SEQUENCES: usize = 64;
+
+/// Whether entering the loop for `steps` sequences pays: enough of them, and
+/// the reader above the floor, the assembly's own first test, so a block the
+/// loop would leave at once never enters it.
 #[inline(always)]
-pub(super) fn can_start(br: &BitReaderReversed<'_, Avx2Kernel>) -> bool {
-    br.index >= INPUT_FLOOR
+pub(super) fn pays_to_enter(br: &BitReaderReversed<'_, Avx2Kernel>, steps: usize) -> bool {
+    steps >= MIN_SEQUENCES && br.index >= INPUT_FLOOR
 }
 
 /// What the assembly reads and writes besides its registers, addressed

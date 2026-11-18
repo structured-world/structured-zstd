@@ -831,8 +831,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
             if B::CURSOR_IS_BLOCK_STABLE
                 && B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && rust_steps != 0
-                && super::seq_loop_asm::can_start(&br)
+                && super::seq_loop_asm::pays_to_enter(&br, rust_steps)
             {
                 // SAFETY: the reader was refilled after its last read (before
                 // the loop) and stands above the floor, the states come from

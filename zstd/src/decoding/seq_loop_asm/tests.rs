@@ -86,8 +86,11 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
 /// The same comparison on frames made against a dictionary, whose matches
 /// reach into it: wholly inside it (the assembly copies those), running out of
 /// it into the output and ending too near its end for sixteen-byte reads (the
-/// Rust path executes those). Frames of 4 KiB, where nearly every match is a
-/// dictionary one, and of 64 KiB, where the dictionary's reach ends.
+/// Rust path executes those). A 16 KiB frame of dictionary pieces of 40 to 199
+/// bytes from all over it, the last near its end, between short runs of
+/// other text, so nearly every match is a dictionary one in a block long
+/// enough for the loop to be entered; and a frame of 64 KiB of other text,
+/// where the dictionary's reach ends.
 #[cfg(feature = "std")]
 #[test]
 fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
@@ -100,11 +103,21 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
     let handle = DictionaryHandle::from_dictionary(
         Dictionary::from_raw_content(dict_id, dict_content.clone()).expect("decoder dictionary"),
     );
-    let inputs = [
-        corpus[610 * 1024..614 * 1024].to_vec(),
-        corpus[200 * 1024..204 * 1024].to_vec(),
-        corpus[300 * 1024..364 * 1024].to_vec(),
-    ];
+    let mut pieces = Vec::new();
+    let mut k = 0usize;
+    while pieces.len() < 16 * 1024 {
+        let len = 40 + k % 160;
+        let at = if k % 9 == 8 {
+            dict_content.len() - len
+        } else {
+            (k * 7919) % (dict_content.len() - len)
+        };
+        pieces.extend_from_slice(&dict_content[at..at + len]);
+        let gap = 100 * 1024 + k * 37;
+        pieces.extend_from_slice(&corpus[gap..gap + 12]);
+        k += 1;
+    }
+    let inputs = [pieces, corpus[300 * 1024..364 * 1024].to_vec()];
     for (shape, input) in inputs.iter().enumerate() {
         for level in [1, 3, 9, 16, 19] {
             let mut compressor: FrameCompressor =
