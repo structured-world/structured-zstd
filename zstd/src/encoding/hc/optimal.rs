@@ -45,7 +45,7 @@ use crate::encoding::{
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
         HcBlockPass, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
-        MatchCandidate,
+        OptMatch,
     },
 };
 
@@ -59,7 +59,7 @@ type OptimalCollectFn = unsafe fn(
     usize,
     &[u32; 3],
     bool,
-    &mut RegionVec<MatchCandidate>,
+    &mut RegionVec<OptMatch>,
 );
 
 macro_rules! build_optimal_plan_impl_body {
@@ -436,10 +436,10 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             if let Some(candidate) = candidates.last() {
-                let longest_len = candidate.match_len.min($current_len);
+                let longest_len = (candidate.match_len as usize).min($current_len);
                 if longest_len > sufficient_len {
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         initial_litlen,
                         initial_reps,
                     );
@@ -459,7 +459,7 @@ macro_rules! build_optimal_plan_impl_body {
                     // SAFETY: cell 0 was written by the seed above (a candidate exists).
                     let forced_price = BtMatcher::add_prices(unsafe { *node_prices }, seq_cost);
                     let forced_state = HcOptimalNode {
-                        off: candidate.offset as u32,
+                        off: candidate.offset,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: initial_reps,
@@ -476,7 +476,7 @@ macro_rules! build_optimal_plan_impl_body {
             if !seed_forced_shortest_path {
                 let mut prev_max_len = min_match_len - 1;
                 for candidate in candidates.iter() {
-                    let max_match_len = candidate.match_len.min(frontier_limit);
+                    let max_match_len = (candidate.match_len as usize).min(frontier_limit);
                     if max_match_len < min_match_len {
                         continue;
                     }
@@ -497,7 +497,7 @@ macro_rules! build_optimal_plan_impl_body {
                         };
                     }
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         initial_litlen,
                         initial_reps,
                     );
@@ -530,7 +530,7 @@ macro_rules! build_optimal_plan_impl_body {
                             unsafe {
                                 HcOptimalNode::write_match_end(
                                     nodes.add(match_len),
-                                    candidate.offset as u32,
+                                    candidate.offset,
                                     match_len as u32,
                                 );
                                 *node_prices.add(match_len) = next_cost;
@@ -774,14 +774,14 @@ macro_rules! build_optimal_plan_impl_body {
             let base_reps = unsafe { (*nodes.add(pos)).reps };
             let base_litlen = unsafe { (*nodes.add(pos)).litlen as usize };
             if let Some(candidate) = candidates.last() {
-                let longest_len = candidate.match_len.min($current_len - pos);
+                let longest_len = (candidate.match_len as usize).min($current_len - pos);
                 if longest_len > sufficient_len
                     || pos + longest_len >= HC_OPT_NUM
                     || pos + longest_len >= $current_len
                 {
                     let lit_len = base_litlen;
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         lit_len,
                         base_reps,
                     );
@@ -802,7 +802,7 @@ macro_rules! build_optimal_plan_impl_body {
                     let end_pos = (pos + longest_len).min($current_len);
                     forced_end = Some(end_pos);
                     forced_end_state = Some(HcOptimalNode {
-                        off: candidate.offset as u32,
+                        off: candidate.offset,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: base_reps,
@@ -821,7 +821,7 @@ macro_rules! build_optimal_plan_impl_body {
             debug_assert!(pos <= frontier_limit);
             let mut start_len = min_match_len;
             for candidate in candidates.iter() {
-                let max_match_len = candidate.match_len;
+                let max_match_len = candidate.match_len as usize;
                 debug_assert!(max_match_len >= start_len, "the candidate ladder rises");
                 debug_assert!(pos + max_match_len <= frontier_limit);
                 let max_next = pos + max_match_len;
@@ -832,7 +832,7 @@ macro_rules! build_optimal_plan_impl_body {
                 }
                 let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
-                    candidate.offset as u32,
+                    candidate.offset,
                     lit_len,
                     base_reps,
                 );
@@ -866,7 +866,7 @@ macro_rules! build_optimal_plan_impl_body {
                             unsafe {
                                 HcOptimalNode::write_match_end(
                                     nodes.add(next),
-                                    candidate.offset as u32,
+                                    candidate.offset,
                                     match_len as u32,
                                 );
                                 *node_prices.add(next) = next_cost;
@@ -918,7 +918,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 ll0_price,
                                 off_price,
                                 base_cost,
-                                candidate.offset as u32,
+                                candidate.offset,
                                 last_pos,
                             )
                         });
@@ -2114,7 +2114,7 @@ impl HcMatchGenerator {
         current_abs_end: usize,
         sufficient_match_len: usize,
         query: HcCandidateQuery,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut Vec<OptMatch>,
     ) {
         use crate::encoding::strategy::{self, StrategyTag};
         self.table.ensure_tables();
@@ -2234,7 +2234,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         #[cfg(all(
             target_arch = "aarch64",
@@ -2365,7 +2365,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2399,7 +2399,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2439,7 +2439,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2473,7 +2473,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2514,7 +2514,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
@@ -2551,7 +2551,7 @@ impl HcMatchGenerator {
         sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         collect_optimal_candidates_initialized_body!(
             self,

@@ -24,6 +24,19 @@ pub(crate) struct MatchCandidate {
     pub(crate) match_len: usize,
 }
 
+/// One match the optimal parser's search found at the position being parsed:
+/// its offset and length, upstream zstd's `ZSTD_match_t` (zstd_opt.c). The
+/// position is the parser's own, so the candidate does not carry it, and two
+/// `u32`s hold a candidate in 8 bytes on every target, as upstream's
+/// `matches[]` does. Both fit: an offset is at most the window (`2^31`), a
+/// length at most a block.
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct OptMatch {
+    pub(crate) offset: u32,
+    pub(crate) match_len: u32,
+}
+
 /// DP cell in the optimal parser table. Stores the chosen offset/match-length,
 /// the literal-run length, and the rep-code history that would be active after
 /// committing this cell.
@@ -90,7 +103,7 @@ pub(crate) struct HcOptimalSequence {
 pub(crate) struct HcCandidateQuery {
     pub(crate) reps: [u32; 3],
     pub(crate) lit_len: usize,
-    pub(crate) ldm_candidate: Option<MatchCandidate>,
+    pub(crate) ldm_candidate: Option<OptMatch>,
 }
 
 /// Per-frame DP state captured at the start of `build_optimal_plan_impl`:
@@ -133,9 +146,9 @@ pub(crate) struct HcOptimalPlanBuffers {
     pub(crate) node_prices: Table<MaybeUninit<u32>>,
     /// The candidates of the position being parsed, written in place in
     /// [`Self::candidate_room`].
-    pub(crate) candidates: RegionVec<MatchCandidate>,
+    pub(crate) candidates: RegionVec<OptMatch>,
     /// Backs [`Self::candidates`]; untouched while the buffers are out.
-    pub(crate) candidate_room: Table<MaybeUninit<MatchCandidate>>,
+    pub(crate) candidate_room: Table<MaybeUninit<OptMatch>>,
     /// Single backing allocation for the LL/ML price caches as `[price,
     /// generation]` pairs, laid out as two fixed-stride `HC_OPT_NUM + 1`
     /// regions (LL pairs, ML pairs). One base pointer + fixed offsets,

@@ -371,7 +371,7 @@ pub(crate) use prefix_len_first_word;
 macro_rules! push_opt_candidate {
     ($out:expr, $candidate:expr) => {{
         let out: &mut $crate::encoding::workspace::RegionVec<
-            $crate::encoding::opt::types::MatchCandidate,
+            $crate::encoding::opt::types::OptMatch,
         > = $out;
         let candidate = $candidate;
         // SAFETY: the room holds more candidates than one search writes.
@@ -453,10 +453,9 @@ macro_rules! rep_probe_slot {
             if match_len > *$best_len_for_skip {
                 $crate::encoding::hc::generator::push_opt_candidate!(
                     &mut *$out,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset: rep,
-                        match_len,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: rep as u32,
+                        match_len: match_len as u32,
                     }
                 );
                 *$best_len_for_skip = match_len;
@@ -800,7 +799,13 @@ macro_rules! bt_insert_and_collect_matches_body {
                 debug_assert!(
                     h3.match_len >= $min_match_len && h3.match_len > *$best_len_for_skip
                 );
-                $crate::encoding::hc::generator::push_opt_candidate!(&mut *$out, h3);
+                $crate::encoding::hc::generator::push_opt_candidate!(
+                    &mut *$out,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: h3.offset as u32,
+                        match_len: h3.match_len as u32,
+                    }
+                );
                 *$best_len_for_skip = h3.match_len;
                 // Same fold as the repeat probe: the block end lives in the
                 // length space the probe already carries.
@@ -988,10 +993,9 @@ macro_rules! bt_insert_and_collect_matches_body {
                 let offset = stored.wrapping_sub(match_stored) as usize;
                 $crate::encoding::hc::generator::push_opt_candidate!(
                     &mut *$out,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset,
-                        match_len,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: offset as u32,
+                        match_len: match_len as u32,
                     }
                 );
                 *$best_len_for_skip = match_len;
@@ -1112,10 +1116,9 @@ macro_rules! bt_insert_and_collect_matches_body {
                     );
                     $crate::encoding::hc::generator::push_opt_candidate!(
                         &mut *$out,
-                        $crate::encoding::opt::types::MatchCandidate {
-                            start: $abs_pos,
-                            offset: idx - dict_idx,
-                            match_len,
+                        $crate::encoding::opt::types::OptMatch {
+                            offset: (idx - dict_idx) as u32,
+                            match_len: match_len as u32,
                         }
                     );
                     *$best_len_for_skip = match_len;

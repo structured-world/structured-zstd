@@ -22,7 +22,7 @@ fn estimated_workspace_bytes_matches_retained_scratch_at_growth_bounds() {
     bt.opt_price_arena = Table::owned(alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN]);
     let rounded = region_bytes::<HcOptimalNode>(HC_OPT_NODE_LEN)
         + region_bytes::<u32>(HC_OPT_NODE_LEN)
-        + region_bytes::<MatchCandidate>(HC_OPT_CANDIDATE_CAPACITY)
+        + region_bytes::<OptMatch>(HC_OPT_CANDIDATE_CAPACITY)
         + region_bytes::<HcOptimalSequence>(plan)
         + region_bytes::<[u32; 2]>(HC_OPT_PRICE_ARENA_LEN);
     assert_eq!(
