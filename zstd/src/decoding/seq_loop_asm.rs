@@ -58,6 +58,15 @@ macro_rules! seq_state_update {
 /// same way.
 const INPUT_FLOOR: usize = 16;
 
+/// Whether a pass can begin at the reader's position: the assembly's own first
+/// test, asked before the call so a stream shorter than the floor (a small
+/// frame of a few sequences) pays nothing for entering a loop that would leave
+/// at once.
+#[inline(always)]
+pub(super) fn can_start(br: &BitReaderReversed<'_, Avx2Kernel>) -> bool {
+    br.index >= INPUT_FLOOR
+}
+
 /// What the assembly reads and writes besides its registers, addressed
 /// through `rsi`. The offsets are the assembly's.
 #[repr(C)]

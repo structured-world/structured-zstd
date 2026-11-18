@@ -731,7 +731,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             // decoding, and from there the Rust loop below finishes the block:
             // every later pass would leave at once again.
             #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
-            if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            if B::CURSOR_IS_BLOCK_STABLE
+                && B::SUPPORTS_INLINE_SEQUENCE_EXEC
+                && super::seq_loop_asm::can_start(&br)
+            {
                 let mut left = rust_steps;
                 while left != 0 {
                     let mut out = Out {
