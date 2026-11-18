@@ -1493,7 +1493,10 @@ impl HcMatchGenerator {
         // The pass holds at most a segment's plan beyond what it has; when the
         // room runs short it stops, the plan so far goes to the sink, and the
         // pass is entered again where it stopped, as upstream stores each
-        // segment's sequences into `seqStore` before the next segment.
+        // segment's sequences into `seqStore` before the next segment. The
+        // pass functions are `#[inline(never)]`: called in this loop, the AVX2
+        // one was inlined into the driver, and the merged body took 9% more
+        // instructions at level 16 on a 1 MiB corpus file.
         let mut literals_start = 0usize;
         loop {
             #[cfg(all(
@@ -1814,7 +1817,7 @@ impl HcMatchGenerator {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     unsafe fn run_optimal_block_neon<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -1853,7 +1856,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     unsafe fn run_optimal_block_sse42<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -1892,7 +1895,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     unsafe fn run_optimal_block_sse2<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -1928,7 +1931,7 @@ impl HcMatchGenerator {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     unsafe fn run_optimal_block_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -1979,7 +1982,7 @@ impl HcMatchGenerator {
         ),
         allow(dead_code)
     )]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn run_optimal_block_scalar<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -2022,7 +2025,7 @@ impl HcMatchGenerator {
     // blocks (needed by the safe scalar wrapper) are redundant inside this
     // target_feature fn.
     #[allow(unused_unsafe)]
-    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     unsafe fn run_optimal_block_simd128<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
