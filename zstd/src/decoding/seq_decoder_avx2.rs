@@ -32,6 +32,8 @@ use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader
 use crate::cpu_kernel::Avx2Kernel;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
+#[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
+use crate::{bit_io::BitReaderReversed, fse::SeqFSEDecoder};
 
 /// Textual expansion of per-sequence decode. Reads LL/ML/OF state,
 /// performs triple-bit extract via `peek_bits_triple_bmi2` (`_pext_u64`
@@ -460,6 +462,102 @@ macro_rules! execute_one_body {
     }};
 }
 
+/// The short arm's common path in assembly (`seq_loop_asm`) for a backend
+/// whose cursor holds for the block: runs `steps` sequences, each advancing
+/// the states, executing here every sequence the loop leaves decoded, and
+/// returns how many of them are still to run, decoded from the reader's
+/// position (the loop stopped near the start of the bit stream). Out of line,
+/// so the monolith around the Rust loop keeps its own register allocation.
+///
+/// # Safety
+/// The CPU has BMI2 and AVX2. The reader was refilled after its last read and
+/// reaches at least `INPUT_FLOOR` bytes into the stream, the states come from
+/// validated tables, `cur` is the block's cursor over a linear output, and the
+/// literals carry their 32 bytes of read slack. `steps >= 1`.
+#[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
+#[target_feature(enable = "bmi2,avx2")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_short_arm_asm<B: BufferBackend>(
+    buffer: &mut DecodeBuffer<B>,
+    cur: &mut OutCursor,
+    br: &mut BitReaderReversed<'_, Avx2Kernel>,
+    ll_dec: &mut SeqFSEDecoder<'_>,
+    ml_dec: &mut SeqFSEDecoder<'_>,
+    of_dec: &mut SeqFSEDecoder<'_>,
+    hist: &mut [u32; 3],
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
+    dict_content: &[u8],
+    literals_buffer: &[u8],
+    literals_buffer_len: usize,
+    lit_cur: &mut usize,
+    seq_sum: &mut u32,
+    steps: usize,
+) -> Result<usize, DecompressBlockError> {
+    let out = Out {
+        base: cur.base,
+        cap_w: cur.cap_w,
+        live_base: cur.live_base.0,
+        dict_end: cur.dict_end,
+    };
+    // SAFETY: the caller's contract; the reader, states and history stay
+    // with the loop until `finish` below.
+    let mut asm_loop = unsafe {
+        Loop::new(
+            br,
+            ll_dec,
+            ml_dec,
+            of_dec,
+            hist,
+            &out,
+            literals_buffer.as_ptr(),
+            literals_buffer_len,
+            dict_content,
+            steps,
+        )
+    };
+    let mut result = Ok(());
+    loop {
+        let op_before = cur.op;
+        // SAFETY: `Loop::new` above; every pending sequence so far was
+        // executed below and counted.
+        let exit = unsafe { asm_loop.pass(&mut cur.op, lit_cur) };
+        let ran = cur.op - op_before;
+        *seq_sum = seq_sum.wrapping_add(ran as u32);
+        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+            buffer.advance_output_counter(ran as u64);
+        }
+        let (seq_ll, seq_ml, resolved_offset) = match exit {
+            Exit::Pending { ll, ml, offset } => (ll, ml, offset),
+            Exit::Done | Exit::Boundary => break,
+        };
+        let r = execute_one_body!(
+            cur,
+            buffer,
+            dict,
+            dict_content,
+            literals_buffer,
+            lit_cur,
+            literals_buffer_len,
+            seq_ll,
+            seq_ml,
+            resolved_offset
+        );
+        if let Err(e) = r {
+            result = Err(e);
+            break;
+        }
+        *seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+        asm_loop.executed_pending();
+        if asm_loop.left() == 0 {
+            break;
+        }
+    }
+    let left = asm_loop.left();
+    asm_loop.finish(br, ll_dec, ml_dec, of_dec, hist);
+    result.map(|()| left)
+}
+
 /// AVX2-tier monolithic decode + execute. Outer init, RLE dispatch, FSE
 /// state init, both pipeline arms, sequence-decode (via
 /// `decode_one_body!`) and sequence-execute (via `execute_one_body!`)
@@ -736,81 +834,36 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 && rust_steps != 0
                 && super::seq_loop_asm::can_start(&br)
             {
-                let out = Out {
-                    base: cur.base,
-                    cap_w: cur.cap_w,
-                    live_base: cur.live_base.0,
-                    dict_end: cur.dict_end,
-                };
                 // SAFETY: the reader was refilled after its last read (before
-                // the loop), the states come from validated tables, the
-                // cursor's base is a linear output writable through `cap_w + 31`
-                // with its live bytes written, and the literals carry their 32
-                // bytes of read slack (the assertion at the top of this
-                // function). The reader, states and history stay with the loop
-                // until `finish` below.
-                let mut asm_loop = unsafe {
-                    Loop::new(
-                        &br,
-                        &ll_dec,
-                        &ml_dec,
-                        &of_dec,
-                        &shadow_hist,
-                        &out,
-                        literals_buffer.as_ptr(),
-                        literals_buffer_len,
-                        dict_content,
-                        rust_steps,
-                    )
-                };
-                let mut exec_err = None;
-                loop {
-                    let op_before = cur.op;
-                    // SAFETY: `Loop::new` above; every pending sequence so far
-                    // was executed below and counted.
-                    let exit = unsafe { asm_loop.pass(&mut cur.op, &mut lit_cur) };
-                    let ran = cur.op - op_before;
-                    seq_sum = seq_sum.wrapping_add(ran as u32);
-                    if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        buffer.advance_output_counter(ran as u64);
-                    }
-                    let (seq_ll, seq_ml, resolved_offset) = match exit {
-                        Exit::Pending { ll, ml, offset } => (ll, ml, offset),
-                        Exit::Done | Exit::Boundary => break,
-                    };
-                    let r = execute_one_body!(
-                        &mut cur,
+                // the loop) and stands above the floor, the states come from
+                // validated tables, the cursor's base is a linear output
+                // writable through `cap_w + 31` with its live bytes written,
+                // and the literals carry their 32 bytes of read slack (the
+                // assertion at the top of this function).
+                let r = unsafe {
+                    run_short_arm_asm(
                         buffer,
+                        &mut cur,
+                        &mut br,
+                        &mut ll_dec,
+                        &mut ml_dec,
+                        &mut of_dec,
+                        &mut shadow_hist,
                         dict,
                         dict_content,
                         literals_buffer,
-                        &mut lit_cur,
                         literals_buffer_len,
-                        seq_ll,
-                        seq_ml,
-                        resolved_offset
-                    );
-                    if let Err(e) = r {
-                        exec_err = Some(e);
-                        break;
+                        &mut lit_cur,
+                        &mut seq_sum,
+                        rust_steps,
+                    )
+                };
+                match r {
+                    Ok(left) => rust_steps = left,
+                    Err(e) => {
+                        fallback_err = Some(e);
+                        break 'short;
                     }
-                    seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
-                    asm_loop.executed_pending();
-                    if asm_loop.left() == 0 {
-                        break;
-                    }
-                }
-                rust_steps = asm_loop.left();
-                asm_loop.finish(
-                    &mut br,
-                    &mut ll_dec,
-                    &mut ml_dec,
-                    &mut of_dec,
-                    &mut shadow_hist,
-                );
-                if let Some(e) = exec_err {
-                    fallback_err = Some(e);
-                    break 'short;
                 }
             }
             for _ in 0..rust_steps {
