@@ -1111,9 +1111,6 @@ macro_rules! optimal_block_body {
         $strategy_ty:ty,
         $current:ident,
         $current_abs_start:ident,
-        $cursor:ident,
-        $litlen:ident,
-        $reps:ident,
         $profile:ident,
         $opt_state:ident,
         $plan:ident,
@@ -1145,18 +1142,24 @@ macro_rules! optimal_block_body {
         };
         // Everything the pass carries between segments lives in `$buffers.pass`,
         // read at the top of a segment and written at its end, so none of it is
-        // live across the segment body (see `HcOptimalPlanBuffers::pass`).
-        $buffers.pass = HcBlockPass {
-            cursor: $cursor,
-            litlen: $litlen,
-            reps: $reps,
-            literals_cursor: 0,
-        };
+        // live across the segment body (see `HcOptimalPlanBuffers::pass`). The
+        // caller sets it before the block's first entry, and a pass that stops
+        // to hand its plan over resumes from it.
         // The last 8 bytes are left as literals. Written as an addition on the
         // cursor, which never passes the block's end, so a block shorter than
         // the tail needs no floor: it simply has no segment.
         let block_len = $current.len();
         while $buffers.pass.cursor + 8 < block_len {
+            // A kept plan holds a segment's sequences at most at a time beyond
+            // what it already has (`BtMatcher::segment_plan_len`); without room
+            // for the next segment's, the pass stops for the caller to hand the
+            // plan over, and is entered again where it stopped.
+            if $keep_plan
+                && $plan.capacity() - $plan.len()
+                    < BtMatcher::segment_plan_len(block_len - $buffers.pass.cursor)
+            {
+                break;
+            }
             let cursor = $buffers.pass.cursor;
             let segment = &$current[cursor..];
             let segment_abs_start = $current_abs_start + cursor;
@@ -1387,8 +1390,13 @@ impl HcMatchGenerator {
         // SAFETY: `plan_room` is touched only through `best_plan` until both
         // are put back below.
         let mut best_plan = unsafe { RegionVec::over(&mut plan_room) };
-        let plan_reps = self.table.offset_hist;
         let (cursor, plan_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
+        plan_buffers.pass = HcBlockPass {
+            cursor,
+            litlen: plan_litlen,
+            reps: self.table.offset_hist,
+            literals_cursor: 0,
+        };
         // Frame-constant LDM presence, resolved once per block (not per segment
         // and not in the DP hot loop): drives the HAS_LDM const-generic dispatch.
         let has_ldm = !self.bt.ldm_sequences.is_empty();
@@ -1403,9 +1411,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1416,9 +1421,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1429,9 +1431,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1442,9 +1441,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1455,9 +1451,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1468,9 +1461,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1481,9 +1471,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1494,9 +1481,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1506,55 +1490,71 @@ impl HcMatchGenerator {
                 }
             }};
         }
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ))]
-        unsafe {
-            run_main_loop!(run_optimal_block_neon);
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::FastpathKernel;
-            crate::encoding::fastpath::tier_match!(K {
-                #[cfg(feature = "kernel-avx2")]
-                FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse2 => run_main_loop!(run_optimal_block_sse2),
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse42 => run_main_loop!(run_optimal_block_sse42),
-                FastpathKernel::Scalar => run_main_loop!(run_optimal_block_scalar),
-            })
-        }
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        unsafe {
-            run_main_loop!(run_optimal_block_simd128);
-        }
-        #[cfg(not(any(
-            all(
+        // The pass holds at most a segment's plan beyond what it has; when the
+        // room runs short it stops, the plan so far goes to the sink, and the
+        // pass is entered again where it stopped, as upstream stores each
+        // segment's sequences into `seqStore` before the next segment.
+        let mut literals_start = 0usize;
+        loop {
+            #[cfg(all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
-            ),
-            target_arch = "x86",
-            target_arch = "x86_64",
-            all(
+            ))]
+            unsafe {
+                run_main_loop!(run_optimal_block_neon);
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                use crate::encoding::fastpath::FastpathKernel;
+                crate::encoding::fastpath::tier_match!(K {
+                    #[cfg(feature = "kernel-avx2")]
+                    FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
+                    #[cfg(feature = "kernel-sse")]
+                    FastpathKernel::Sse2 => run_main_loop!(run_optimal_block_sse2),
+                    #[cfg(feature = "kernel-sse")]
+                    FastpathKernel::Sse42 => run_main_loop!(run_optimal_block_sse42),
+                    FastpathKernel::Scalar => run_main_loop!(run_optimal_block_scalar),
+                })
+            }
+            #[cfg(all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
                 feature = "kernel-simd128"
-            )
-        )))]
-        {
-            run_main_loop!(run_optimal_block_scalar);
+            ))]
+            unsafe {
+                run_main_loop!(run_optimal_block_simd128);
+            }
+            #[cfg(not(any(
+                all(
+                    target_arch = "aarch64",
+                    target_endian = "little",
+                    feature = "kernel-neon"
+                ),
+                target_arch = "x86",
+                target_arch = "x86_64",
+                all(
+                    target_arch = "wasm32",
+                    target_feature = "simd128",
+                    feature = "kernel-simd128"
+                )
+            )))]
+            {
+                run_main_loop!(run_optimal_block_scalar);
+            }
+            self.table.emit_optimal_sequences(
+                current_len,
+                &best_plan,
+                &mut literals_start,
+                &mut handle_sequence,
+            );
+            best_plan.clear();
+            if plan_buffers.pass.cursor + 8 >= current_len {
+                break;
+            }
         }
-
         self.table
-            .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
+            .emit_block_tail(current_len, literals_start, &mut handle_sequence);
         // `best_plan` is not read past here, so the room goes back.
         self.bt.opt_segment_plan_scratch = plan_room;
         let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
@@ -1585,8 +1585,14 @@ impl HcMatchGenerator {
         debug_assert_eq!(seed_profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
-        let seed_reps = self.table.offset_hist;
         let (cursor, seed_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
+        // The seed pass keeps no plan, so it runs the block in one entry.
+        plan_buffers.pass = HcBlockPass {
+            cursor,
+            litlen: seed_litlen,
+            reps: self.table.offset_hist,
+            literals_cursor: 0,
+        };
         // The seed pass keeps no plan (`KEEP_PLAN = false`), so it writes into
         // none.
         let mut seed_plan = RegionVec::empty();
@@ -1601,9 +1607,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, false, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1614,9 +1617,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, true, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1627,9 +1627,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, false, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1640,9 +1637,6 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, true, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1653,9 +1647,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, false, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1666,9 +1657,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, true, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1679,9 +1667,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, false, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1692,9 +1677,6 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, true, false>(
                             current,
                             current_abs_start,
-                            cursor,
-                            seed_litlen,
-                            seed_reps,
                             seed_profile,
                             &mut opt_state,
                             &mut seed_plan,
@@ -1843,9 +1825,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -1856,9 +1835,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,
@@ -1888,9 +1864,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -1901,9 +1874,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,
@@ -1933,9 +1903,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -1946,9 +1913,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,
@@ -1975,9 +1939,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -1988,9 +1949,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,
@@ -2032,9 +1990,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -2045,9 +2000,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,
@@ -2081,9 +2033,6 @@ impl HcMatchGenerator {
         &mut self,
         current: &[u8],
         current_abs_start: usize,
-        cursor: usize,
-        litlen: usize,
-        reps: [u32; 3],
         profile: HcOptimalCostProfile,
         opt_state: &mut HcOptState,
         plan: &mut RegionVec<HcOptimalSequence>,
@@ -2094,9 +2043,6 @@ impl HcMatchGenerator {
             S,
             current,
             current_abs_start,
-            cursor,
-            litlen,
-            reps,
             profile,
             opt_state,
             plan,

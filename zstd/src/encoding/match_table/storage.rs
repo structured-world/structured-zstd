@@ -2251,21 +2251,19 @@ impl MatchTable {
         self.tables.fill(HC_EMPTY);
     }
 
-    /// Upstream zstd parity: replay an optimal-parser plan into the consumer's
-    /// sequence sink over a block of `current_len` bytes, advancing
-    /// `offset_hist` exactly like the upstream zstd block-store walker.
-    pub(crate) fn emit_optimal_plan(
+    /// Upstream zstd parity: replay a run of an optimal-parser plan into the
+    /// consumer's sequence sink, advancing `offset_hist` exactly like the
+    /// upstream zstd block-store walker. `literals_start` is where the block's
+    /// pending literals begin; the plan of one block may arrive in several
+    /// runs, each continuing where the last ended, and
+    /// [`Self::emit_block_tail`] closes the block.
+    pub(crate) fn emit_optimal_sequences(
         &mut self,
         current_len: usize,
         plan: &[HcOptimalSequence],
+        literals_start: &mut usize,
         handle_sequence: &mut impl FnMut(Sequence),
     ) {
-        if plan.is_empty() {
-            handle_sequence(Sequence::Literals { len: current_len });
-            return;
-        }
-
-        let mut literals_start = 0usize;
         for item in plan {
             let lit_len = item.lit_len as usize;
             let match_len = item.match_len as usize;
@@ -2288,9 +2286,18 @@ impl MatchTable {
                 match_len,
             });
             encode_offset_with_history(item.offset, lit_len as u32, &mut self.offset_hist);
-            literals_start = end;
+            *literals_start = end;
         }
+    }
 
+    /// Closes a block of `current_len` bytes whose sequences ended at
+    /// `literals_start`: the rest of it goes to the sink as literals.
+    pub(crate) fn emit_block_tail(
+        &mut self,
+        current_len: usize,
+        literals_start: usize,
+        handle_sequence: &mut impl FnMut(Sequence),
+    ) {
         if literals_start < current_len {
             handle_sequence(Sequence::Literals {
                 len: current_len - literals_start,

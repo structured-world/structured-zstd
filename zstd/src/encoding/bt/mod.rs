@@ -101,10 +101,21 @@ impl BtMatcher {
         core::mem::size_of::<Self>() + Self::scratch_workspace_bytes(block)
     }
 
-    /// Plan entries a block of `block` bytes can hold: every sequence covers
-    /// at least [`FORMAT_MIN_MATCH`] bytes of it.
+    /// The most sequences one segment of the optimal pass writes when
+    /// `remaining` bytes of the block are left: every sequence covers at least
+    /// [`FORMAT_MIN_MATCH`] bytes, and a segment's stretches lie within its
+    /// [`HC_OPT_NODE_LEN`](super::cost_model::HC_OPT_NODE_LEN) cells.
+    pub(crate) fn segment_plan_len(remaining: usize) -> usize {
+        use super::cost_model::HC_OPT_NODE_LEN;
+        (remaining.min(HC_OPT_NODE_LEN) / FORMAT_MIN_MATCH) + 1
+    }
+
+    /// Plan room for blocks of up to `block` bytes: one segment's sequences.
+    /// The pass hands the plan over whenever the next segment might not fit,
+    /// so the room never needs the block's worth (upstream likewise stores
+    /// each segment into `seqStore` before the next).
     pub(crate) fn plan_room_len(block: usize) -> usize {
-        block / FORMAT_MIN_MATCH + 1
+        Self::segment_plan_len(block)
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the
