@@ -871,6 +871,46 @@ pub(crate) enum CpuKernelTag {
     Sve,
 }
 
+/// Every kernel this build has and this CPU can execute, scalar first, for
+/// tests that must run each tier's monomorph by name: a decode through the
+/// detected tier covers only the one the host picks. SVE and VBMI2 come in
+/// only when the detector itself verified their full feature set.
+#[cfg(test)]
+pub(crate) fn supported_kernels_for_tests() -> alloc::vec::Vec<CpuKernelTag> {
+    let mut kernels = alloc::vec![CpuKernelTag::Scalar];
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    if std::is_x86_feature_detected!("sse2") {
+        kernels.push(CpuKernelTag::Sse2);
+    }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
+    if std::is_x86_feature_detected!("bmi2") {
+        kernels.push(CpuKernelTag::Bmi2);
+    }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("avx2") {
+        kernels.push(CpuKernelTag::Avx2);
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
+    kernels.push(CpuKernelTag::Neon);
+    let native = detect_cpu_kernel();
+    if !kernels.contains(&native) {
+        kernels.push(native);
+    }
+    kernels
+}
+
 /// Detect once and cache the best available CPU kernel for the
 /// current process. Subsequent calls return the cached tag without
 /// re-running CPU-feature detection. Std-only — no-std targets use

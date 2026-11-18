@@ -1,6 +1,6 @@
 use super::super::{ADVANCE, decode_and_execute_sequences, init_sequence_stream};
 use crate::blocks::sequence_section::SequencesHeader;
-use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, supported_kernels_for_tests};
 use crate::decoding::buffer_backend::BufferBackend;
 use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::{DecompressBlockError, ExecuteSequencesError};
@@ -48,43 +48,6 @@ const BITSTREAM: &[u8] = &[
     115, 2, 130, 211, 140, 155, 27, 109, 22, 174, 73, 236, 45, 225, 53, 195, 205, 16, 64, 172, 75,
     93, 1,
 ];
-
-fn supported_kernels() -> Vec<CpuKernelTag> {
-    let mut kernels = alloc::vec![CpuKernelTag::Scalar];
-    #[cfg(all(
-        feature = "std",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse"
-    ))]
-    if std::is_x86_feature_detected!("sse2") {
-        kernels.push(CpuKernelTag::Sse2);
-    }
-    #[cfg(all(
-        feature = "std",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-bmi2"
-    ))]
-    if std::is_x86_feature_detected!("bmi2") {
-        kernels.push(CpuKernelTag::Bmi2);
-    }
-    #[cfg(all(
-        feature = "std",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-avx2"
-    ))]
-    if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("avx2") {
-        kernels.push(CpuKernelTag::Avx2);
-    }
-    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-    kernels.push(CpuKernelTag::Neon);
-    // Includes SVE/VBMI2 only when the production detector has verified their
-    // full feature set. Never ask an unsafe trampoline to run on another CPU.
-    let native = detect_cpu_kernel();
-    if !kernels.contains(&native) {
-        kernels.push(native);
-    }
-    kernels
-}
 
 fn check_pipeline<B: BufferBackend>(kernel: CpuKernelTag, fail_at: Option<usize>) {
     let dict = Dictionary::from_raw_content(0, DICTIONARY.to_vec())
@@ -203,7 +166,7 @@ fn check_pipeline<B: BufferBackend>(kernel: CpuKernelTag, fail_at: Option<usize>
 
 #[test]
 fn long_pipeline_decodes_dictionary_repcodes_and_ring_wrap() {
-    for kernel in supported_kernels() {
+    for kernel in supported_kernels_for_tests() {
         check_pipeline::<RingBuffer>(kernel, None);
         check_pipeline::<FlatBuf>(kernel, None);
     }
@@ -214,7 +177,7 @@ fn long_pipeline_rolls_back_main_loop_failure() {
     // The main loop executes sequences 0..NUM_SEQUENCES-ADVANCE.
     let fail_at = 3;
     assert!(fail_at < SEQUENCES.len() - ADVANCE);
-    for kernel in supported_kernels() {
+    for kernel in supported_kernels_for_tests() {
         check_pipeline::<RingBuffer>(kernel, Some(fail_at));
         check_pipeline::<FlatBuf>(kernel, Some(fail_at));
     }
@@ -225,7 +188,7 @@ fn long_pipeline_rolls_back_drain_failure() {
     // Several drain copies succeed before sequence 14 runs out of literals.
     let fail_at = 14;
     assert!(fail_at >= SEQUENCES.len() - ADVANCE);
-    for kernel in supported_kernels() {
+    for kernel in supported_kernels_for_tests() {
         check_pipeline::<RingBuffer>(kernel, Some(fail_at));
         check_pipeline::<FlatBuf>(kernel, Some(fail_at));
     }
