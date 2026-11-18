@@ -110,12 +110,10 @@ pub(super) enum Exit {
     Pending { ll: u32, ml: u32, offset: u32 },
 }
 
-/// Where the block's output stands, for the loop to read and advance.
+/// The block's output bounds, fixed for the block.
 pub(super) struct Out {
     /// Start of the linear output.
     pub(super) base: *mut u8,
-    /// Write position, from `base`.
-    pub(super) op: usize,
     /// The cursor's `cap_w`: a sequence's write must end at or before it.
     pub(super) cap_w: usize,
     /// The cursor's `live_base`: the live output is `op - live_base`, modular.
@@ -124,310 +122,381 @@ pub(super) struct Out {
     pub(super) dict_end: usize,
 }
 
-/// Runs up to `*left` sequences, each advancing the states, decrementing
-/// `*left` for every one it executes.
-///
-/// # Safety
-/// The CPU has BMI2 and AVX2. The reader was refilled after its last read and
-/// its window `source[index..index + 8]` is in bounds; the three decoders hold
-/// validated states of tables with `1 << accuracy_log` built entries. `out`
-/// describes a linear output writable through `cap_w + 31`, whose bytes from
-/// `live_base` to `op` are written, and the window holds `dict_content` for a
-/// match whose literals end below `dict_end`. `literals` is readable
-/// `lit_len + 32` bytes from its start. `*left >= 1`.
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-pub(super) unsafe fn run(
-    br: &mut BitReaderReversed<'_, Avx2Kernel>,
-    ll_dec: &mut SeqFSEDecoder<'_>,
-    ml_dec: &mut SeqFSEDecoder<'_>,
-    of_dec: &mut SeqFSEDecoder<'_>,
-    hist: &mut [u32; 3],
-    out: &mut Out,
-    literals: *const u8,
-    lit_cur: &mut usize,
-    lit_len: usize,
-    dict_content: &[u8],
-    left: &mut usize,
-) -> Exit {
-    debug_assert!(*left >= 1);
-    debug_assert!(br.bits_consumed < 8);
-    let source = br.source.as_ptr();
-    let base = out.base as usize;
-    let mut slots = Slots {
-        hist: hist.map(u64::from),
-        tables: [
-            ll_dec.entry_words(),
-            ml_dec.entry_words(),
-            of_dec.entry_words(),
-        ],
-        input_floor: (source as usize).wrapping_add(INPUT_FLOOR),
-        lit_end: literals as usize + lit_len,
-        out_end: base + out.cap_w,
-        out_floor: base.wrapping_add(out.live_base),
-        left: *left,
-        ll: 0,
-        ml: 0,
-        offset: 0,
-        // Saturating is the meaning: a position past the address space means
-        // the window never runs out within this output, which the largest
-        // address says as well; zero (no dictionary room) gives `base`, below
-        // every write position.
-        dict_limit: base.saturating_add(out.dict_end),
-        dict_len: dict_content.len(),
-        dict_end: dict_content.as_ptr() as usize + dict_content.len(),
-    };
-    let mut container = br.bit_container;
-    let mut consumed = u64::from(br.bits_consumed);
-    let mut ip = source.wrapping_add(br.index);
-    let mut ll_e = ll_dec.state.to_word();
-    let mut ml_e = ml_dec.state.to_word();
-    let mut of_e = of_dec.state.to_word();
-    let mut op = base + out.op;
-    let mut lit = literals as usize + *lit_cur;
-    let status: u64;
-    // SAFETY: the caller's contract. The assembly reads the tables, the input
-    // window, the literals and the output it has written, writes the output
-    // within `out_end + 31` and the slots, and reads no input below the
-    // floor's eight-byte window. Every field read is a plain integer.
-    unsafe {
-        core::arch::asm!(
-            "2:",
-            "cmp r10, qword ptr [rsi + 48]",
-            "jb 90f",
-            // Offset: a new one (more than one extra bit), or a repeat.
-            "mov rax, r13",
-            "shr rax, 24",
-            "movzx edx, al",
-            "cmp edx, 1",
-            "jbe 50f",
-            "shlx rax, r8, r9",
-            "add r9, rdx",
-            "neg edx",
-            "shrx rax, rax, rdx",
-            "mov rcx, r13",
-            "shr rcx, 32",
-            "lea rcx, [rcx + rax - 3]",
-            "mov rax, qword ptr [rsi + 8]",
-            "mov qword ptr [rsi + 16], rax",
-            "mov rax, qword ptr [rsi]",
-            "mov qword ptr [rsi + 8], rax",
-            "mov qword ptr [rsi], rcx",
-            // Match length.
-            "20:",
-            "mov rax, r12",
-            "shr rax, 24",
-            "movzx edi, al",
-            "add r9, rdi",
-            "mov eax, 64",
-            "sub rax, r9",
-            "shrx rax, r8, rax",
-            "bzhi rdi, rax, rdi",
-            "mov rax, r12",
-            "shr rax, 32",
-            "add rdi, rax",
-            // Literal length, after a refill when its bits and the three state
-            // updates would run past the container.
-            "mov rax, r11",
-            "shr rax, 24",
-            "movzx edx, al",
-            "lea rax, [r9 + rdx + 26]",
-            "cmp rax, 64",
-            "jbe 21f",
-            "mov rax, r9",
-            "shr rax, 3",
-            "sub r10, rax",
-            "and r9d, 7",
-            "mov r8, qword ptr [r10]",
-            "21:",
-            "add r9, rdx",
-            "mov eax, 64",
-            "sub rax, r9",
-            "shrx rax, r8, rax",
-            "bzhi rdx, rax, rdx",
-            "mov rax, r11",
-            "shr rax, 32",
-            "add rdx, rax",
-            "mov qword ptr [rsi + 88], rdx",
-            // The three states, LL, ML, OF.
-            seq_state_update!("r11", "r11w", "24"),
-            seq_state_update!("r12", "r12w", "32"),
-            seq_state_update!("r13", "r13w", "40"),
-            "mov rax, r9",
-            "shr rax, 3",
-            "sub r10, rax",
-            "and r9d, 7",
-            "mov r8, qword ptr [r10]",
-            // The gates of the copies below; any refusal leaves the loop.
-            "mov rdx, qword ptr [rsi + 88]",
-            "lea rax, [r15 + rdx]",
-            "cmp rax, qword ptr [rsi + 56]",
-            "ja 80f",
-            "cmp rdi, 255",
-            "ja 80f",
-            "cmp rcx, 16",
-            "jb 80f",
-            "lea rax, [r14 + rdx]",
-            "add rax, rdi",
-            "cmp rax, qword ptr [rsi + 64]",
-            "ja 80f",
-            "lea rax, [r14 + rdx]",
-            "sub rax, qword ptr [rsi + 72]",
-            "cmp rcx, rax",
-            "ja 60f",
-            // Literals: sixteen, then the rest sixteen at a time.
-            "33:",
-            "vmovdqu xmm0, xmmword ptr [r15]",
-            "vmovdqu xmmword ptr [r14], xmm0",
-            "cmp rdx, 16",
-            "ja 30f",
-            "31:",
-            "add r15, rdx",
-            "add r14, rdx",
-            // Match, from 16 or more bytes back: the same.
-            "mov rax, r14",
-            "sub rax, rcx",
-            "vmovdqu xmm0, xmmword ptr [rax]",
-            "vmovdqu xmmword ptr [r14], xmm0",
-            "cmp rdi, 16",
-            "ja 40f",
-            "41:",
-            "add r14, rdi",
-            "dec qword ptr [rsi + 80]",
-            "jnz 2b",
-            "xor eax, eax",
-            "jmp 99f",
-            // A repeated offset with no extra bit.
-            "50:",
-            "je 52f",
-            "mov rax, qword ptr [rsi]",
-            "mov rdi, qword ptr [rsi + 8]",
-            "mov rcx, r11",
-            "shr rcx, 32",
-            "test ecx, ecx",
-            "mov rcx, rax",
-            "cmovz rcx, rdi",
-            "cmovz rdi, rax",
-            "mov qword ptr [rsi + 8], rdi",
-            "mov qword ptr [rsi], rcx",
-            "jmp 20b",
-            // A repeated offset with one extra bit: index 1 + (ll == 0) + bit,
-            // index 3 the most recent less one.
-            "52:",
-            "shlx rax, r8, r9",
-            "shr rax, 63",
-            "inc r9",
-            "mov rdi, r11",
-            "shr rdi, 32",
-            "cmp edi, 1",
-            "adc rax, 1",
-            "cmp rax, 3",
-            "jne 53f",
-            "mov rcx, qword ptr [rsi]",
-            "lea ecx, [rcx - 1]",
-            "jmp 54f",
-            "53:",
-            "mov rcx, qword ptr [rsi + rax*8]",
-            "54:",
-            "cmp rax, 1",
-            "je 55f",
-            "mov rdi, qword ptr [rsi + 8]",
-            "mov qword ptr [rsi + 16], rdi",
-            "55:",
-            "mov rdi, qword ptr [rsi]",
-            "mov qword ptr [rsi + 8], rdi",
-            "mov qword ptr [rsi], rcx",
-            "jmp 20b",
-            // The rest of a literal run past sixteen.
-            "30:",
-            "mov eax, 16",
-            "32:",
-            "vmovdqu xmm0, xmmword ptr [r15 + rax]",
-            "vmovdqu xmmword ptr [r14 + rax], xmm0",
-            "add rax, 16",
-            "cmp rax, rdx",
-            "jb 32b",
-            "jmp 31b",
-            // The rest of a match past sixteen; `rax` is its source.
-            "40:",
-            "mov edx, 16",
-            "42:",
-            "vmovdqu xmm0, xmmword ptr [rax + rdx]",
-            "vmovdqu xmmword ptr [r14 + rdx], xmm0",
-            "add rdx, 16",
-            "cmp rdx, rdi",
-            "jb 42b",
-            "jmp 41b",
-            // A match reaching past the output (`rax` the output behind it):
-            // taken when its literals end below the dictionary limit and the
-            // match lies inside the dictionary with its reads rounded up to
-            // sixteen, as the Rust path's extDict branch takes it. `rcx`
-            // becomes the distance from the match's write position to its
-            // dictionary source, so the copies above run unchanged.
-            "60:",
-            "lea rdx, [r14 + rdx]",
-            "cmp rdx, qword ptr [rsi + 112]",
-            "jae 80f",
-            "neg rax",
-            "add rax, rcx",
-            "cmp rax, qword ptr [rsi + 120]",
-            "ja 80f",
-            "lea rdx, [rdi + 15]",
-            "and rdx, -16",
-            "cmp rdx, rax",
-            "ja 80f",
-            "mov rdx, qword ptr [rsi + 128]",
-            "sub rdx, rax",
-            "mov rcx, qword ptr [rsi + 88]",
-            "add rcx, r14",
-            "sub rcx, rdx",
-            "mov rdx, qword ptr [rsi + 88]",
-            "jmp 33b",
-            "80:",
-            "mov qword ptr [rsi + 96], rdi",
-            "mov qword ptr [rsi + 104], rcx",
-            "mov eax, 2",
-            "jmp 99f",
-            "90:",
-            "mov eax, 1",
-            "99:",
-            inout("r8") container,
-            inout("r9") consumed,
-            inout("r10") ip,
-            inout("r11") ll_e,
-            inout("r12") ml_e,
-            inout("r13") of_e,
-            inout("r14") op,
-            inout("r15") lit,
-            in("rsi") &raw mut slots,
-            out("rax") status,
-            out("rcx") _,
-            out("rdx") _,
-            out("rdi") _,
-            out("xmm0") _,
-            options(nostack),
-        );
+/// The loop's state for one block: the slots, and the bit reader, the three
+/// FSE entries and the offset history taken out of their owners once, so a
+/// pending exit hands back only the output and literal positions, the only
+/// things the caller's execution of that sequence moves. [`Loop::finish`]
+/// returns the rest to the owners.
+pub(super) struct Loop {
+    slots: Slots,
+    container: u64,
+    consumed: u64,
+    ip: *const u8,
+    ll_e: u64,
+    ml_e: u64,
+    of_e: u64,
+    source: *const u8,
+    base: usize,
+    literals: usize,
+}
+
+impl Loop {
+    /// Takes the block's reader, states and history, to run `left`
+    /// sequences, each advancing the states.
+    ///
+    /// # Safety
+    /// The CPU has BMI2 and AVX2. The reader was refilled after its last read
+    /// and its window `source[index..index + 8]` is in bounds; the three
+    /// decoders hold validated states of tables with `1 << accuracy_log` built
+    /// entries, and are left untouched until [`Loop::finish`]. `out` describes
+    /// a linear output writable through `cap_w + 31`, and the window holds
+    /// `dict_content` for a match whose literals end below `dict_end`.
+    /// `literals` is readable `lit_len + 32` bytes from its start.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(super) unsafe fn new(
+        br: &BitReaderReversed<'_, Avx2Kernel>,
+        ll_dec: &SeqFSEDecoder<'_>,
+        ml_dec: &SeqFSEDecoder<'_>,
+        of_dec: &SeqFSEDecoder<'_>,
+        hist: &[u32; 3],
+        out: &Out,
+        literals: *const u8,
+        lit_len: usize,
+        dict_content: &[u8],
+        left: usize,
+    ) -> Self {
+        debug_assert!(br.bits_consumed < 8);
+        let source = br.source.as_ptr();
+        let base = out.base as usize;
+        Self {
+            slots: Slots {
+                hist: hist.map(u64::from),
+                tables: [
+                    ll_dec.entry_words(),
+                    ml_dec.entry_words(),
+                    of_dec.entry_words(),
+                ],
+                input_floor: (source as usize).wrapping_add(INPUT_FLOOR),
+                lit_end: literals as usize + lit_len,
+                out_end: base + out.cap_w,
+                out_floor: base.wrapping_add(out.live_base),
+                left,
+                ll: 0,
+                ml: 0,
+                offset: 0,
+                // Saturating is the meaning: a position past the address space
+                // means the window never runs out within this output, which
+                // the largest address says as well; zero (no dictionary room)
+                // gives `base`, below every write position.
+                dict_limit: base.saturating_add(out.dict_end),
+                dict_len: dict_content.len(),
+                dict_end: dict_content.as_ptr() as usize + dict_content.len(),
+            },
+            container: br.bit_container,
+            consumed: u64::from(br.bits_consumed),
+            ip: source.wrapping_add(br.index),
+            ll_e: ll_dec.state.to_word(),
+            ml_e: ml_dec.state.to_word(),
+            of_e: of_dec.state.to_word(),
+            source,
+            base,
+            literals: literals as usize,
+        }
     }
-    br.bit_container = container;
-    br.bits_consumed = consumed as u8;
-    br.index = ip as usize - source as usize;
-    ll_dec.state = SeqSymbol::from_word(ll_e);
-    ml_dec.state = SeqSymbol::from_word(ml_e);
-    of_dec.state = SeqSymbol::from_word(of_e);
-    // Every offset is below 2^32: a new one is `base + bits - 3` with
-    // `bits < base <= 2^31`, a repeat is one of these or one less, modular.
-    *hist = slots.hist.map(|h| h as u32);
-    out.op = op - base;
-    *lit_cur = lit - literals as usize;
-    *left = slots.left;
-    match status {
-        0 => Exit::Done,
-        1 => Exit::Boundary,
-        _ => Exit::Pending {
-            ll: slots.ll as u32,
-            ml: slots.ml as u32,
-            offset: slots.offset as u32,
-        },
+
+    /// Sequences still to run.
+    #[inline(always)]
+    pub(super) fn left(&self) -> usize {
+        self.slots.left
+    }
+
+    /// Counts a pending sequence the caller executed.
+    #[inline(always)]
+    pub(super) fn executed_pending(&mut self) {
+        self.slots.left -= 1;
+    }
+
+    /// Returns the reader, the states and the history to their owners.
+    #[inline(always)]
+    pub(super) fn finish(
+        self,
+        br: &mut BitReaderReversed<'_, Avx2Kernel>,
+        ll_dec: &mut SeqFSEDecoder<'_>,
+        ml_dec: &mut SeqFSEDecoder<'_>,
+        of_dec: &mut SeqFSEDecoder<'_>,
+        hist: &mut [u32; 3],
+    ) {
+        br.bit_container = self.container;
+        br.bits_consumed = self.consumed as u8;
+        br.index = self.ip as usize - self.source as usize;
+        ll_dec.state = SeqSymbol::from_word(self.ll_e);
+        ml_dec.state = SeqSymbol::from_word(self.ml_e);
+        of_dec.state = SeqSymbol::from_word(self.of_e);
+        // Every offset is below 2^32: a new one is `base + bits - 3` with
+        // `bits < base <= 2^31`, a repeat is one of these or one less, modular.
+        *hist = self.slots.hist.map(|h| h as u32);
+    }
+
+    /// Runs sequences until one leaves, or none is left (`left() >= 1` on
+    /// entry), from output position `*op_pos` (from the output's start) and
+    /// literal position `*lit_cur`, both advanced past what ran.
+    ///
+    /// # Safety
+    /// [`Loop::new`]'s contract holds, the output's bytes up to `*op_pos` are
+    /// written, and every pending exit's sequence was executed and counted.
+    #[inline(always)]
+    pub(super) unsafe fn pass(&mut self, op_pos: &mut usize, lit_cur: &mut usize) -> Exit {
+        debug_assert!(self.slots.left >= 1);
+        let mut container = self.container;
+        let mut consumed = self.consumed;
+        let mut ip = self.ip;
+        let mut ll_e = self.ll_e;
+        let mut ml_e = self.ml_e;
+        let mut of_e = self.of_e;
+        let mut op = self.base + *op_pos;
+        let mut lit = self.literals + *lit_cur;
+        let slots = &raw mut self.slots;
+        let status: u64;
+        // SAFETY: the caller's contract. The assembly reads the tables, the input
+        // window, the literals and the output it has written, writes the output
+        // within `out_end + 31` and the slots, and reads no input below the
+        // floor's eight-byte window. Every field read is a plain integer.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "cmp r10, qword ptr [rsi + 48]",
+                "jb 90f",
+                // Offset: a new one (more than one extra bit), or a repeat.
+                "mov rax, r13",
+                "shr rax, 24",
+                "movzx edx, al",
+                "cmp edx, 1",
+                "jbe 50f",
+                "shlx rax, r8, r9",
+                "add r9, rdx",
+                "neg edx",
+                "shrx rax, rax, rdx",
+                "mov rcx, r13",
+                "shr rcx, 32",
+                "lea rcx, [rcx + rax - 3]",
+                "mov rax, qword ptr [rsi + 8]",
+                "mov qword ptr [rsi + 16], rax",
+                "mov rax, qword ptr [rsi]",
+                "mov qword ptr [rsi + 8], rax",
+                "mov qword ptr [rsi], rcx",
+                // Match length.
+                "20:",
+                "mov rax, r12",
+                "shr rax, 24",
+                "movzx edi, al",
+                "add r9, rdi",
+                "mov eax, 64",
+                "sub rax, r9",
+                "shrx rax, r8, rax",
+                "bzhi rdi, rax, rdi",
+                "mov rax, r12",
+                "shr rax, 32",
+                "add rdi, rax",
+                // Literal length, after a refill when its bits and the three state
+                // updates would run past the container.
+                "mov rax, r11",
+                "shr rax, 24",
+                "movzx edx, al",
+                "lea rax, [r9 + rdx + 26]",
+                "cmp rax, 64",
+                "jbe 21f",
+                "mov rax, r9",
+                "shr rax, 3",
+                "sub r10, rax",
+                "and r9d, 7",
+                "mov r8, qword ptr [r10]",
+                "21:",
+                "add r9, rdx",
+                "mov eax, 64",
+                "sub rax, r9",
+                "shrx rax, r8, rax",
+                "bzhi rdx, rax, rdx",
+                "mov rax, r11",
+                "shr rax, 32",
+                "add rdx, rax",
+                "mov qword ptr [rsi + 88], rdx",
+                // The three states, LL, ML, OF.
+                seq_state_update!("r11", "r11w", "24"),
+                seq_state_update!("r12", "r12w", "32"),
+                seq_state_update!("r13", "r13w", "40"),
+                "mov rax, r9",
+                "shr rax, 3",
+                "sub r10, rax",
+                "and r9d, 7",
+                "mov r8, qword ptr [r10]",
+                // The gates of the copies below; any refusal leaves the loop.
+                "mov rdx, qword ptr [rsi + 88]",
+                "lea rax, [r15 + rdx]",
+                "cmp rax, qword ptr [rsi + 56]",
+                "ja 80f",
+                "cmp rdi, 255",
+                "ja 80f",
+                "cmp rcx, 16",
+                "jb 80f",
+                "lea rax, [r14 + rdx]",
+                "add rax, rdi",
+                "cmp rax, qword ptr [rsi + 64]",
+                "ja 80f",
+                "lea rax, [r14 + rdx]",
+                "sub rax, qword ptr [rsi + 72]",
+                "cmp rcx, rax",
+                "ja 60f",
+                // Literals: sixteen, then the rest sixteen at a time.
+                "33:",
+                "vmovdqu xmm0, xmmword ptr [r15]",
+                "vmovdqu xmmword ptr [r14], xmm0",
+                "cmp rdx, 16",
+                "ja 30f",
+                "31:",
+                "add r15, rdx",
+                "add r14, rdx",
+                // Match, from 16 or more bytes back: the same.
+                "mov rax, r14",
+                "sub rax, rcx",
+                "vmovdqu xmm0, xmmword ptr [rax]",
+                "vmovdqu xmmword ptr [r14], xmm0",
+                "cmp rdi, 16",
+                "ja 40f",
+                "41:",
+                "add r14, rdi",
+                "dec qword ptr [rsi + 80]",
+                "jnz 2b",
+                "xor eax, eax",
+                "jmp 99f",
+                // A repeated offset with no extra bit.
+                "50:",
+                "je 52f",
+                "mov rax, qword ptr [rsi]",
+                "mov rdi, qword ptr [rsi + 8]",
+                "mov rcx, r11",
+                "shr rcx, 32",
+                "test ecx, ecx",
+                "mov rcx, rax",
+                "cmovz rcx, rdi",
+                "cmovz rdi, rax",
+                "mov qword ptr [rsi + 8], rdi",
+                "mov qword ptr [rsi], rcx",
+                "jmp 20b",
+                // A repeated offset with one extra bit: index 1 + (ll == 0) + bit,
+                // index 3 the most recent less one.
+                "52:",
+                "shlx rax, r8, r9",
+                "shr rax, 63",
+                "inc r9",
+                "mov rdi, r11",
+                "shr rdi, 32",
+                "cmp edi, 1",
+                "adc rax, 1",
+                "cmp rax, 3",
+                "jne 53f",
+                "mov rcx, qword ptr [rsi]",
+                "lea ecx, [rcx - 1]",
+                "jmp 54f",
+                "53:",
+                "mov rcx, qword ptr [rsi + rax*8]",
+                "54:",
+                "cmp rax, 1",
+                "je 55f",
+                "mov rdi, qword ptr [rsi + 8]",
+                "mov qword ptr [rsi + 16], rdi",
+                "55:",
+                "mov rdi, qword ptr [rsi]",
+                "mov qword ptr [rsi + 8], rdi",
+                "mov qword ptr [rsi], rcx",
+                "jmp 20b",
+                // The rest of a literal run past sixteen.
+                "30:",
+                "mov eax, 16",
+                "32:",
+                "vmovdqu xmm0, xmmword ptr [r15 + rax]",
+                "vmovdqu xmmword ptr [r14 + rax], xmm0",
+                "add rax, 16",
+                "cmp rax, rdx",
+                "jb 32b",
+                "jmp 31b",
+                // The rest of a match past sixteen; `rax` is its source.
+                "40:",
+                "mov edx, 16",
+                "42:",
+                "vmovdqu xmm0, xmmword ptr [rax + rdx]",
+                "vmovdqu xmmword ptr [r14 + rdx], xmm0",
+                "add rdx, 16",
+                "cmp rdx, rdi",
+                "jb 42b",
+                "jmp 41b",
+                // A match reaching past the output (`rax` the output behind it):
+                // taken when its literals end below the dictionary limit and the
+                // match lies inside the dictionary with its reads rounded up to
+                // sixteen, as the Rust path's extDict branch takes it. `rcx`
+                // becomes the distance from the match's write position to its
+                // dictionary source, so the copies above run unchanged.
+                "60:",
+                "lea rdx, [r14 + rdx]",
+                "cmp rdx, qword ptr [rsi + 112]",
+                "jae 80f",
+                "neg rax",
+                "add rax, rcx",
+                "cmp rax, qword ptr [rsi + 120]",
+                "ja 80f",
+                "lea rdx, [rdi + 15]",
+                "and rdx, -16",
+                "cmp rdx, rax",
+                "ja 80f",
+                "mov rdx, qword ptr [rsi + 128]",
+                "sub rdx, rax",
+                "mov rcx, qword ptr [rsi + 88]",
+                "add rcx, r14",
+                "sub rcx, rdx",
+                "mov rdx, qword ptr [rsi + 88]",
+                "jmp 33b",
+                "80:",
+                "mov qword ptr [rsi + 96], rdi",
+                "mov qword ptr [rsi + 104], rcx",
+                "mov eax, 2",
+                "jmp 99f",
+                "90:",
+                "mov eax, 1",
+                "99:",
+                inout("r8") container,
+                inout("r9") consumed,
+                inout("r10") ip,
+                inout("r11") ll_e,
+                inout("r12") ml_e,
+                inout("r13") of_e,
+                inout("r14") op,
+                inout("r15") lit,
+                in("rsi") slots,
+                out("rax") status,
+                out("rcx") _,
+                out("rdx") _,
+                out("rdi") _,
+                out("xmm0") _,
+                options(nostack),
+            );
+        }
+        self.container = container;
+        self.consumed = consumed;
+        self.ip = ip;
+        self.ll_e = ll_e;
+        self.ml_e = ml_e;
+        self.of_e = of_e;
+        *op_pos = op - self.base;
+        *lit_cur = lit - self.literals;
+        match status {
+            0 => Exit::Done,
+            1 => Exit::Boundary,
+            _ => Exit::Pending {
+                ll: self.slots.ll as u32,
+                ml: self.slots.ml as u32,
+                offset: self.slots.offset as u32,
+            },
+        }
     }
 }
 

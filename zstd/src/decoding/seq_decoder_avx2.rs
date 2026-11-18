@@ -24,7 +24,7 @@ use super::exec_sequence_inline::{
 };
 use super::scratch::FSEScratch;
 #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
-use super::seq_loop_asm::{Exit, Out};
+use super::seq_loop_asm::{Exit, Loop, Out};
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
 };
@@ -733,40 +733,43 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             #[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
             if B::CURSOR_IS_BLOCK_STABLE
                 && B::SUPPORTS_INLINE_SEQUENCE_EXEC
+                && rust_steps != 0
                 && super::seq_loop_asm::can_start(&br)
             {
-                let mut left = rust_steps;
-                while left != 0 {
-                    let mut out = Out {
-                        base: cur.base,
-                        op: cur.op,
-                        cap_w: cur.cap_w,
-                        live_base: cur.live_base.0,
-                        dict_end: cur.dict_end,
-                    };
-                    // SAFETY: the reader was refilled after its last read (before
-                    // the loop, or at the end of the last step), the states come
-                    // from validated tables, the cursor's base is a linear output
-                    // writable through `cap_w + 31` with its live bytes written,
-                    // and the literals carry their 32 bytes of read slack (the
-                    // assertion at the top of this function).
-                    let exit = unsafe {
-                        super::seq_loop_asm::run(
-                            &mut br,
-                            &mut ll_dec,
-                            &mut ml_dec,
-                            &mut of_dec,
-                            &mut shadow_hist,
-                            &mut out,
-                            literals_buffer.as_ptr(),
-                            &mut lit_cur,
-                            literals_buffer_len,
-                            dict_content,
-                            &mut left,
-                        )
-                    };
-                    let ran = out.op - cur.op;
-                    cur.op = out.op;
+                let out = Out {
+                    base: cur.base,
+                    cap_w: cur.cap_w,
+                    live_base: cur.live_base.0,
+                    dict_end: cur.dict_end,
+                };
+                // SAFETY: the reader was refilled after its last read (before
+                // the loop), the states come from validated tables, the
+                // cursor's base is a linear output writable through `cap_w + 31`
+                // with its live bytes written, and the literals carry their 32
+                // bytes of read slack (the assertion at the top of this
+                // function). The reader, states and history stay with the loop
+                // until `finish` below.
+                let mut asm_loop = unsafe {
+                    Loop::new(
+                        &br,
+                        &ll_dec,
+                        &ml_dec,
+                        &of_dec,
+                        &shadow_hist,
+                        &out,
+                        literals_buffer.as_ptr(),
+                        literals_buffer_len,
+                        dict_content,
+                        rust_steps,
+                    )
+                };
+                let mut exec_err = None;
+                loop {
+                    let op_before = cur.op;
+                    // SAFETY: `Loop::new` above; every pending sequence so far
+                    // was executed below and counted.
+                    let exit = unsafe { asm_loop.pass(&mut cur.op, &mut lit_cur) };
+                    let ran = cur.op - op_before;
                     seq_sum = seq_sum.wrapping_add(ran as u32);
                     if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
                         buffer.advance_output_counter(ran as u64);
@@ -788,13 +791,27 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                         resolved_offset
                     );
                     if let Err(e) = r {
-                        fallback_err = Some(e);
-                        break 'short;
+                        exec_err = Some(e);
+                        break;
                     }
                     seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
-                    left -= 1;
+                    asm_loop.executed_pending();
+                    if asm_loop.left() == 0 {
+                        break;
+                    }
                 }
-                rust_steps = left;
+                rust_steps = asm_loop.left();
+                asm_loop.finish(
+                    &mut br,
+                    &mut ll_dec,
+                    &mut ml_dec,
+                    &mut of_dec,
+                    &mut shadow_hist,
+                );
+                if let Some(e) = exec_err {
+                    fallback_err = Some(e);
+                    break 'short;
+                }
             }
             for _ in 0..rust_steps {
                 short_step!(true, 'short);
