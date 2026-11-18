@@ -1152,14 +1152,17 @@ macro_rules! optimal_block_body {
         // A segment adds at most a segment's sequences to a kept plan; past
         // this length the next might not fit, so the pass stops for the caller
         // to hand the plan over and is entered again where it stopped. Fixed
-        // for the entry, so each segment pays one comparison.
-        let plan_stop = if $keep_plan {
+        // for the entry, so each segment pays one comparison; held with the
+        // rest of the pass in memory, where it takes no register from the
+        // segment body (a local live across the loop cost 2% more
+        // instructions in this pass at level 19 on a 1 MiB corpus file).
+        $buffers.pass.plan_stop = if $keep_plan {
             BtMatcher::plan_stop_len($plan.capacity(), block_len)
         } else {
             usize::MAX
         };
         while $buffers.pass.cursor + 8 < block_len {
-            if $plan.len() > plan_stop {
+            if $plan.len() > $buffers.pass.plan_stop {
                 break;
             }
             let cursor = $buffers.pass.cursor;
@@ -1398,6 +1401,8 @@ impl HcMatchGenerator {
             litlen: plan_litlen,
             reps: self.table.offset_hist,
             literals_cursor: 0,
+            // Set by the pass on entry.
+            plan_stop: usize::MAX,
         };
         // Frame-constant LDM presence, resolved once per block (not per segment
         // and not in the DP hot loop): drives the HAS_LDM const-generic dispatch.
@@ -1597,6 +1602,8 @@ impl HcMatchGenerator {
             litlen: seed_litlen,
             reps: self.table.offset_hist,
             literals_cursor: 0,
+            // Set by the pass on entry.
+            plan_stop: usize::MAX,
         };
         // The seed pass keeps no plan (`KEEP_PLAN = false`), so it writes into
         // none.

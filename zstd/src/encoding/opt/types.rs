@@ -189,4 +189,7 @@ pub(crate) struct HcBlockPass {
     pub(crate) reps: [u32; 3],
     /// Block offset the statistics update has consumed literals up to.
     pub(crate) literals_cursor: usize,
+    /// Plan length past which the pass stops to hand its plan over
+    /// (`BtMatcher::plan_stop_len`), set on each entry.
+    pub(crate) plan_stop: usize,
 }
