@@ -49,13 +49,15 @@ fn slice_decode(
     target
 }
 
-/// Asserts that every exit of the loop was taken since `before`: entered
-/// blocks finishing in it, stopping at the stream's start, and handing a
-/// sequence to Rust.
+/// Asserts that since `before` the loop stopped at the stream's start and
+/// handed sequences to Rust. `Done` is not asked for: a block's last
+/// sequences sit in the first bytes of its bit stream, below the floor, so an
+/// entered block ends at `Boundary` unless the stream outlasts its sequences,
+/// which no frame here produces.
 #[cfg(feature = "std")]
-fn assert_every_exit_since(before: [u64; 3]) {
+fn assert_loop_ran_since(before: [u64; 3]) {
     let after = EXITS.with(|exits| exits.get());
-    for (exit, name) in ["Done", "Boundary", "Pending"].iter().enumerate() {
+    for (exit, name) in [(1, "Boundary"), (2, "Pending")] {
         assert!(
             after[exit] > before[exit],
             "the assembly loop never exited {name} (exits before {before:?}, after {after:?})"
@@ -107,8 +109,7 @@ fn shapes() -> Vec<Vec<u8>> {
 /// a time, whose loops are Rust; with the slice exactly the content's size
 /// (the last sequences in the tight tail) and with room past it. The tiers are
 /// named, not detected: a host whose detector picks a wider tier would
-/// otherwise never run the assembly. Where AVX2 runs, the loop must have taken
-/// each of its exits.
+/// otherwise never run the assembly. Where AVX2 runs, the loop must have run.
 #[cfg(feature = "std")]
 #[test]
 fn assembly_loop_decodes_what_the_rust_loop_decodes() {
@@ -149,7 +150,7 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
         }
     }
     if avx2_runs() {
-        assert_every_exit_since(before);
+        assert_loop_ran_since(before);
     }
 }
 
@@ -243,6 +244,6 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
         }
     }
     if avx2_runs() {
-        assert_every_exit_since(before);
+        assert_loop_ran_since(before);
     }
 }
