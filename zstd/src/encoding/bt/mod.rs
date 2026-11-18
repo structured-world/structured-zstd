@@ -101,25 +101,37 @@ impl BtMatcher {
         core::mem::size_of::<Self>() + Self::scratch_workspace_bytes(block)
     }
 
-    /// The most sequences one segment of the optimal pass writes when
-    /// `remaining` bytes of the block are left: every sequence covers at least
-    /// [`FORMAT_MIN_MATCH`] bytes, and a segment's stretches lie within its
+    /// The most sequences one segment of the optimal pass writes: every
+    /// sequence covers at least [`FORMAT_MIN_MATCH`] bytes, and a segment's
+    /// stretches lie within its
     /// [`HC_OPT_NODE_LEN`](super::cost_model::HC_OPT_NODE_LEN) cells.
-    pub(crate) fn segment_plan_len(remaining: usize) -> usize {
-        use super::cost_model::HC_OPT_NODE_LEN;
-        (remaining.min(HC_OPT_NODE_LEN) / FORMAT_MIN_MATCH) + 1
-    }
+    pub(crate) const SEGMENT_PLAN_LEN: usize =
+        super::cost_model::HC_OPT_NODE_LEN / FORMAT_MIN_MATCH + 1;
 
     /// Plan room for blocks of up to `block` bytes: the block's sequences, at
     /// most two segments' worth. The pass hands the plan over whenever the next
     /// segment might not fit, so the room never needs a large block's worth
     /// (upstream likewise stores each segment into `seqStore` before the
     /// next). Two segments rather than one: on compressible input a segment
-    /// often ends at its first match, and room for one made the pass stop and
-    /// re-enter after nearly every sequence, 3% more instructions at level 16
-    /// on a 1 MiB corpus file; with two it stops once per segment's worth.
+    /// often ends at its first match, and room for one stopped the pass after
+    /// nearly every sequence, 0.7% more instructions at levels 16 and 19 on a
+    /// 1 MiB corpus file than room for two.
     pub(crate) fn plan_room_len(block: usize) -> usize {
-        (block / FORMAT_MIN_MATCH + 1).min(2 * Self::segment_plan_len(usize::MAX))
+        (block / FORMAT_MIN_MATCH + 1).min(2 * Self::SEGMENT_PLAN_LEN)
+    }
+
+    /// The plan length past which the pass over a `block_len`-byte block stops
+    /// to hand its plan over, with room for `capacity` sequences: room less a
+    /// segment's worth, or never where the room holds the whole block's.
+    pub(crate) fn plan_stop_len(capacity: usize, block_len: usize) -> usize {
+        if capacity > block_len / FORMAT_MIN_MATCH {
+            usize::MAX
+        } else {
+            // The room is at least `plan_room_len(block_len)`, two segments'
+            // worth when it is short of the whole block's.
+            debug_assert!(capacity >= 2 * Self::SEGMENT_PLAN_LEN);
+            capacity - Self::SEGMENT_PLAN_LEN
+        }
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the

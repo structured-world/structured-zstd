@@ -1149,15 +1149,17 @@ macro_rules! optimal_block_body {
         // cursor, which never passes the block's end, so a block shorter than
         // the tail needs no floor: it simply has no segment.
         let block_len = $current.len();
+        // A segment adds at most a segment's sequences to a kept plan; past
+        // this length the next might not fit, so the pass stops for the caller
+        // to hand the plan over and is entered again where it stopped. Fixed
+        // for the entry, so each segment pays one comparison.
+        let plan_stop = if $keep_plan {
+            BtMatcher::plan_stop_len($plan.capacity(), block_len)
+        } else {
+            usize::MAX
+        };
         while $buffers.pass.cursor + 8 < block_len {
-            // A kept plan holds a segment's sequences at most at a time beyond
-            // what it already has (`BtMatcher::segment_plan_len`); without room
-            // for the next segment's, the pass stops for the caller to hand the
-            // plan over, and is entered again where it stopped.
-            if $keep_plan
-                && $plan.capacity() - $plan.len()
-                    < BtMatcher::segment_plan_len(block_len - $buffers.pass.cursor)
-            {
+            if $plan.len() > plan_stop {
                 break;
             }
             let cursor = $buffers.pass.cursor;
