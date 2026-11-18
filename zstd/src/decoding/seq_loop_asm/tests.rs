@@ -1,4 +1,4 @@
-use crate::cpu_kernel::CpuKernelTag;
+use crate::cpu_kernel::{CpuKernelTag, supported_kernels_for_tests};
 use crate::decoding::{FrameDecoder, StreamingDecoder};
 use crate::encoding::{CompressionLevel, compress_slice_to_vec};
 use alloc::vec::Vec;
@@ -19,13 +19,6 @@ pub(super) fn count_exit(status: usize) {
         counts[status.min(2)] += 1;
         exits.set(counts);
     });
-}
-
-/// Whether this CPU can run the AVX2 tier, the one whose sequence loop is the
-/// assembly.
-#[cfg(feature = "std")]
-fn avx2_runs() -> bool {
-    std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")
 }
 
 /// Decodes `frame` into a slice of `len + slack` bytes on the named tier.
@@ -103,30 +96,25 @@ fn shapes() -> Vec<Vec<u8>> {
     alloc::vec![text, short_period, long_runs, mixed]
 }
 
-/// A frame decoded into a slice on the AVX2 tier, where the sequence loop runs
-/// its common path in assembly, equals the input, as do the scalar tier's
-/// slice decode and the same frame streamed through the ring buffer a piece at
-/// a time, whose loops are Rust; with the slice exactly the content's size
-/// (the last sequences in the tight tail) and with room past it. The tiers are
-/// named, not detected: a host whose detector picks a wider tier would
-/// otherwise never run the assembly. Where AVX2 runs, the loop must have run.
+/// A frame decoded into a slice on every kernel this CPU runs, each named,
+/// equals the input, as does the same frame streamed through the ring buffer a
+/// piece at a time; with the slice exactly the content's size (the last
+/// sequences in the tight tail) and with room past it. On the AVX2 kernel the
+/// sequence loop runs its common path in assembly, and there the loop must
+/// have run; the other kernels and the ring buffer run Rust loops.
 #[cfg(feature = "std")]
 #[test]
 fn assembly_loop_decodes_what_the_rust_loop_decodes() {
+    let kernels = supported_kernels_for_tests();
     let before = EXITS.with(|exits| exits.get());
     for (shape, input) in shapes().iter().enumerate() {
         for level in [1, 3, 9, 16, 19] {
             let frame = compress_slice_to_vec(input, CompressionLevel::from_level(level));
-            for slack in [0usize, 64] {
-                assert!(
-                    slice_decode(&frame, input.len(), slack, CpuKernelTag::Scalar, None) == *input,
-                    "scalar slice decode differs: shape {shape} level {level} slack {slack}"
-                );
-                if avx2_runs() {
+            for &kernel in &kernels {
+                for slack in [0usize, 64] {
                     assert!(
-                        slice_decode(&frame, input.len(), slack, CpuKernelTag::Avx2, None)
-                            == *input,
-                        "AVX2 slice decode differs: shape {shape} level {level} slack {slack}"
+                        slice_decode(&frame, input.len(), slack, kernel, None) == *input,
+                        "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
                     );
                 }
             }
@@ -149,7 +137,7 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
             );
         }
     }
-    if avx2_runs() {
+    if kernels.contains(&CpuKernelTag::Avx2) {
         assert_loop_ran_since(before);
     }
 }
@@ -189,6 +177,7 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
         k += 1;
     }
     let inputs = [pieces, corpus[300 * 1024..364 * 1024].to_vec()];
+    let kernels = supported_kernels_for_tests();
     let before = EXITS.with(|exits| exits.get());
     for (shape, input) in inputs.iter().enumerate() {
         for level in [1, 3, 9, 16, 19] {
@@ -201,27 +190,11 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
                 )
                 .expect("attach dictionary");
             let frame = compressor.compress_independent_frame(input);
-            for slack in [0usize, 64] {
-                assert!(
-                    slice_decode(
-                        &frame,
-                        input.len(),
-                        slack,
-                        CpuKernelTag::Scalar,
-                        Some(&handle)
-                    ) == *input,
-                    "scalar slice decode differs: shape {shape} level {level} slack {slack}"
-                );
-                if avx2_runs() {
+            for &kernel in &kernels {
+                for slack in [0usize, 64] {
                     assert!(
-                        slice_decode(
-                            &frame,
-                            input.len(),
-                            slack,
-                            CpuKernelTag::Avx2,
-                            Some(&handle)
-                        ) == *input,
-                        "AVX2 slice decode differs: shape {shape} level {level} slack {slack}"
+                        slice_decode(&frame, input.len(), slack, kernel, Some(&handle)) == *input,
+                        "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
                     );
                 }
             }
@@ -243,7 +216,7 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
             );
         }
     }
-    if avx2_runs() {
+    if kernels.contains(&CpuKernelTag::Avx2) {
         assert_loop_ran_since(before);
     }
 }
