@@ -48,14 +48,26 @@ fn slice_decode(
 /// entered block ends at `Boundary` unless the stream outlasts its sequences,
 /// which no frame here produces.
 #[cfg(feature = "std")]
-fn assert_loop_ran_since(before: [u64; 3]) {
+fn assert_loop_ran_since(before: [u64; 3], shape: usize) {
     let after = EXITS.with(|exits| exits.get());
     for (exit, name) in [(1, "Boundary"), (2, "Pending")] {
         assert!(
             after[exit] > before[exit],
-            "the assembly loop never exited {name} (exits before {before:?}, after {after:?})"
+            "shape {shape}: the assembly loop never exited {name} \
+             (exits before {before:?}, after {after:?})"
         );
     }
+}
+
+/// Whether the kernels include AVX2, the one whose loop is the assembly; says
+/// so when they do not, so a host that skips the loop's checks shows it.
+#[cfg(feature = "std")]
+fn assembly_runs(kernels: &[CpuKernelTag]) -> bool {
+    let runs = kernels.contains(&CpuKernelTag::Avx2);
+    if !runs {
+        std::eprintln!("no AVX2 kernel on this CPU: the assembly loop is not exercised");
+    }
+    runs
 }
 
 /// Inputs whose sequences reach every exit of the assembly loop: text with
@@ -101,13 +113,15 @@ fn shapes() -> Vec<Vec<u8>> {
 /// piece at a time; with the slice exactly the content's size (the last
 /// sequences in the tight tail) and with room past it. On the AVX2 kernel the
 /// sequence loop runs its common path in assembly, and there the loop must
-/// have run; the other kernels and the ring buffer run Rust loops.
+/// have run for every shape; the other kernels and the ring buffer run Rust
+/// loops.
 #[cfg(feature = "std")]
 #[test]
 fn assembly_loop_decodes_what_the_rust_loop_decodes() {
     let kernels = supported_kernels_for_tests();
-    let before = EXITS.with(|exits| exits.get());
+    let assembly = assembly_runs(&kernels);
     for (shape, input) in shapes().iter().enumerate() {
+        let before = EXITS.with(|exits| exits.get());
         for level in [1, 3, 9, 16, 19] {
             let frame = compress_slice_to_vec(input, CompressionLevel::from_level(level));
             for &kernel in &kernels {
@@ -136,9 +150,9 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
                 "stream decode differs: shape {shape} level {level}"
             );
         }
-    }
-    if kernels.contains(&CpuKernelTag::Avx2) {
-        assert_loop_ran_since(before);
+        if assembly {
+            assert_loop_ran_since(before, shape);
+        }
     }
 }
 
@@ -178,8 +192,9 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
     }
     let inputs = [pieces, corpus[300 * 1024..364 * 1024].to_vec()];
     let kernels = supported_kernels_for_tests();
-    let before = EXITS.with(|exits| exits.get());
+    let assembly = assembly_runs(&kernels);
     for (shape, input) in inputs.iter().enumerate() {
+        let before = EXITS.with(|exits| exits.get());
         for level in [1, 3, 9, 16, 19] {
             let mut compressor: FrameCompressor =
                 FrameCompressor::new(CompressionLevel::from_level(level));
@@ -215,8 +230,8 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
                 "stream decode differs: shape {shape} level {level}"
             );
         }
-    }
-    if kernels.contains(&CpuKernelTag::Avx2) {
-        assert_loop_ran_since(before);
+        if assembly {
+            assert_loop_ran_since(before, shape);
+        }
     }
 }
