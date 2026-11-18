@@ -21,25 +21,34 @@ pub(super) fn count_exit(status: usize) {
     });
 }
 
-/// Decodes `frame` into a slice of `len + slack` bytes on the named tier.
+/// Decodes `frame` into a slice of `len + slack` bytes on the named tier, and
+/// with a dictionary a second time on the same decoder. A dictionary is cold
+/// on its first frame, whose blocks of 16 sequences or more take the long
+/// pipeline, as upstream's do; only from the next frame on do its blocks reach
+/// the short loop and the assembly, as on a decoder reused across frames.
 #[cfg(feature = "std")]
-fn slice_decode(
+fn slice_decodes(
     frame: &[u8],
     len: usize,
     slack: usize,
     kernel: CpuKernelTag,
     dict: Option<&crate::decoding::DictionaryHandle>,
-) -> Vec<u8> {
+) -> Vec<Vec<u8>> {
     let mut decoder = FrameDecoder::new();
     decoder.decode_with_kernel_for_tests(kernel);
-    let mut target = alloc::vec![0u8; len + slack];
-    let wrote = match dict {
-        Some(handle) => decoder.decode_all_with_dict_handle(frame, &mut target, handle),
-        None => decoder.decode_all(frame, &mut target),
-    }
-    .expect("slice decode");
-    target.truncate(wrote);
-    target
+    let rounds = if dict.is_some() { 2 } else { 1 };
+    (0..rounds)
+        .map(|_| {
+            let mut target = alloc::vec![0u8; len + slack];
+            let wrote = match dict {
+                Some(handle) => decoder.decode_all_with_dict_handle(frame, &mut target, handle),
+                None => decoder.decode_all(frame, &mut target),
+            }
+            .expect("slice decode");
+            target.truncate(wrote);
+            target
+        })
+        .collect()
 }
 
 /// Asserts that since `before` the loop stopped at the stream's start and
@@ -126,10 +135,12 @@ fn assembly_loop_decodes_what_the_rust_loop_decodes() {
             let frame = compress_slice_to_vec(input, CompressionLevel::from_level(level));
             for &kernel in &kernels {
                 for slack in [0usize, 64] {
-                    assert!(
-                        slice_decode(&frame, input.len(), slack, kernel, None) == *input,
-                        "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
-                    );
+                    for decoded in slice_decodes(&frame, input.len(), slack, kernel, None) {
+                        assert!(
+                            decoded == *input,
+                            "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
+                        );
+                    }
                 }
             }
             // `read` in small pieces, so the frame decodes block by block
@@ -207,10 +218,14 @@ fn assembly_loop_decodes_dictionary_frames_as_the_rust_loop_does() {
             let frame = compressor.compress_independent_frame(input);
             for &kernel in &kernels {
                 for slack in [0usize, 64] {
-                    assert!(
-                        slice_decode(&frame, input.len(), slack, kernel, Some(&handle)) == *input,
-                        "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
-                    );
+                    let decodes = slice_decodes(&frame, input.len(), slack, kernel, Some(&handle));
+                    for (round, decoded) in decodes.iter().enumerate() {
+                        assert!(
+                            *decoded == *input,
+                            "{kernel:?} slice decode {round} differs: \
+                             shape {shape} level {level} slack {slack}"
+                        );
+                    }
                 }
             }
             let mut decoder =
