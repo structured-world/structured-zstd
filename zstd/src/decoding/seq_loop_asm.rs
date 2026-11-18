@@ -160,10 +160,11 @@ pub(super) unsafe fn run(
         ll: 0,
         ml: 0,
         offset: 0,
-        // A position past the address space means the window never runs out
-        // within this output, which the largest address says as well; zero
-        // (no dictionary room) gives `base`, below every write position.
-        dict_limit: base.checked_add(out.dict_end).unwrap_or(usize::MAX),
+        // Saturating is the meaning: a position past the address space means
+        // the window never runs out within this output, which the largest
+        // address says as well; zero (no dictionary room) gives `base`, below
+        // every write position.
+        dict_limit: base.saturating_add(out.dict_end),
         dict_len: dict_content.len(),
         dict_end: dict_content.as_ptr() as usize + dict_content.len(),
     };
