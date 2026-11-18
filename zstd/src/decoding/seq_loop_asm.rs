@@ -495,6 +495,8 @@ impl Loop {
         self.of_e = of_e;
         *op_pos = op - self.base;
         *lit_cur = lit - self.literals;
+        #[cfg(all(test, feature = "std"))]
+        tests::count_exit(status as usize);
         match status {
             0 => Exit::Done,
             1 => Exit::Boundary,
