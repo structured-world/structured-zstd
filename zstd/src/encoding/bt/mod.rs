@@ -110,12 +110,16 @@ impl BtMatcher {
         (remaining.min(HC_OPT_NODE_LEN) / FORMAT_MIN_MATCH) + 1
     }
 
-    /// Plan room for blocks of up to `block` bytes: one segment's sequences.
-    /// The pass hands the plan over whenever the next segment might not fit,
-    /// so the room never needs the block's worth (upstream likewise stores
-    /// each segment into `seqStore` before the next).
+    /// Plan room for blocks of up to `block` bytes: the block's sequences, at
+    /// most two segments' worth. The pass hands the plan over whenever the next
+    /// segment might not fit, so the room never needs a large block's worth
+    /// (upstream likewise stores each segment into `seqStore` before the
+    /// next). Two segments rather than one: on compressible input a segment
+    /// often ends at its first match, and room for one made the pass stop and
+    /// re-enter after nearly every sequence, 3% more instructions at level 16
+    /// on a 1 MiB corpus file; with two it stops once per segment's worth.
     pub(crate) fn plan_room_len(block: usize) -> usize {
-        Self::segment_plan_len(block)
+        (block / FORMAT_MIN_MATCH + 1).min(2 * Self::segment_plan_len(usize::MAX))
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the
