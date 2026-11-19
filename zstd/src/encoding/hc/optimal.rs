@@ -52,15 +52,8 @@ use crate::encoding::{
 /// One position's search, built for the block's strategy, key width and kernel
 /// (`collect_optimal_candidates_initialized_<kernel>`), as the block's pass
 /// calls it.
-type OptimalCollectFn = unsafe fn(
-    &mut HcMatchGenerator,
-    usize,
-    usize,
-    usize,
-    &[u32; 3],
-    bool,
-    &mut RegionVec<OptMatch>,
-);
+type OptimalCollectFn =
+    unsafe fn(&mut HcMatchGenerator, usize, &[u32; 3], bool, &mut RegionVec<OptMatch>);
 
 macro_rules! build_optimal_plan_impl_body {
     (
@@ -87,7 +80,9 @@ macro_rules! build_optimal_plan_impl_body {
         // segment loop rather than as a function of its own.
         $seg:lifetime $(,)?
     ) => {{
-        let current_abs_end = $current_abs_start + $current_len;
+        // Every segment runs to the block's end, which the pass set for the
+        // searches as it entered.
+        debug_assert_eq!($current_abs_start + $current_len, $self.opt_block_abs_end);
         let min_match_len = $self.table.opt_min_match();
         // `HC_OPT_NUM > 0` by const definition, so `HC_OPT_NUM - 1` is safe.
         let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
@@ -239,8 +234,6 @@ macro_rules! build_optimal_plan_impl_body {
                     $collect(
                         &mut *$self,
                         abs_pos,
-                        current_abs_end,
-                        profile.sufficient_match_len,
                         &initial_reps,
                         no_literals_before,
                         &mut *candidates,
@@ -344,8 +337,6 @@ macro_rules! build_optimal_plan_impl_body {
                     $collect(
                         &mut *$self,
                         $current_abs_start,
-                        current_abs_end,
-                        profile.sufficient_match_len,
                         &initial_reps,
                         initial_litlen == 0,
                         &mut *candidates,
@@ -748,8 +739,6 @@ macro_rules! build_optimal_plan_impl_body {
                 $collect(
                     &mut *$self,
                     abs_pos,
-                    current_abs_end,
-                    profile.sufficient_match_len,
                     &(*nodes.add(pos)).reps,
                     (*nodes.add(pos)).litlen == 0,
                     &mut *candidates,
@@ -1157,6 +1146,10 @@ macro_rules! optimal_block_body {
         // cursor, which never passes the block's end, so a block shorter than
         // the tail needs no floor: it simply has no segment.
         let block_len = $current.len();
+        // Fixed for the pass, so every position's search reads them here
+        // rather than taking them as arguments of its call.
+        $self.opt_block_abs_end = $current_abs_start + block_len;
+        $self.opt_sufficient_match_len = $profile.sufficient_match_len;
         // A segment adds at most a segment's sequences to a kept plan; past
         // this length the next might not fit, so the pass stops for the caller
         // to hand the plan over and is entered again where it stopped. Fixed
@@ -2191,6 +2184,9 @@ impl HcMatchGenerator {
         let mut found = unsafe { RegionVec::over(&mut room) };
         let reps = &query.reps;
         let ll0 = query.lit_len == 0;
+        // The pass's constants, as `optimal_block_body!` sets them.
+        self.opt_block_abs_end = current_abs_end;
+        self.opt_sufficient_match_len = sufficient_match_len;
         // Dispatch purely from `self.strategy_tag` (set by
         // `configure()`). Tests must configure the matcher the same
         // way production does — wiring up `table.hash3_log` directly
@@ -2201,36 +2197,16 @@ impl HcMatchGenerator {
             ($strategy:ty) => {
                 match self.table.opt_search_mls() {
                     3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                 }
             };
@@ -2287,8 +2263,6 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
@@ -2299,14 +2273,7 @@ impl HcMatchGenerator {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_neon::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -2316,8 +2283,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2327,8 +2292,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Sse2 => unsafe {
                     self.collect_optimal_candidates_initialized_sse2::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2338,8 +2301,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Sse42 => unsafe {
                     self.collect_optimal_candidates_initialized_sse42::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2348,8 +2309,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Scalar => self
                     .collect_optimal_candidates_initialized_scalar::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2366,14 +2325,7 @@ impl HcMatchGenerator {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(not(any(
             all(
@@ -2390,14 +2342,7 @@ impl HcMatchGenerator {
             )
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(abs_pos, reps, ll0, out)
         }
     }
 
@@ -2418,12 +2363,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2452,12 +2398,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2492,12 +2439,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2526,12 +2474,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2567,12 +2516,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2604,12 +2554,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
         out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
