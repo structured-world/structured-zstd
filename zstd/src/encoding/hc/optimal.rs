@@ -45,22 +45,15 @@ use crate::encoding::{
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
         HcBlockPass, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
-        MatchCandidate,
+        OptMatch,
     },
 };
 
 /// One position's search, built for the block's strategy, key width and kernel
 /// (`collect_optimal_candidates_initialized_<kernel>`), as the block's pass
 /// calls it.
-type OptimalCollectFn = unsafe fn(
-    &mut HcMatchGenerator,
-    usize,
-    usize,
-    usize,
-    &[u32; 3],
-    bool,
-    &mut RegionVec<MatchCandidate>,
-);
+type OptimalCollectFn =
+    unsafe fn(&mut HcMatchGenerator, usize, &[u32; 3], bool, &mut RegionVec<OptMatch>);
 
 macro_rules! build_optimal_plan_impl_body {
     (
@@ -87,7 +80,9 @@ macro_rules! build_optimal_plan_impl_body {
         // segment loop rather than as a function of its own.
         $seg:lifetime $(,)?
     ) => {{
-        let current_abs_end = $current_abs_start + $current_len;
+        // Every segment runs to the block's end, which the pass set for the
+        // searches as it entered.
+        debug_assert_eq!($current_abs_start + $current_len, $self.opt_block_abs_end);
         let min_match_len = $self.table.opt_min_match();
         // `HC_OPT_NUM > 0` by const definition, so `HC_OPT_NUM - 1` is safe.
         let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
@@ -239,8 +234,6 @@ macro_rules! build_optimal_plan_impl_body {
                     $collect(
                         &mut *$self,
                         abs_pos,
-                        current_abs_end,
-                        profile.sufficient_match_len,
                         &initial_reps,
                         no_literals_before,
                         &mut *candidates,
@@ -344,8 +337,6 @@ macro_rules! build_optimal_plan_impl_body {
                     $collect(
                         &mut *$self,
                         $current_abs_start,
-                        current_abs_end,
-                        profile.sufficient_match_len,
                         &initial_reps,
                         initial_litlen == 0,
                         &mut *candidates,
@@ -436,10 +427,10 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             if let Some(candidate) = candidates.last() {
-                let longest_len = candidate.match_len.min($current_len);
+                let longest_len = (candidate.match_len as usize).min($current_len);
                 if longest_len > sufficient_len {
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         initial_litlen,
                         initial_reps,
                     );
@@ -459,7 +450,7 @@ macro_rules! build_optimal_plan_impl_body {
                     // SAFETY: cell 0 was written by the seed above (a candidate exists).
                     let forced_price = BtMatcher::add_prices(unsafe { *node_prices }, seq_cost);
                     let forced_state = HcOptimalNode {
-                        off: candidate.offset as u32,
+                        off: candidate.offset,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: initial_reps,
@@ -476,7 +467,7 @@ macro_rules! build_optimal_plan_impl_body {
             if !seed_forced_shortest_path {
                 let mut prev_max_len = min_match_len - 1;
                 for candidate in candidates.iter() {
-                    let max_match_len = candidate.match_len.min(frontier_limit);
+                    let max_match_len = (candidate.match_len as usize).min(frontier_limit);
                     if max_match_len < min_match_len {
                         continue;
                     }
@@ -497,7 +488,7 @@ macro_rules! build_optimal_plan_impl_body {
                         };
                     }
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         initial_litlen,
                         initial_reps,
                     );
@@ -530,7 +521,7 @@ macro_rules! build_optimal_plan_impl_body {
                             unsafe {
                                 HcOptimalNode::write_match_end(
                                     nodes.add(match_len),
-                                    candidate.offset as u32,
+                                    candidate.offset,
                                     match_len as u32,
                                 );
                                 *node_prices.add(match_len) = next_cost;
@@ -748,8 +739,6 @@ macro_rules! build_optimal_plan_impl_body {
                 $collect(
                     &mut *$self,
                     abs_pos,
-                    current_abs_end,
-                    profile.sufficient_match_len,
                     &(*nodes.add(pos)).reps,
                     (*nodes.add(pos)).litlen == 0,
                     &mut *candidates,
@@ -774,14 +763,14 @@ macro_rules! build_optimal_plan_impl_body {
             let base_reps = unsafe { (*nodes.add(pos)).reps };
             let base_litlen = unsafe { (*nodes.add(pos)).litlen as usize };
             if let Some(candidate) = candidates.last() {
-                let longest_len = candidate.match_len.min($current_len - pos);
+                let longest_len = (candidate.match_len as usize).min($current_len - pos);
                 if longest_len > sufficient_len
                     || pos + longest_len >= HC_OPT_NUM
                     || pos + longest_len >= $current_len
                 {
                     let lit_len = base_litlen;
                     let off_base = BtMatcher::encode_offset_base_with_reps(
-                        candidate.offset as u32,
+                        candidate.offset,
                         lit_len,
                         base_reps,
                     );
@@ -802,7 +791,7 @@ macro_rules! build_optimal_plan_impl_body {
                     let end_pos = (pos + longest_len).min($current_len);
                     forced_end = Some(end_pos);
                     forced_end_state = Some(HcOptimalNode {
-                        off: candidate.offset as u32,
+                        off: candidate.offset,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: base_reps,
@@ -821,7 +810,7 @@ macro_rules! build_optimal_plan_impl_body {
             debug_assert!(pos <= frontier_limit);
             let mut start_len = min_match_len;
             for candidate in candidates.iter() {
-                let max_match_len = candidate.match_len;
+                let max_match_len = candidate.match_len as usize;
                 debug_assert!(max_match_len >= start_len, "the candidate ladder rises");
                 debug_assert!(pos + max_match_len <= frontier_limit);
                 let max_next = pos + max_match_len;
@@ -832,7 +821,7 @@ macro_rules! build_optimal_plan_impl_body {
                 }
                 let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
-                    candidate.offset as u32,
+                    candidate.offset,
                     lit_len,
                     base_reps,
                 );
@@ -866,7 +855,7 @@ macro_rules! build_optimal_plan_impl_body {
                             unsafe {
                                 HcOptimalNode::write_match_end(
                                     nodes.add(next),
-                                    candidate.offset as u32,
+                                    candidate.offset,
                                     match_len as u32,
                                 );
                                 *node_prices.add(next) = next_cost;
@@ -918,7 +907,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 ll0_price,
                                 off_price,
                                 base_cost,
-                                candidate.offset as u32,
+                                candidate.offset,
                                 last_pos,
                             )
                         });
@@ -1145,18 +1134,36 @@ macro_rules! optimal_block_body {
         };
         // Everything the pass carries between segments lives in `$buffers.pass`,
         // read at the top of a segment and written at its end, so none of it is
-        // live across the segment body (see `HcOptimalPlanBuffers::pass`).
-        $buffers.pass = HcBlockPass {
-            cursor: $cursor,
-            litlen: $litlen,
-            reps: $reps,
-            literals_cursor: 0,
-        };
+        // live across the segment body (see `HcOptimalPlanBuffers::pass`). The
+        // caller sets it before the block's first entry, and a pass that stops
+        // to hand its plan over resumes from it.
+        // The entry's position arrives as arguments and is written here, the
+        // statistics cursor stays as the caller left it.
+        $buffers.pass.cursor = $cursor;
+        $buffers.pass.litlen = $litlen;
+        $buffers.pass.reps = $reps;
         // The last 8 bytes are left as literals. Written as an addition on the
         // cursor, which never passes the block's end, so a block shorter than
         // the tail needs no floor: it simply has no segment.
         let block_len = $current.len();
+        // Fixed for the pass, so every position's search reads them here
+        // rather than taking them as arguments of its call.
+        $self.opt_block_abs_end = $current_abs_start + block_len;
+        $self.opt_sufficient_match_len = $profile.sufficient_match_len;
+        // A segment adds at most a segment's sequences to a kept plan; past
+        // this length the next might not fit, so the pass stops for the caller
+        // to hand the plan over and is entered again where it stopped. Fixed
+        // for the entry, so each segment pays one comparison; held with the
+        // rest of the pass state, read once a segment.
+        $buffers.pass.plan_stop = if $keep_plan {
+            BtMatcher::plan_stop_len($plan.capacity(), block_len)
+        } else {
+            usize::MAX
+        };
         while $buffers.pass.cursor + 8 < block_len {
+            if $plan.len() > $buffers.pass.plan_stop {
+                break;
+            }
             let cursor = $buffers.pass.cursor;
             let segment = &$current[cursor..];
             let segment_abs_start = $current_abs_start + cursor;
@@ -1387,8 +1394,15 @@ impl HcMatchGenerator {
         // SAFETY: `plan_room` is touched only through `best_plan` until both
         // are put back below.
         let mut best_plan = unsafe { RegionVec::over(&mut plan_room) };
-        let plan_reps = self.table.offset_hist;
         let (cursor, plan_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
+        plan_buffers.pass = HcBlockPass {
+            cursor,
+            litlen: plan_litlen,
+            reps: self.table.offset_hist,
+            literals_cursor: 0,
+            // Set by the pass on entry.
+            plan_stop: usize::MAX,
+        };
         // Frame-constant LDM presence, resolved once per block (not per segment
         // and not in the DP hot loop): drives the HAS_LDM const-generic dispatch.
         let has_ldm = !self.bt.ldm_sequences.is_empty();
@@ -1403,9 +1417,9 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1416,9 +1430,9 @@ impl HcMatchGenerator {
                         self.$block::<S, true, false, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1429,9 +1443,9 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1442,9 +1456,9 @@ impl HcMatchGenerator {
                         self.$block::<S, true, true, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1455,9 +1469,9 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1468,9 +1482,9 @@ impl HcMatchGenerator {
                         self.$block::<S, false, false, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1481,9 +1495,9 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, false, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1494,9 +1508,9 @@ impl HcMatchGenerator {
                         self.$block::<S, false, true, true, true>(
                             current,
                             current_abs_start,
-                            cursor,
-                            plan_litlen,
-                            plan_reps,
+                            plan_buffers.pass.cursor,
+                            plan_buffers.pass.litlen,
+                            plan_buffers.pass.reps,
                             profile,
                             &mut opt_state,
                             &mut best_plan,
@@ -1506,55 +1520,76 @@ impl HcMatchGenerator {
                 }
             }};
         }
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ))]
-        unsafe {
-            run_main_loop!(run_optimal_block_neon);
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::FastpathKernel;
-            crate::encoding::fastpath::tier_match!(K {
-                #[cfg(feature = "kernel-avx2")]
-                FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse2 => run_main_loop!(run_optimal_block_sse2),
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse42 => run_main_loop!(run_optimal_block_sse42),
-                FastpathKernel::Scalar => run_main_loop!(run_optimal_block_scalar),
-            })
-        }
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        unsafe {
-            run_main_loop!(run_optimal_block_simd128);
-        }
-        #[cfg(not(any(
-            all(
+        // The pass holds at most a segment's plan beyond what it has; when the
+        // room runs short it stops, the plan so far goes to the sink, and the
+        // pass is entered again where it stopped, as upstream stores each
+        // segment's sequences into `seqStore` before the next segment. The
+        // pass functions are `#[inline(never)]`: called in this loop, the AVX2
+        // one was inlined into the driver, and the merged body took 9% more
+        // instructions at level 16 on a 1 MiB corpus file.
+        let mut literals_start = 0usize;
+        loop {
+            // Each entry starts where the pass stands: the block's start on
+            // the first, where it stopped on the next.
+            #[cfg(all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
-            ),
-            target_arch = "x86",
-            target_arch = "x86_64",
-            all(
+            ))]
+            unsafe {
+                run_main_loop!(run_optimal_block_neon);
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                use crate::encoding::fastpath::FastpathKernel;
+                crate::encoding::fastpath::tier_match!(K {
+                    #[cfg(feature = "kernel-avx2")]
+                    FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
+                    #[cfg(feature = "kernel-sse")]
+                    FastpathKernel::Sse2 => run_main_loop!(run_optimal_block_sse2),
+                    #[cfg(feature = "kernel-sse")]
+                    FastpathKernel::Sse42 => run_main_loop!(run_optimal_block_sse42),
+                    FastpathKernel::Scalar => run_main_loop!(run_optimal_block_scalar),
+                })
+            }
+            #[cfg(all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
                 feature = "kernel-simd128"
-            )
-        )))]
-        {
-            run_main_loop!(run_optimal_block_scalar);
+            ))]
+            unsafe {
+                run_main_loop!(run_optimal_block_simd128);
+            }
+            #[cfg(not(any(
+                all(
+                    target_arch = "aarch64",
+                    target_endian = "little",
+                    feature = "kernel-neon"
+                ),
+                target_arch = "x86",
+                target_arch = "x86_64",
+                all(
+                    target_arch = "wasm32",
+                    target_feature = "simd128",
+                    feature = "kernel-simd128"
+                )
+            )))]
+            {
+                run_main_loop!(run_optimal_block_scalar);
+            }
+            self.table.emit_optimal_sequences(
+                current_len,
+                &best_plan,
+                &mut literals_start,
+                &mut handle_sequence,
+            );
+            best_plan.clear();
+            if plan_buffers.pass.cursor + 8 >= current_len {
+                break;
+            }
         }
-
         self.table
-            .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
+            .emit_block_tail(current_len, literals_start, &mut handle_sequence);
         // `best_plan` is not read past here, so the room goes back.
         self.bt.opt_segment_plan_scratch = plan_room;
         let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
@@ -1585,8 +1620,17 @@ impl HcMatchGenerator {
         debug_assert_eq!(seed_profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
-        let seed_reps = self.table.offset_hist;
         let (cursor, seed_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
+        let seed_reps = self.table.offset_hist;
+        // The seed pass keeps no plan, so it runs the block in one entry.
+        plan_buffers.pass = HcBlockPass {
+            cursor,
+            litlen: seed_litlen,
+            reps: seed_reps,
+            literals_cursor: 0,
+            // Set by the pass on entry.
+            plan_stop: usize::MAX,
+        };
         // The seed pass keeps no plan (`KEEP_PLAN = false`), so it writes into
         // none.
         let mut seed_plan = RegionVec::empty();
@@ -1832,6 +1876,7 @@ impl HcMatchGenerator {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_optimal_block_neon<
         S: crate::encoding::strategy::Strategy,
@@ -1877,6 +1922,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_optimal_block_sse42<
         S: crate::encoding::strategy::Strategy,
@@ -1922,6 +1968,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_optimal_block_sse2<
         S: crate::encoding::strategy::Strategy,
@@ -1964,6 +2011,7 @@ impl HcMatchGenerator {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_optimal_block_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
@@ -2021,6 +2069,7 @@ impl HcMatchGenerator {
         ),
         allow(dead_code)
     )]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn run_optimal_block_scalar<
         S: crate::encoding::strategy::Strategy,
@@ -2070,6 +2119,7 @@ impl HcMatchGenerator {
     // blocks (needed by the safe scalar wrapper) are redundant inside this
     // target_feature fn.
     #[allow(unused_unsafe)]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_optimal_block_simd128<
         S: crate::encoding::strategy::Strategy,
@@ -2114,7 +2164,7 @@ impl HcMatchGenerator {
         current_abs_end: usize,
         sufficient_match_len: usize,
         query: HcCandidateQuery,
-        out: &mut Vec<MatchCandidate>,
+        out: &mut Vec<OptMatch>,
     ) {
         use crate::encoding::strategy::{self, StrategyTag};
         self.table.ensure_tables();
@@ -2134,6 +2184,9 @@ impl HcMatchGenerator {
         let mut found = unsafe { RegionVec::over(&mut room) };
         let reps = &query.reps;
         let ll0 = query.lit_len == 0;
+        // The pass's constants, as `optimal_block_body!` sets them.
+        self.opt_block_abs_end = current_abs_end;
+        self.opt_sufficient_match_len = sufficient_match_len;
         // Dispatch purely from `self.strategy_tag` (set by
         // `configure()`). Tests must configure the matcher the same
         // way production does — wiring up `table.hash3_log` directly
@@ -2144,36 +2197,16 @@ impl HcMatchGenerator {
             ($strategy:ty) => {
                 match self.table.opt_search_mls() {
                     3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                     _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
-                        abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
-                        reps,
-                        ll0,
-                        &mut found,
+                        abs_pos, reps, ll0, &mut found,
                     ),
                 }
             };
@@ -2230,11 +2263,9 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
         #[cfg(all(
             target_arch = "aarch64",
@@ -2242,14 +2273,7 @@ impl HcMatchGenerator {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_neon::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -2259,8 +2283,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2270,8 +2292,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Sse2 => unsafe {
                     self.collect_optimal_candidates_initialized_sse2::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2281,8 +2301,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Sse42 => unsafe {
                     self.collect_optimal_candidates_initialized_sse42::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2291,8 +2309,6 @@ impl HcMatchGenerator {
                 FastpathKernel::Scalar => self
                     .collect_optimal_candidates_initialized_scalar::<S, MLS>(
                         abs_pos,
-                        current_abs_end,
-                        sufficient_match_len,
                         reps,
                         ll0,
                         out,
@@ -2309,14 +2325,7 @@ impl HcMatchGenerator {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(not(any(
             all(
@@ -2333,14 +2342,7 @@ impl HcMatchGenerator {
             )
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            )
+            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(abs_pos, reps, ll0, out)
         }
     }
 
@@ -2361,12 +2363,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2395,12 +2398,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2435,12 +2439,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2469,12 +2474,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2510,12 +2516,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,
@@ -2547,12 +2554,13 @@ impl HcMatchGenerator {
     >(
         &mut self,
         abs_pos: usize,
-        current_abs_end: usize,
-        sufficient_match_len: usize,
         reps: &[u32; 3],
         ll0: bool,
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
     ) {
+        // The pass's constants, set as it entered (`optimal_block_body!`).
+        let current_abs_end = self.opt_block_abs_end;
+        let sufficient_match_len = self.opt_sufficient_match_len;
         collect_optimal_candidates_initialized_body!(
             self,
             S,

@@ -40,7 +40,7 @@ use super::match_table::helpers::common_prefix_len;
 #[cfg(test)]
 use super::opt::ldm::HcRawSeq;
 #[cfg(test)]
-use super::opt::types::{HcCandidateQuery, MatchCandidate};
+use super::opt::types::{HcCandidateQuery, MatchCandidate, OptMatch};
 use super::row::RowMatchGenerator;
 use super::simple::fast_matcher::{
     FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher, TableCarry,

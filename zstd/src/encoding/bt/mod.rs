@@ -22,7 +22,7 @@ use core::mem::MaybeUninit;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
-use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
+use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, OptMatch};
 use super::workspace::{FORMAT_MIN_MATCH, RegionVec, Table, Workspace};
 
 /// Maximum offset reachable by the HC3 short-match probe. Upstream zstd
@@ -53,7 +53,7 @@ pub(crate) struct BtMatcher {
     /// as `opt_nodes_scratch`; index `i` is the price of node `i`.
     pub(crate) opt_node_prices_scratch: Table<MaybeUninit<u32>>,
     /// Per-frame room for collected match candidates, written before read.
-    pub(crate) opt_candidates_scratch: Table<MaybeUninit<MatchCandidate>>,
+    pub(crate) opt_candidates_scratch: Table<MaybeUninit<OptMatch>>,
     /// Room for a block's plan (parse → encode hand-off), at most one sequence
     /// per [`FORMAT_MIN_MATCH`] bytes of the block; written before read.
     pub(crate) opt_segment_plan_scratch: Table<MaybeUninit<HcOptimalSequence>>,
@@ -101,10 +101,37 @@ impl BtMatcher {
         core::mem::size_of::<Self>() + Self::scratch_workspace_bytes(block)
     }
 
-    /// Plan entries a block of `block` bytes can hold: every sequence covers
-    /// at least [`FORMAT_MIN_MATCH`] bytes of it.
+    /// The most sequences one segment of the optimal pass writes: every
+    /// sequence covers at least [`FORMAT_MIN_MATCH`] bytes, and a segment's
+    /// stretches lie within its
+    /// [`HC_OPT_NODE_LEN`](super::cost_model::HC_OPT_NODE_LEN) cells.
+    pub(crate) const SEGMENT_PLAN_LEN: usize =
+        super::cost_model::HC_OPT_NODE_LEN / FORMAT_MIN_MATCH + 1;
+
+    /// Plan room for blocks of up to `block` bytes: the block's sequences, at
+    /// most two segments' worth. The pass hands the plan over whenever the next
+    /// segment might not fit, so the room never needs a large block's worth
+    /// (upstream likewise stores each segment into `seqStore` before the
+    /// next). Two segments rather than one: on compressible input a segment
+    /// often ends at its first match, and room for one stopped the pass after
+    /// nearly every sequence, 0.7% more instructions at levels 16 and 19 on a
+    /// 1 MiB corpus file than room for two.
     pub(crate) fn plan_room_len(block: usize) -> usize {
-        block / FORMAT_MIN_MATCH + 1
+        (block / FORMAT_MIN_MATCH + 1).min(2 * Self::SEGMENT_PLAN_LEN)
+    }
+
+    /// The plan length past which the pass over a `block_len`-byte block stops
+    /// to hand its plan over, with room for `capacity` sequences: room less a
+    /// segment's worth, or never where the room holds the whole block's.
+    pub(crate) fn plan_stop_len(capacity: usize, block_len: usize) -> usize {
+        if capacity > block_len / FORMAT_MIN_MATCH {
+            usize::MAX
+        } else {
+            // The room is at least `plan_room_len(block_len)`, two segments'
+            // worth when it is short of the whole block's.
+            debug_assert!(capacity >= 2 * Self::SEGMENT_PLAN_LEN);
+            capacity - Self::SEGMENT_PLAN_LEN
+        }
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the
@@ -113,17 +140,18 @@ impl BtMatcher {
     /// improving candidates. Pure associated function — no BtMatcher
     /// state needed, just the candidate ladder bookkeeping.
     pub(crate) fn push_candidate_ladder(
-        out: &mut RegionVec<MatchCandidate>,
+        out: &mut RegionVec<OptMatch>,
         best_len_for_skip: &mut usize,
-        candidate: MatchCandidate,
+        candidate: OptMatch,
         min_match_len: usize,
     ) -> bool {
-        if candidate.match_len < min_match_len {
+        let match_len = candidate.match_len as usize;
+        if match_len < min_match_len {
             return false;
         }
-        if candidate.match_len > *best_len_for_skip {
+        if match_len > *best_len_for_skip {
             out.push(candidate);
-            *best_len_for_skip = candidate.match_len;
+            *best_len_for_skip = match_len;
             return true;
         }
         false
@@ -136,11 +164,11 @@ impl BtMatcher {
     /// entry is the bar.
     #[inline(always)]
     pub(crate) fn push_ldm_candidate(
-        out: &mut RegionVec<MatchCandidate>,
-        ldm: MatchCandidate,
+        out: &mut RegionVec<OptMatch>,
+        ldm: OptMatch,
         min_match_len: usize,
     ) {
-        let mut best_len = out.last().map_or(0, |c| c.match_len);
+        let mut best_len = out.last().map_or(0, |c| c.match_len as usize);
         let _ = Self::push_candidate_ladder(out, &mut best_len, ldm, min_match_len);
     }
 
@@ -185,7 +213,7 @@ impl BtMatcher {
         use super::workspace::region_bytes;
         region_bytes::<HcOptimalNode>(HC_OPT_NODE_LEN)
             + region_bytes::<u32>(HC_OPT_NODE_LEN)
-            + region_bytes::<MatchCandidate>(HC_OPT_CANDIDATE_CAPACITY)
+            + region_bytes::<OptMatch>(HC_OPT_CANDIDATE_CAPACITY)
             + region_bytes::<[u32; 2]>(HC_OPT_PRICE_ARENA_LEN)
             + region_bytes::<HcOptimalSequence>(Self::plan_room_len(block))
     }
@@ -329,13 +357,13 @@ impl BtMatcher {
     /// Upstream zstd parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
     /// window (open/close cursors set by
     /// [`Self::ldm_get_next_match_and_update_seq_store`]) into a usable
-    /// `MatchCandidate` when the current position falls inside it.
+    /// candidate when the current position falls inside it.
     pub(crate) fn ldm_maybe_add_match(
         &self,
         opt_ldm: &HcOptLdmState,
         curr_pos_in_block: usize,
         min_match: usize,
-    ) -> Option<MatchCandidate> {
+    ) -> Option<OptMatch> {
         let _ = self;
         let pos_diff = curr_pos_in_block.saturating_sub(opt_ldm.start_pos_in_block);
         let candidate_match_length = opt_ldm
@@ -348,10 +376,9 @@ impl BtMatcher {
         {
             return None;
         }
-        Some(MatchCandidate {
-            start: curr_pos_in_block,
-            offset: opt_ldm.offset,
-            match_len: candidate_match_length,
+        Some(OptMatch {
+            offset: opt_ldm.offset as u32,
+            match_len: candidate_match_length as u32,
         })
     }
 
@@ -364,7 +391,7 @@ impl BtMatcher {
         curr_pos_in_block: usize,
         remaining_bytes: usize,
         min_match: usize,
-    ) -> Option<MatchCandidate> {
+    ) -> Option<OptMatch> {
         if opt_ldm.seq_store.size == 0 || opt_ldm.seq_store.pos >= opt_ldm.seq_store.size {
             return None;
         }

@@ -36,6 +36,11 @@ pub(crate) struct HcMatchGenerator {
     /// `BtOpt` and `BtUltra` onto the same monomorphisation since
     /// `table.is_btultra2` alone can't tell them apart.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
+    /// The block's end and the pass's sufficient match length, both fixed for
+    /// an optimal pass: set as the pass enters, read by every position's
+    /// search, so neither crosses the per-position call.
+    pub(crate) opt_block_abs_end: usize,
+    pub(crate) opt_sufficient_match_len: usize,
 }
 
 // Plain-data types relocated to [`crate::encoding::opt::types`] and
@@ -371,7 +376,7 @@ pub(crate) use prefix_len_first_word;
 macro_rules! push_opt_candidate {
     ($out:expr, $candidate:expr) => {{
         let out: &mut $crate::encoding::workspace::RegionVec<
-            $crate::encoding::opt::types::MatchCandidate,
+            $crate::encoding::opt::types::OptMatch,
         > = $out;
         let candidate = $candidate;
         // SAFETY: the room holds more candidates than one search writes.
@@ -453,10 +458,9 @@ macro_rules! rep_probe_slot {
             if match_len > *$best_len_for_skip {
                 $crate::encoding::hc::generator::push_opt_candidate!(
                     &mut *$out,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset: rep,
-                        match_len,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: rep as u32,
+                        match_len: match_len as u32,
                     }
                 );
                 *$best_len_for_skip = match_len;
@@ -800,7 +804,13 @@ macro_rules! bt_insert_and_collect_matches_body {
                 debug_assert!(
                     h3.match_len >= $min_match_len && h3.match_len > *$best_len_for_skip
                 );
-                $crate::encoding::hc::generator::push_opt_candidate!(&mut *$out, h3);
+                $crate::encoding::hc::generator::push_opt_candidate!(
+                    &mut *$out,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: h3.offset as u32,
+                        match_len: h3.match_len as u32,
+                    }
+                );
                 *$best_len_for_skip = h3.match_len;
                 // Same fold as the repeat probe: the block end lives in the
                 // length space the probe already carries.
@@ -942,6 +952,23 @@ macro_rules! bt_insert_and_collect_matches_body {
         );
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
+        // No candidate inside the window: the position becomes a leaf at once,
+        // which incompressible input does at nearly every position. Leaving
+        // here rather than through the walk's exit keeps this path off the
+        // registers the walk carries to that exit, which the merge had to set
+        // up (four instructions a position on i686). Same result as the walk
+        // falling through: both sides cleared, `match_end_abs - 8`, and the
+        // dictionary tree, when there is one, still searched below.
+        if (match_stored as usize) < win_low_stored && !$table.dms.is_primed() {
+            // SAFETY: both sides still point at this position's pair slots.
+            unsafe {
+                *smaller_slot = $crate::encoding::match_table::storage::HC_EMPTY;
+                *larger_slot = $crate::encoding::match_table::storage::HC_EMPTY;
+            }
+            $table.skip_insert_until_abs = match_end_abs - 8;
+            return;
+        }
+
         // Upstream's `while (nbCompares && matchIndex >= matchLow)`: a node below
         // the window floor, and the empty slot 0 below every floor, ends the
         // walk. Nothing in the tree lies at or past the searched position:
@@ -988,10 +1015,9 @@ macro_rules! bt_insert_and_collect_matches_body {
                 let offset = stored.wrapping_sub(match_stored) as usize;
                 $crate::encoding::hc::generator::push_opt_candidate!(
                     &mut *$out,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset,
-                        match_len,
+                    $crate::encoding::opt::types::OptMatch {
+                        offset: offset as u32,
+                        match_len: match_len as u32,
                     }
                 );
                 *$best_len_for_skip = match_len;
@@ -1112,10 +1138,9 @@ macro_rules! bt_insert_and_collect_matches_body {
                     );
                     $crate::encoding::hc::generator::push_opt_candidate!(
                         &mut *$out,
-                        $crate::encoding::opt::types::MatchCandidate {
-                            start: $abs_pos,
-                            offset: idx - dict_idx,
-                            match_len,
+                        $crate::encoding::opt::types::OptMatch {
+                            offset: (idx - dict_idx) as u32,
+                            match_len: match_len as u32,
                         }
                     );
                     *$best_len_for_skip = match_len;
@@ -1229,6 +1254,9 @@ impl HcMatchGenerator {
             // Every caller runs `configure()` before the first encode, which
             // overwrites this.
             strategy_tag: crate::encoding::strategy::StrategyTag::BtOpt,
+            // Set by each optimal pass before its first search.
+            opt_block_abs_end: 0,
+            opt_sufficient_match_len: 0,
         }
     }
 
@@ -1330,12 +1358,17 @@ impl HcMatchGenerator {
             hc,
             bt: _,
             strategy_tag,
+            opt_block_abs_end: _,
+            opt_sufficient_match_len: _,
         } = self;
         Self {
             table: table.clone(),
             hc: hc.clone(),
             bt: alloc::boxed::Box::new(crate::encoding::bt::BtMatcher::new()),
             strategy_tag: *strategy_tag,
+            // A pass's constants, set by the next pass.
+            opt_block_abs_end: 0,
+            opt_sufficient_match_len: 0,
         }
     }
 
@@ -1348,6 +1381,8 @@ impl HcMatchGenerator {
             hc,
             bt: _,
             strategy_tag,
+            opt_block_abs_end: _,
+            opt_sufficient_match_len: _,
         } = snapshot;
         self.table = table.clone();
         self.hc = hc.clone();

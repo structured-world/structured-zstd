@@ -384,8 +384,53 @@ fn emit_optimal_plan_empty_plan_emits_full_literals() {
     let mut t = new_table(8);
     t.push_test_chunk(b"abcdefgh".to_vec());
     let mut emitted: Vec<Sequence> = Vec::new();
-    t.emit_optimal_plan(8, &[], &mut |seq| emitted.push(seq));
+    let mut literals_start = 0;
+    t.emit_optimal_sequences(8, &[], &mut literals_start, &mut |seq| emitted.push(seq));
+    t.emit_block_tail(8, literals_start, &mut |seq| emitted.push(seq));
     assert_eq!(emitted, [Sequence::Literals { len: 8 }]);
+}
+
+/// The optimal pass hands its plan over in runs when the room for it runs
+/// short. Sequences, trailing literals and the offset history must come out
+/// as they do when the block's plan arrives in one run.
+#[test]
+fn emit_optimal_sequences_in_runs_matches_one_run() {
+    let plan = [
+        HcOptimalSequence {
+            offset: 7,
+            lit_len: 2,
+            match_len: 4,
+        },
+        HcOptimalSequence {
+            offset: 1,
+            lit_len: 0,
+            match_len: 3,
+        },
+        HcOptimalSequence {
+            offset: 12,
+            lit_len: 5,
+            match_len: 6,
+        },
+    ];
+    let emit = |runs: &[&[HcOptimalSequence]]| {
+        let mut t = new_table(32);
+        t.push_test_chunk(alloc::vec![b'a'; 32]);
+        let mut emitted: Vec<Sequence> = Vec::new();
+        let mut literals_start = 0;
+        for run in runs {
+            t.emit_optimal_sequences(32, run, &mut literals_start, &mut |seq| emitted.push(seq));
+        }
+        t.emit_block_tail(32, literals_start, &mut |seq| emitted.push(seq));
+        (emitted, t.offset_hist)
+    };
+    let whole = emit(&[&plan]);
+    assert_eq!(
+        whole.0.len(),
+        4,
+        "three sequences and the trailing literals"
+    );
+    assert_eq!(emit(&[&plan[..1], &plan[1..]]), whole);
+    assert_eq!(emit(&[&plan[..2], &[], &plan[2..]]), whole);
 }
 
 #[test]
@@ -400,7 +445,9 @@ fn emit_optimal_plan_skips_oversized_plan_item_and_emits_trailing_literals() {
         match_len: 99, // overflows the 8-byte window → continue
     }];
     let mut emitted: Vec<Sequence> = Vec::new();
-    t.emit_optimal_plan(8, &plan, &mut |seq| emitted.push(seq));
+    let mut literals_start = 0;
+    t.emit_optimal_sequences(8, &plan, &mut literals_start, &mut |seq| emitted.push(seq));
+    t.emit_block_tail(8, literals_start, &mut |seq| emitted.push(seq));
     assert_eq!(
         emitted,
         [Sequence::Literals { len: 8 }],

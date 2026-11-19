@@ -1553,7 +1553,9 @@ fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
                         &mut out,
                     )
                 );
-                out.iter().map(|c| (c.offset, c.match_len)).collect()
+                out.iter()
+                    .map(|c| (c.offset as usize, c.match_len as usize))
+                    .collect()
             })
             .collect()
     };
@@ -1703,8 +1705,7 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
 
     let abs_pos = 128usize;
     let current_abs_end = 256usize;
-    let ldm = MatchCandidate {
-        start: abs_pos,
+    let ldm = OptMatch {
         offset: 96,
         match_len: 40,
     };
@@ -1746,8 +1747,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
     hc.table.search_depth = 32;
 
     let abs_pos = 10usize;
-    let ldm = MatchCandidate {
-        start: abs_pos,
+    let ldm = OptMatch {
         offset: 7,
         match_len: 12,
     };

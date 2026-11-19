@@ -149,7 +149,6 @@ fn ldm_maybe_add_match_emits_candidate_inside_window() {
     let cand = bt
         .ldm_maybe_add_match(&opt_ldm, 22, 4)
         .expect("should emit");
-    assert_eq!(cand.start, 22);
     assert_eq!(cand.offset, 7);
     // candidate length = window - (pos - start) = 10 - 2 = 8
     assert_eq!(cand.match_len, 8);
@@ -171,13 +170,12 @@ fn ldm_process_match_candidate_returns_none_when_store_exhausted() {
 fn push_candidate_ladder_rejects_below_min_match() {
     let mut room = Table::owned_unwritten(4);
     // SAFETY: `room` is used only through `out`.
-    let mut out: RegionVec<MatchCandidate> = unsafe { RegionVec::over(&mut room) };
+    let mut out: RegionVec<OptMatch> = unsafe { RegionVec::over(&mut room) };
     let mut best = 0usize;
     let accepted = BtMatcher::push_candidate_ladder(
         &mut out,
         &mut best,
-        MatchCandidate {
-            start: 10,
+        OptMatch {
             offset: 5,
             match_len: 2,
         },
@@ -192,13 +190,12 @@ fn push_candidate_ladder_rejects_below_min_match() {
 fn push_candidate_ladder_rejects_when_not_strictly_better() {
     let mut room = Table::owned_unwritten(4);
     // SAFETY: `room` is used only through `out`.
-    let mut out: RegionVec<MatchCandidate> = unsafe { RegionVec::over(&mut room) };
+    let mut out: RegionVec<OptMatch> = unsafe { RegionVec::over(&mut room) };
     let mut best = 8usize;
     let accepted = BtMatcher::push_candidate_ladder(
         &mut out,
         &mut best,
-        MatchCandidate {
-            start: 10,
+        OptMatch {
             offset: 5,
             match_len: 8,
         },
@@ -270,7 +267,6 @@ fn ldm_process_match_candidate_reseeds_after_overshoot() {
     let cand = bt
         .ldm_process_match_candidate(&mut opt_ldm, 5, 100, 4)
         .expect("should emit reseeded candidate");
-    assert_eq!(cand.start, 5);
     assert_eq!(cand.offset, 33);
     assert_eq!(cand.match_len, 5);
 }
