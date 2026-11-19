@@ -2736,17 +2736,23 @@ fn choose_table_from_counts<'a>(
             // (`FSE_repeat_valid`); a table a block built is only `check`,
             // which this band never repeats. The coverage holds by
             // construction and is checked anyway, so a repeat can never
-            // produce an invalid stream: a table with a state for every code
-            // up to the highest one used covers the block, which is one read
-            // per code; only a table with a gap below it is priced to see
-            // whether the block uses the gap.
+            // produce an invalid stream: a valid table records the code up to
+            // which it gives every code a state, found once when the
+            // dictionary was loaded, and a block whose codes stay at or under
+            // it is covered; one reaching past it is priced to see whether it
+            // uses a code the table lacks.
             if total < 1000
                 && let Some(prev) = previous
-                && prev.is_valid()
+                && let Some(covered) = prev.covered_through()
                 && let Some(table) = prev.as_table(default_table)
-                && ((0..=max_symbol).all(|code| table.symbol_probability(code as u8) != 0)
+                && (max_symbol <= usize::from(covered)
                     || fse_bit_cost(counts, max_symbol, table).is_some())
             {
+                debug_assert!(
+                    (0..=max_symbol.min(usize::from(covered)))
+                        .all(|code| table.symbol_probability(code as u8) != 0),
+                    "a valid table lacks a code under the one it covers through"
+                );
                 return FseTableMode::RepeatLast(prev);
             }
             let default_log = default_table.acc_log() as usize;
@@ -2972,7 +2978,7 @@ fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
 /// just built into, and it is the fresher of the two.
 fn park_displaced_handle(displaced: Option<PreviousFseTable>, next: &mut Option<SharedFseTable>) {
     if next.is_none()
-        && let Some(PreviousFseTable::Custom(handle) | PreviousFseTable::Dictionary(handle)) =
+        && let Some(PreviousFseTable::Custom(handle) | PreviousFseTable::Dictionary(handle, _)) =
             displaced
     {
         *next = Some(handle);
@@ -3003,7 +3009,7 @@ fn commit_last_used_table(
             // build fills it rather than a blank being made here for a block
             // that may not need one.
             let outgoing = match previous.take() {
-                Some(PreviousFseTable::Custom(old) | PreviousFseTable::Dictionary(old)) => {
+                Some(PreviousFseTable::Custom(old) | PreviousFseTable::Dictionary(old, _)) => {
                     Some(old)
                 }
                 _ => None,

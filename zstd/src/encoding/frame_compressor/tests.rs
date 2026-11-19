@@ -1319,20 +1319,20 @@ fn a_dictionary_fse_seed_still_in_its_slot_is_re_borrowed() {
         ))
     };
     let dictionary = table(7);
-    let seed = Some(PreviousFseTable::Dictionary(dictionary.clone()));
+    let seed = Some(PreviousFseTable::Dictionary(dictionary.clone(), 7));
     let mut slot = Some(PreviousFseTable::Custom(dictionary.clone()));
     let count = SharedFseTable::strong_count(&dictionary);
     seed_previous_table(&mut slot, &seed);
     assert!(
-        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
-        "the slot keeps the dictionary's handle, valid again"
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h, 7)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        "the slot keeps the dictionary's handle, valid again with the seed's coverage"
     );
     assert_eq!(SharedFseTable::strong_count(&dictionary), count);
 
     let mut slot = Some(PreviousFseTable::Custom(table(9)));
     seed_previous_table(&mut slot, &seed);
     assert!(
-        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h, 7)) if SharedFseTable::ptr_eq(h, &dictionary)),
         "a slot holding another table takes the seed"
     );
 }

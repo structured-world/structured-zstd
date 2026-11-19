@@ -1493,7 +1493,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
 
     for (previous, repeats) in [
         (
-            PreviousFseTable::Dictionary(SharedFseTable::new(prev())),
+            PreviousFseTable::Dictionary(SharedFseTable::new(prev()), 1),
             true,
         ),
         (PreviousFseTable::Custom(SharedFseTable::new(prev())), false),
@@ -1532,9 +1532,11 @@ fn a_dictionary_table_with_a_gap_repeats_only_for_a_block_that_avoids_it() {
     use crate::encoding::frame_compressor::SharedFseTable;
     use crate::encoding::strategy::StrategyTag;
     // States for codes 0 and 2, none for code 1.
-    let previous = PreviousFseTable::Dictionary(SharedFseTable::new(
-        build_table_from_symbol_counts(&[8, 0, 1], 9, false),
-    ));
+    // Covered through code 0, the last before the gap.
+    let previous = PreviousFseTable::Dictionary(
+        SharedFseTable::new(build_table_from_symbol_counts(&[8, 0, 1], 9, false)),
+        0,
+    );
     let fse_tables = FseTables::new();
     for (code_one, repeats) in [(0usize, true), (3, false)] {
         let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
@@ -2042,19 +2044,25 @@ fn a_dictionary_offset_table_is_valid_for_the_first_block_only() {
     use crate::encoding::frame_compressor::SharedFseTable;
     let table = || build_table_from_symbol_counts(&[1, 1], 5, false);
     let mut tables = FseTables::new();
-    tables.ll_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
-    tables.of_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
+    tables.ll_previous = Some(PreviousFseTable::Dictionary(
+        SharedFseTable::new(table()),
+        1,
+    ));
+    tables.of_previous = Some(PreviousFseTable::Dictionary(
+        SharedFseTable::new(table()),
+        1,
+    ));
     tables.end_block();
     assert!(
         tables
             .ll_previous
             .as_ref()
-            .is_some_and(PreviousFseTable::is_valid)
+            .is_some_and(|previous| previous.covered_through().is_some())
     );
     assert!(
         tables
             .of_previous
             .as_ref()
-            .is_some_and(|previous| !previous.is_valid())
+            .is_some_and(|previous| previous.covered_through().is_none())
     );
 }
