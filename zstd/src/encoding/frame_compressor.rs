@@ -581,7 +581,7 @@ impl CachedDictionaryEntropy {
     pub(crate) fn heap_size(&self) -> usize {
         let mut total = self.huff.as_ref().map_or(0, |h| h.heap_size());
         for prev in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
-            if let Some(PreviousFseTable::Custom(table) | PreviousFseTable::Dictionary(table)) =
+            if let Some(PreviousFseTable::Custom(table) | PreviousFseTable::Dictionary(table, _)) =
                 prev
             {
                 total +=
@@ -612,7 +612,8 @@ impl CachedDictionaryEntropy {
                 let valid = (0..=max_symbol).all(|s| table.symbol_probability(s as u8) != 0);
                 let table = SharedFseTable::new(table);
                 if valid {
-                    PreviousFseTable::Dictionary(table)
+                    // `max_symbol` is at most `MaxML` (52).
+                    PreviousFseTable::Dictionary(table, max_symbol as u8)
                 } else {
                     PreviousFseTable::Custom(table)
                 }
@@ -669,11 +670,12 @@ pub(crate) enum PreviousFseTable {
     // builds a new table swaps in a fresh `SharedFseTable`), never mutated in
     // place, so sharing is sound.
     Custom(SharedFseTable),
-    /// A dictionary's table that covers every symbol its stream can carry:
-    /// upstream's `FSE_repeat_valid`, which a fast-band block repeats without
-    /// pricing it. It stays valid while blocks repeat it; the offset table
-    /// only for the frame's first block ([`FseTables::end_block`]).
-    Dictionary(SharedFseTable),
+    /// A dictionary's table that covers every symbol its stream can carry, up
+    /// to and including the code it carries: upstream's `FSE_repeat_valid`,
+    /// which a fast-band block repeats without pricing it. It stays valid
+    /// while blocks repeat it; the offset table only for the frame's first
+    /// block ([`FseTables::end_block`]).
+    Dictionary(SharedFseTable, u8),
     Rle(u8),
 }
 
@@ -681,21 +683,25 @@ impl PreviousFseTable {
     pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> Option<&'a FSETable> {
         match self {
             Self::Default => Some(default),
-            Self::Custom(table) | Self::Dictionary(table) => Some(table),
+            Self::Custom(table) | Self::Dictionary(table, _) => Some(table),
             Self::Rle(_) => None,
         }
     }
 
-    /// Whether a block may repeat this table without pricing it.
-    pub(crate) fn is_valid(&self) -> bool {
-        matches!(self, Self::Dictionary(_))
+    /// The code up to which a valid table gives every code a state, `None`
+    /// for a table a block may not repeat without pricing it.
+    pub(crate) fn covered_through(&self) -> Option<u8> {
+        match self {
+            Self::Dictionary(_, covered) => Some(*covered),
+            _ => None,
+        }
     }
 
     /// The table itself when it is a distribution of its own, not the
     /// predefined one or a single symbol.
     pub(crate) fn distribution(&self) -> Option<&FSETable> {
         match self {
-            Self::Custom(table) | Self::Dictionary(table) => Some(table),
+            Self::Custom(table) | Self::Dictionary(table, _) => Some(table),
             Self::Default | Self::Rle(_) => None,
         }
     }
@@ -708,16 +714,15 @@ impl PreviousFseTable {
 /// first block): the handle is re-borrowed, with no reference count touched.
 fn seed_previous_table(slot: &mut Option<PreviousFseTable>, seed: &Option<PreviousFseTable>) {
     use PreviousFseTable::{Custom, Dictionary};
-    if let (Some(Custom(held) | Dictionary(held)), Some(Custom(source) | Dictionary(source))) =
+    if let (Some(Custom(held) | Dictionary(held, _)), Some(Custom(source) | Dictionary(source, _))) =
         (slot.as_ref(), seed.as_ref())
         && SharedFseTable::ptr_eq(held, source)
     {
-        let valid = matches!(seed, Some(Dictionary(_)));
-        if let Some(Custom(handle) | Dictionary(handle)) = slot.take() {
-            *slot = Some(if valid {
-                Dictionary(handle)
-            } else {
-                Custom(handle)
+        let covered = seed.as_ref().and_then(PreviousFseTable::covered_through);
+        if let Some(Custom(handle) | Dictionary(handle, _)) = slot.take() {
+            *slot = Some(match covered {
+                Some(covered) => Dictionary(handle, covered),
+                None => Custom(handle),
             });
         }
         return;
@@ -768,7 +773,7 @@ impl FseTables {
     /// `ZSTD_compressBlock_internal`, zstd_compress.c:4444).
     pub(crate) fn end_block(&mut self) {
         self.of_previous = match self.of_previous.take() {
-            Some(PreviousFseTable::Dictionary(table)) => Some(PreviousFseTable::Custom(table)),
+            Some(PreviousFseTable::Dictionary(table, _)) => Some(PreviousFseTable::Custom(table)),
             other => other,
         };
     }
@@ -1466,6 +1471,7 @@ pub(crate) fn resolve_frame_params(
                 row_plan: None,
                 dict_use: None,
                 split_strategy: params.strategy_tag,
+                dict_tables: None,
             }
         }
     }
@@ -3043,7 +3049,23 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         // A dictionary frame runs the CDict's strategy (upstream
         // `ZSTD_resetCCtx_usingCDict`), so resolve through the same
         // dictionary-aware path the matcher's reset took.
-        let params = self.resolve_frame_params(initial_size_hint, use_dictionary_state);
+        // The built-in matcher's reset has just resolved a dictionary frame
+        // with these inputs; any other frame is resolved here.
+        let resolved = self
+            .state
+            .matcher
+            .builtin_driver()
+            .and_then(|driver| driver.dict_frame_params().copied());
+        let params = match resolved {
+            Some(frame) => {
+                debug_assert!(
+                    frame == self.resolve_frame_params(initial_size_hint, use_dictionary_state),
+                    "the matcher resolved the dictionary frame differently from the encoder"
+                );
+                frame
+            }
+            None => self.resolve_frame_params(initial_size_hint, use_dictionary_state),
+        };
         self.sync_effective_strategy(&params);
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.

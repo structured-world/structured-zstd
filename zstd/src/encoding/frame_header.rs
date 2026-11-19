@@ -1,6 +1,6 @@
 //! Utilities and representations for a frame header.
 use crate::common::MAGIC_NUM;
-use crate::encoding::util::{find_fcs_field_size, find_min_size, write_minified_val};
+use crate::encoding::util::{find_fcs_field_size, find_min_size};
 use alloc::vec::Vec;
 
 /// A header for a single Zstandard frame.
@@ -43,13 +43,21 @@ impl FrameHeader {
     pub fn serialize(self, output: &mut Vec<u8>) {
         vprintln!("Serializing frame with header: {self:?}");
         // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header
+        // The fields are laid out in a local buffer with fixed-width stores,
+        // each followed by the field's real width, and land in `output` in one
+        // copy: pushed one at a time, every field was a capacity check and the
+        // variable-width ones a `memcpy` call.
+        let mut header = [0u8; MAX_FRAME_HEADER_LEN];
+        let mut len = 0usize;
         // Magic Number (omitted in magicless mode — `ZSTD_f_zstd1_magicless`):
         if !self.magicless {
-            output.extend_from_slice(&MAGIC_NUM.to_le_bytes());
+            header[..4].copy_from_slice(&MAGIC_NUM.to_le_bytes());
+            len = 4;
         }
 
         // `Frame_Header_Descriptor`:
-        output.push(self.descriptor());
+        header[len] = self.descriptor();
+        len += 1;
 
         // `Window_Descriptor
         // TODO: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#window_descriptor
@@ -58,16 +66,45 @@ impl FrameHeader {
         {
             let log = window_size.next_power_of_two().ilog2();
             let exponent = if log > 10 { log - 10 } else { 1 } as u8;
-            output.push(exponent << 3);
+            header[len] = exponent << 3;
+            len += 1;
         }
 
         if let Some(id) = self.dictionary_id {
-            write_minified_val(id, output);
+            // At most four bytes: `descriptor` refuses a wider id above. Four
+            // are stored and the id's width kept.
+            header[len..len + 4].copy_from_slice(&(id as u32).to_le_bytes());
+            len += find_min_size(id);
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
             let field_size = find_fcs_field_size(frame_content_size, self.single_segment);
-            write_fcs(frame_content_size, field_size, output);
+            // RFC 8878 3.1.1.1.4: a two-byte field stores the size less 256.
+            let stored = if field_size == 2 {
+                frame_content_size - 256
+            } else {
+                frame_content_size
+            };
+            header[len..len + 8].copy_from_slice(&stored.to_le_bytes());
+            len += field_size;
+        }
+        let start = output.len();
+        if output.capacity() - start >= MAX_FRAME_HEADER_LEN {
+            // A copy of constant width, a pair of loads and stores, into the
+            // room the frame's caller reserved; only `len` bytes are kept.
+            // SAFETY: the buffer has `MAX_FRAME_HEADER_LEN` bytes of spare
+            // capacity past `start`, and `len <= MAX_FRAME_HEADER_LEN` bytes of
+            // them are initialized by the copy before the length covers them.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    header.as_ptr(),
+                    output.as_mut_ptr().add(start),
+                    MAX_FRAME_HEADER_LEN,
+                );
+                output.set_len(start + len);
+            }
+        } else {
+            output.extend_from_slice(&header[..len]);
         }
     }
 
@@ -151,23 +188,12 @@ pub(crate) fn single_segment(content_size: Option<u64>, window_size: u64) -> boo
     content_size.is_some_and(|size| size <= window_size)
 }
 
-/// Serialize a `Frame_Content_Size` value into `field_size` bytes.
-///
-/// For 1, 4, and 8-byte fields the value is stored directly.
-/// For 2-byte fields an offset of 256 is subtracted before encoding.
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
-fn write_fcs(val: u64, field_size: usize, output: &mut Vec<u8>) {
-    debug_assert!(matches!(field_size, 1 | 2 | 4 | 8));
-    debug_assert!(field_size != 2 || val >= 256);
-
-    let adjusted = match field_size {
-        2 => val - 256,
-        1 | 4 | 8 => val,
-        _ => unreachable!("invalid Frame_Content_Size field size: {field_size}"),
-    };
-    output.extend_from_slice(&adjusted.to_le_bytes()[..field_size]);
-}
+/// The longest frame header: magic (4), descriptor (1), window descriptor (1),
+/// dictionary id (4) and content size (8) (RFC 8878 3.1.1). A dictionary id is
+/// stored in at most four bytes here, and a frame with a window descriptor
+/// carries no one-byte content size, so the fixed-width stores of
+/// [`FrameHeader::serialize`] stay inside it.
+const MAX_FRAME_HEADER_LEN: usize = 18;
 
 #[cfg(test)]
 mod tests;

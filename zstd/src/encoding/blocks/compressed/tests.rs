@@ -1493,7 +1493,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
 
     for (previous, repeats) in [
         (
-            PreviousFseTable::Dictionary(SharedFseTable::new(prev())),
+            PreviousFseTable::Dictionary(SharedFseTable::new(prev()), 1),
             true,
         ),
         (PreviousFseTable::Custom(SharedFseTable::new(prev())), false),
@@ -1532,9 +1532,11 @@ fn a_dictionary_table_with_a_gap_repeats_only_for_a_block_that_avoids_it() {
     use crate::encoding::frame_compressor::SharedFseTable;
     use crate::encoding::strategy::StrategyTag;
     // States for codes 0 and 2, none for code 1.
-    let previous = PreviousFseTable::Dictionary(SharedFseTable::new(
-        build_table_from_symbol_counts(&[8, 0, 1], 9, false),
-    ));
+    // Covered through code 0, the last before the gap.
+    let previous = PreviousFseTable::Dictionary(
+        SharedFseTable::new(build_table_from_symbol_counts(&[8, 0, 1], 9, false)),
+        0,
+    );
     let fse_tables = FseTables::new();
     for (code_one, repeats) in [(0usize, true), (3, false)] {
         let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
@@ -1832,6 +1834,68 @@ fn gathered_literals_are_the_runs_in_order() {
     }
 }
 
+/// A raw literals section written straight from the runs is byte for byte the
+/// one `raw_literals` writes from the gathered runs, under every tier: across
+/// every header width, including the counts that take a narrower header than
+/// the block's length reserved room for, so the runs are moved down over it
+/// (fewer than 32 literals in a long block, 32..4095 in a block past 4 KiB).
+#[test]
+fn raw_literals_from_runs_are_the_section_of_the_gathered_runs() {
+    use crate::bit_io::BitWriter;
+    // (block length, literal run lengths, tail)
+    let cases: [(usize, &[usize], usize); 8] = [
+        (10, &[], 10),
+        (40, &[3], 0),
+        (40, &[31], 1),
+        (5000, &[0, 7], 3),
+        (5000, &[31], 0),
+        (5000, &[100, 900], 31),
+        (5000, &[4095], 0),
+        (9000, &[4000, 96], 1),
+    ];
+    for (block_len, runs, tail) in cases {
+        let block: Vec<u8> = (0..block_len as u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        // The match lengths take up whatever the runs and the tail leave.
+        let literal_total: usize = runs.iter().sum::<usize>() + tail;
+        let match_total = block_len - literal_total;
+        let sequences: Vec<RawSequence> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, &ll)| RawSequence {
+                ll: ll as u32,
+                ml: if i + 1 == runs.len() {
+                    (match_total - (runs.len() - 1) * 4) as u32
+                } else {
+                    4
+                },
+                off_base: 1,
+            })
+            .collect();
+        for kernel in runnable_fastpath_kernels() {
+            let (_ws, mut literals) = literals_buffer(block_len);
+            crate::encoding::fastpath::with_encode_tier!(
+                kernel,
+                K => super::literal_runs::gather_literals::<K>(&block, &sequences, tail, &mut literals)
+            );
+            let mut expected = alloc::vec![0xEE; 3];
+            let mut writer = BitWriter::from(&mut expected);
+            super::raw_literals(&literals, &mut writer);
+            writer.flush();
+            let mut written = alloc::vec![0xEE; 3];
+            crate::encoding::fastpath::with_encode_tier!(
+                kernel,
+                K => super::write_raw_literals_from_runs::<K>(&block, &sequences, tail, &mut written)
+            );
+            assert_eq!(
+                written, expected,
+                "{kernel:?}, a {block_len}-byte block with {literal_total} literals"
+            );
+        }
+    }
+}
+
 /// Every tier this CPU can run writes the same block, byte for byte, as the
 /// scalar tier: the tiers differ in the instructions of the Huffman burst and
 /// the sequence-section loop (BMI2 against base shifts), never in their output.
@@ -2042,19 +2106,25 @@ fn a_dictionary_offset_table_is_valid_for_the_first_block_only() {
     use crate::encoding::frame_compressor::SharedFseTable;
     let table = || build_table_from_symbol_counts(&[1, 1], 5, false);
     let mut tables = FseTables::new();
-    tables.ll_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
-    tables.of_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
+    tables.ll_previous = Some(PreviousFseTable::Dictionary(
+        SharedFseTable::new(table()),
+        1,
+    ));
+    tables.of_previous = Some(PreviousFseTable::Dictionary(
+        SharedFseTable::new(table()),
+        1,
+    ));
     tables.end_block();
     assert!(
         tables
             .ll_previous
             .as_ref()
-            .is_some_and(PreviousFseTable::is_valid)
+            .is_some_and(|previous| previous.covered_through().is_some())
     );
     assert!(
         tables
             .of_previous
             .as_ref()
-            .is_some_and(|previous| !previous.is_valid())
+            .is_some_and(|previous| previous.covered_through().is_none())
     );
 }

@@ -1306,8 +1306,8 @@ fn a_copied_dictionary_frame_past_the_tagged_range_keeps_the_dictionary() {
 
 /// A frame start leaves an FSE slot that still holds the dictionary's table on
 /// that handle, giving it back the seed's form (the offset table a block turned
-/// custom is valid again), without touching the reference count; a slot
-/// holding another table takes the seed's handle.
+/// custom is valid again, a custom seed stays custom), without touching the
+/// reference count; a slot holding another table takes the seed's handle.
 #[test]
 fn a_dictionary_fse_seed_still_in_its_slot_is_re_borrowed() {
     use super::{PreviousFseTable, SharedFseTable, seed_previous_table};
@@ -1319,22 +1319,36 @@ fn a_dictionary_fse_seed_still_in_its_slot_is_re_borrowed() {
         ))
     };
     let dictionary = table(7);
-    let seed = Some(PreviousFseTable::Dictionary(dictionary.clone()));
+    let seed = Some(PreviousFseTable::Dictionary(dictionary.clone(), 7));
     let mut slot = Some(PreviousFseTable::Custom(dictionary.clone()));
     let count = SharedFseTable::strong_count(&dictionary);
     seed_previous_table(&mut slot, &seed);
     assert!(
-        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
-        "the slot keeps the dictionary's handle, valid again"
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h, 7)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        "the slot keeps the dictionary's handle, valid again with the seed's coverage"
     );
     assert_eq!(SharedFseTable::strong_count(&dictionary), count);
 
     let mut slot = Some(PreviousFseTable::Custom(table(9)));
     seed_previous_table(&mut slot, &seed);
     assert!(
-        matches!(&slot, Some(PreviousFseTable::Dictionary(h)) if SharedFseTable::ptr_eq(h, &dictionary)),
+        matches!(&slot, Some(PreviousFseTable::Dictionary(h, 7)) if SharedFseTable::ptr_eq(h, &dictionary)),
         "a slot holding another table takes the seed"
     );
+
+    // A dictionary table that leaves a code of its alphabet without a state is
+    // seeded custom, and re-borrowing it must not make it valid: a block that
+    // repeated it unpriced would code a symbol the table cannot carry.
+    let partial = table(11);
+    let seed = Some(PreviousFseTable::Custom(partial.clone()));
+    let mut slot = Some(PreviousFseTable::Custom(partial.clone()));
+    let count = SharedFseTable::strong_count(&partial);
+    seed_previous_table(&mut slot, &seed);
+    assert!(
+        matches!(&slot, Some(PreviousFseTable::Custom(h)) if SharedFseTable::ptr_eq(h, &partial)),
+        "a custom seed still in its slot stays custom on the same handle"
+    );
+    assert_eq!(SharedFseTable::strong_count(&partial), count);
 }
 
 /// A reused compressor keeps the dictionary's Huffman table in place from one

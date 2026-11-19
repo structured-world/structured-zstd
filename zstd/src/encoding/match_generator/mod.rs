@@ -401,10 +401,11 @@ pub struct MatchGeneratorDriver {
     // primed-snapshot key is the resolved shape ([`reset_shape`](Self::reset_shape)),
     // not this bucket.
     reset_size_log: Option<u8>,
-    /// How the frame the last reset prepared uses its dictionary, `None`
-    /// without one: resolved with the frame's parameters, and read by every
-    /// backend's layout and prime.
-    reset_dict_use: Option<crate::encoding::levels::config::DictUse>,
+    /// The resolution of the dictionary frame the last reset prepared, `None`
+    /// without a dictionary: how the frame uses its dictionary, read by every
+    /// backend's layout and prime, and the frame's gates, which the encoder
+    /// reads here rather than resolving the frame a second time.
+    dict_frame: Option<crate::encoding::levels::config::FrameParams>,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
     // Fast attach-vs-copy mode and the Fast slot format. Combined with the
@@ -756,7 +757,7 @@ impl MatchGeneratorDriver {
             // resolved LevelParams.
             reported_window_size: next_pow2,
             reset_size_log: None,
-            reset_dict_use: None,
+            dict_frame: None,
             reset_shape: None,
             dict_reach_log: None,
             dict_params: Default::default(),
@@ -1249,8 +1250,24 @@ impl MatchGeneratorDriver {
     /// per frame). The reset lays the tables out by it and the prime fills
     /// them by it, so the two cannot disagree.
     fn dict_attached(&self) -> bool {
-        self.reset_dict_use
+        self.reset_dict_use()
             .is_some_and(crate::encoding::levels::config::DictUse::attaches)
+    }
+
+    /// How the frame the last reset prepared uses its dictionary, `None`
+    /// without one.
+    #[inline]
+    fn reset_dict_use(&self) -> Option<crate::encoding::levels::config::DictUse> {
+        self.dict_frame.as_ref().and_then(|frame| frame.dict_use)
+    }
+
+    /// The resolution of the dictionary frame the last reset prepared, `None`
+    /// when it has no dictionary.
+    #[inline]
+    pub(crate) fn dict_frame_params(
+        &self,
+    ) -> Option<&crate::encoding::levels::config::FrameParams> {
+        self.dict_frame.as_ref()
     }
 
     /// [`Self::dict_attached`] for the frame the last reset prepared.
@@ -1266,7 +1283,7 @@ impl MatchGeneratorDriver {
     /// index's geometry. A dictionary loaded into tables resolved for the
     /// frame's source is hashed into them, as upstream loads it per frame.
     fn dfast_copies_dict_index(&self, dict_len: usize) -> bool {
-        self.reset_dict_use == Some(crate::encoding::levels::config::DictUse::Copy)
+        self.reset_dict_use() == Some(crate::encoding::levels::config::DictUse::Copy)
             && matches!(
                 &self.storage,
                 MatcherStorage::Dfast(dfast) if dfast.dict_index_serves_copy(dict_len)
@@ -1451,40 +1468,34 @@ impl Matcher for MatchGeneratorDriver {
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
-        let (params, dict_plan, dict_use) = match dict_hint {
-            Some(sizes) => {
-                let resolved = self.dict_params.resolve(level, hint, sizes, &overrides);
-                (resolved.params, resolved.row_plan, resolved.dict_use)
-            }
+        // Every backend attaches, copies or loads the dictionary as this
+        // resolution says; the prime that follows reads the same field.
+        self.dict_frame =
+            dict_hint.map(|sizes| self.dict_params.resolve(level, hint, sizes, &overrides));
+        let (params, dict_plan, dict_use, dict_tables) = match self.dict_frame {
+            Some(frame) => (
+                frame.params,
+                frame.row_plan,
+                frame.dict_use,
+                frame.dict_tables,
+            ),
             None => (
                 crate::encoding::levels::config::resolve_frame_params(level, hint, &overrides),
                 None,
                 None,
+                None,
             ),
         };
-        // Every backend attaches, copies or loads the dictionary as this
-        // resolution says; the prime that follows reads the same field.
-        self.reset_dict_use = dict_use;
         // A dictionary loaded into the frame's tables is indexed at the frame's
         // own cParams: there is no separate set of tables sized for it.
         let loaded_into_frame = dict_use == Some(crate::encoding::levels::config::DictUse::Load);
         // Upstream indexes the last `1 << max(hashLog + 3, chainLog + 1)`
         // bytes of a dictionary into the tables it is loaded into, at their
         // cParams (`ZSTD_loadDictionaryContent`, zstd_compress.c:4987).
-        self.dict_reach_log = dict_hint.map(|sizes| {
-            let cd = if loaded_into_frame {
-                crate::encoding::levels::config::loaded_dict_frame_cparams(
-                    level, hint, sizes, &overrides,
-                )
-            } else {
-                crate::encoding::cparams::get_cdict_cparams(
-                    crate::encoding::levels::config::numeric_level(level),
-                    sizes.serialized,
-                    &overrides,
-                )
-            };
-            (cd.hash_log + 3).max(cd.chain_log + 1).min(31)
-        });
+        // The tables the dictionary is indexed into: the frame's own when it
+        // is loaded, the CDict's otherwise, as the resolution gave them.
+        debug_assert_eq!(dict_hint.is_some(), dict_tables.is_some());
+        self.dict_reach_log = dict_tables.map(|cd| (cd.hash_log + 3).max(cd.chain_log + 1).min(31));
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = params;
         // Test-only: apply a parse×search override so the matrix can be
@@ -1783,7 +1794,7 @@ impl Matcher for MatchGeneratorDriver {
                     .primed
                     .as_ref()
                     .filter(|(_, _, captured)| {
-                        restores_primed_snapshot(self.reset_dict_use, hint)
+                        restores_primed_snapshot(dict_use, hint)
                             && *captured
                                 == PrimedKey {
                                     level,
@@ -1813,16 +1824,11 @@ impl Matcher for MatchGeneratorDriver {
                 // shrink the table a large dictionary was sized for.
                 // A dictionary loaded into the frame's tables is indexed at the
                 // frame's own width: there is no separately-sized set.
-                m.set_dict_table_hash_log(dict_hint.map(|sizes| {
+                m.set_dict_table_hash_log(dict_tables.map(|cd| {
                     if loaded_into_frame {
                         hash_log
                     } else {
-                        crate::encoding::cparams::get_cdict_cparams(
-                            crate::encoding::levels::config::numeric_level(level),
-                            sizes.serialized,
-                            &overrides,
-                        )
-                        .hash_log
+                        cd.hash_log
                     }
                 }));
                 let tables =
@@ -1884,16 +1890,11 @@ impl Matcher for MatchGeneratorDriver {
                 // The attached dictionary tables take the CDict's geometry
                 // (upstream hashes the dictMatchState tables with
                 // `dictCParams`), not the source-capped live widths.
-                dfast.set_dict_table_bits(dict_hint.map(|sizes| {
+                dfast.set_dict_table_bits(dict_tables.map(|cd| {
                     // Loaded into the frame's tables: the frame's own widths.
                     if loaded_into_frame {
                         return (long_bits, short_bits);
                     }
-                    let cd = crate::encoding::cparams::get_cdict_cparams(
-                        crate::encoding::levels::config::numeric_level(level),
-                        sizes.serialized,
-                        &overrides,
-                    );
                     (cd.hash_log as usize, cd.chain_log as usize)
                 }));
                 // A copy-mode frame (source past the attach cutoff, or a
@@ -2004,13 +2005,16 @@ impl Matcher for MatchGeneratorDriver {
         // upstream reuses its `ldmState_t`.
         #[cfg(feature = "ldm")]
         {
-            self.ldm = frame_ldm.map(|p| match self.ldm.take() {
-                Some(mut existing) if existing.params() == p => {
-                    existing.clear();
-                    existing
+            // Edited in place: the producer is never moved out and back.
+            match (frame_ldm, &mut self.ldm) {
+                (Some(p), Some(existing)) if existing.params() == p => existing.clear(),
+                (Some(p), slot) => *slot = Some(super::ldm::LdmProducer::new(p)),
+                (None, slot) => {
+                    if slot.is_some() {
+                        *slot = None;
+                    }
                 }
-                _ => super::ldm::LdmProducer::new(p),
-            });
+            }
             // A dictionary the reset kept in place is the frame's first bytes.
             self.ldm_committed_end = self.storage.committed_window().len();
             self.ldm_dict_end = self.ldm_committed_end;

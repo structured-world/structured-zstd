@@ -1379,6 +1379,7 @@ impl FastKernelMatcher {
             // (a `&self` accessor would borrow all of `self` and collide).
             run_fast_kernel_block(
                 None,
+                0,
                 history,
                 block_start,
                 super::fast_kernel::kernel::PrefixBounds {
@@ -1456,6 +1457,7 @@ impl FastKernelMatcher {
         let history: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
         let rep_out = run_fast_kernel_block(
             None,
+            0,
             history,
             block_start,
             super::fast_kernel::kernel::PrefixBounds {
@@ -1517,8 +1519,16 @@ impl FastKernelMatcher {
         let input: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
         let padded: &[u8] =
             unsafe { core::slice::from_raw_parts(self.history.as_ptr(), self.history.len()) };
+        // Once the block ends past a window beyond the dictionary, the window
+        // floor lies past it and no candidate can reach it: the input is
+        // scanned alone, at the positions it holds behind the dictionary
+        // (upstream zstd `ZSTD_checkDictValidity`, `blockEndIdx > maxDist +
+        // loadedDictEnd`, after which `ZSTD_compressBlock_fast` runs in place
+        // of the extDict kernel).
+        let copied = (window_low as usize <= dict_end).then_some((padded, dict_end));
         self.rep = run_fast_kernel_block(
-            Some((padded, dict_end)),
+            copied,
+            dict_end,
             input,
             block_start,
             bounds,
@@ -2635,10 +2645,13 @@ fn tagged_positions_fit(max_window_size: usize) -> bool {
 /// input's first ones after them, and the dictionary's length), `history` is
 /// the input read in place behind that dictionary: `block_start` is an offset
 /// in it and `bounds` are positions of the joined window
-/// ([`super::fast_kernel::kernel::compress_block_fast_split`]).
+/// ([`super::fast_kernel::kernel::compress_block_fast_split`]). Without it,
+/// `history` stands at position `origin` of the window
+/// ([`super::fast_kernel::kernel::compress_block_fast`]).
 #[allow(clippy::too_many_arguments)]
 fn run_fast_kernel_block(
     copied: Option<(&[u8], usize)>,
+    origin: usize,
     history: &[u8],
     block_start: usize,
     bounds: super::fast_kernel::kernel::PrefixBounds,
@@ -2674,6 +2687,7 @@ fn run_fast_kernel_block(
             } else {
                 compress_block_fast::<$mls, $cmov, $tagged>(
                     history,
+                    origin,
                     block_start,
                     bounds,
                     hash_table,

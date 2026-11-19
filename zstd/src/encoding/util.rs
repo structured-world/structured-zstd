@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-
 /// Returns the minimum number of bytes needed to represent this value, as
 /// either 1, 2, 4, or 8 bytes. A value of 0 will still return one byte.
 ///
@@ -18,15 +16,6 @@ pub fn find_min_size(val: u64) -> usize {
         return 4;
     }
     8
-}
-
-/// Appends the value represented using the smallest number of bytes needed
-/// (1, 2, 4, or 8; zero takes 1 byte) directly onto `output`.
-///
-/// Operates in **little-endian**.
-pub fn write_minified_val(val: u64, output: &mut Vec<u8>) {
-    let new_size = find_min_size(val);
-    output.extend_from_slice(&val.to_le_bytes()[0..new_size]);
 }
 
 /// Returns the minimum FCS field size for the given content size.
