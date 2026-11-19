@@ -35,14 +35,34 @@ pub(super) fn gather_literals<K: EncodeTier>(
     if dst.capacity() - dst.len() < block.len() {
         crate::encoding::workspace::capacity_exhausted();
     }
+    let start = dst.len();
+    // SAFETY: `block.len()` bytes of capacity past `start`, checked above.
+    unsafe {
+        let written = gather_into::<K>(block, sequences, tail, dst.as_mut_ptr().add(start));
+        dst.set_len(start + written);
+    }
+}
+
+/// [`gather_literals`] into `out`, returning the bytes written.
+///
+/// # Safety
+/// `out` is valid for writes of `block.len()` bytes and overlaps nothing the
+/// copy reads.
+pub(super) unsafe fn gather_into<K: EncodeTier>(
+    block: &[u8],
+    sequences: &[RawSequence],
+    tail: usize,
+    out: *mut u8,
+) -> usize {
     crate::encoding::fastpath::tier_match!(K {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
         ))]
-        // SAFETY: the tier is only selected after confirming AVX2 (and BMI2).
+        // SAFETY: the tier is only selected after confirming AVX2 (and BMI2);
+        // `out` as the caller guarantees.
         crate::encoding::fastpath::FastpathKernel::Avx2Bmi2 => unsafe {
-            gather_avx2(block, sequences, tail, dst)
+            gather_avx2(block, sequences, tail, out)
         },
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
@@ -51,23 +71,28 @@ pub(super) fn gather_literals<K: EncodeTier>(
         // SAFETY: both tiers are only selected after confirming SSE2.
         crate::encoding::fastpath::FastpathKernel::Sse2
         | crate::encoding::fastpath::FastpathKernel::Sse42 => unsafe {
-            gather_sse2(block, sequences, tail, dst)
+            gather_sse2(block, sequences, tail, out)
         },
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
             feature = "kernel-neon"
         ))]
-        crate::encoding::fastpath::FastpathKernel::Neon => gather_neon(block, sequences, tail, dst),
+        // SAFETY: `out` as the caller guarantees.
+        crate::encoding::fastpath::FastpathKernel::Neon => unsafe {
+            gather_neon(block, sequences, tail, out)
+        },
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
             feature = "kernel-simd128"
         ))]
-        crate::encoding::fastpath::FastpathKernel::Simd128 => {
-            gather_simd128(block, sequences, tail, dst)
+        // SAFETY: `out` as the caller guarantees.
+        crate::encoding::fastpath::FastpathKernel::Simd128 => unsafe {
+            gather_simd128(block, sequences, tail, out)
         },
-        _ => gather_scalar(block, sequences, tail, dst),
+        // SAFETY: `out` as the caller guarantees.
+        _ => unsafe { gather_scalar(block, sequences, tail, out) },
     })
 }
 
@@ -83,13 +108,11 @@ const WILDCOPY_SLACK: usize = 32;
 /// `$medium` for `33..2048` bytes. A macro so each tier's loop is compiled
 /// inside its own `#[target_feature]` function and its kernels inline into it.
 macro_rules! gather_body {
-    ($block:expr, $sequences:expr, $tail:expr, $dst:expr, $medium:path, $wild:path, $chunk:expr) => {{
+    ($block:expr, $sequences:expr, $tail:expr, $out:expr, $medium:path, $wild:path, $chunk:expr) => {{
         let block: &[u8] = $block;
-        let dst: &mut RegionVec<u8> = $dst;
+        let out: *mut u8 = $out;
         let src = block.as_ptr();
         let src_len = block.len();
-        let start = dst.len();
-        let out = unsafe { dst.as_mut_ptr().add(start) };
         let mut written = 0usize;
         let mut pos = 0usize;
         // A run's length is a `u32`, but the tail is a matcher's unchecked sum;
@@ -102,9 +125,8 @@ macro_rules! gather_body {
         macro_rules! copy_run {
             ($len:expr) => {{
                 let len = $len;
-                // SAFETY (both arms): `written <= pos`, and the capacity check in
-                // `gather_literals` gives the buffer `src_len` bytes past
-                // `start`. The chunked arm reads and writes at most
+                // SAFETY (both arms): `written <= pos`, and `out` is writable
+                // for `src_len` bytes (`gather_into`'s contract). The chunked arm reads and writes at most
                 // `max($chunk, len + $chunk - 1) <= len + WILDCOPY_SLACK` bytes
                 // from `pos` / `written` (`$chunk <= WILDCOPY_SLACK`), inside the
                 // block by its guard; the exact arm, `len <= src_len - pos`.
@@ -170,8 +192,7 @@ macro_rules! gather_body {
         // Once per block, in every build: a custom matcher that stops short
         // would leave the block's end out of the frame.
         assert_eq!(pos + $tail, src_len, "sequences must cover the block");
-        // SAFETY: `[start, start + written)` was written above, within capacity.
-        unsafe { dst.set_len(start + written) };
+        written
     }};
 }
 
@@ -180,17 +201,12 @@ macro_rules! gather_body {
     feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
-unsafe fn gather_avx2(
-    block: &[u8],
-    sequences: &[RawSequence],
-    tail: usize,
-    dst: &mut RegionVec<u8>,
-) {
+unsafe fn gather_avx2(block: &[u8], sequences: &[RawSequence], tail: usize, out: *mut u8) -> usize {
     gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_avx2,
         simd_copy::copy_avx2,
         32
@@ -202,17 +218,12 @@ unsafe fn gather_avx2(
     feature = "kernel-sse"
 ))]
 #[target_feature(enable = "sse2")]
-unsafe fn gather_sse2(
-    block: &[u8],
-    sequences: &[RawSequence],
-    tail: usize,
-    dst: &mut RegionVec<u8>,
-) {
+unsafe fn gather_sse2(block: &[u8], sequences: &[RawSequence], tail: usize, out: *mut u8) -> usize {
     gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_sse2,
         simd_copy::copy_sse2,
         16
@@ -224,27 +235,28 @@ unsafe fn gather_sse2(
     target_endian = "little",
     feature = "kernel-neon"
 ))]
-fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
+unsafe fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, out: *mut u8) -> usize {
     #[cfg(target_feature = "neon")]
-    gather_body!(
+    let written = gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_neon,
         simd_copy::copy_neon,
         16
     );
     #[cfg(not(target_feature = "neon"))]
-    gather_body!(
+    let written = gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_u64,
         simd_copy::copy_scalar,
         core::mem::size_of::<usize>()
     );
+    written
 }
 
 /// wasm SIMD is a compile-time feature, so the tier needs no
@@ -255,24 +267,34 @@ fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut R
     target_feature = "simd128",
     feature = "kernel-simd128"
 ))]
-fn gather_simd128(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
+unsafe fn gather_simd128(
+    block: &[u8],
+    sequences: &[RawSequence],
+    tail: usize,
+    out: *mut u8,
+) -> usize {
     gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_simd128,
         simd_copy::copy_simd128,
         16
     )
 }
 
-fn gather_scalar(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
+unsafe fn gather_scalar(
+    block: &[u8],
+    sequences: &[RawSequence],
+    tail: usize,
+    out: *mut u8,
+) -> usize {
     gather_body!(
         block,
         sequences,
         tail,
-        dst,
+        out,
         simd_copy::copy_exact_u64,
         simd_copy::copy_scalar,
         core::mem::size_of::<usize>()

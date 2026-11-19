@@ -590,15 +590,85 @@ pub(crate) fn compress_block<M: Matcher, K: EncodeTier>(
     output: &mut Vec<u8>,
 ) -> BlockTables {
     let mut scratch = core::mem::take(&mut state.block_scratch);
-    collect_block_parts::<M, K>(state, &mut scratch.parts);
-    let tables = encode_block_parts::<M, K>(
-        state,
-        &scratch.parts.literals,
-        &mut scratch.parts.sequences,
-        output,
-    );
+    let tables = if state.literal_compression_disabled {
+        // Raw literals go to the output as they are gathered: the section is
+        // the runs behind a header, so staging them in the literals buffer
+        // first would copy every literal byte twice.
+        let tail = collect_block_sequences::<M, K>(state, &mut scratch.parts);
+        write_raw_literals_from_runs::<K>(
+            state.matcher.get_last_space(),
+            &scratch.parts.sequences,
+            tail,
+            output,
+        );
+        let mut writer = BitWriter::from(output);
+        let fse =
+            encode_sequences_section::<M, K>(state, &mut scratch.parts.sequences, &mut writer);
+        writer.flush();
+        BlockTables {
+            fse,
+            huff: HuffOutcome::Keep,
+        }
+    } else {
+        collect_block_parts::<M, K>(state, &mut scratch.parts);
+        encode_block_parts::<M, K>(
+            state,
+            &scratch.parts.literals,
+            &mut scratch.parts.sequences,
+            output,
+        )
+    };
     state.block_scratch = scratch;
     tables
+}
+
+/// A raw literals section of the runs of `sequences` and the `tail` that
+/// follows them, appended to `output` with each run copied once, from the
+/// block into the section, as [`raw_literals`] writes it from gathered runs.
+///
+/// The header's width depends on the literals' count, known only once they
+/// are gathered; the room reserved for it is the width the whole block would
+/// take, and the runs move down over the bytes it did not need. That happens
+/// only for fewer than 4096 literals, so the move is that short at most.
+fn write_raw_literals_from_runs<K: EncodeTier>(
+    block: &[u8],
+    sequences: &[RawSequence],
+    tail: usize,
+    output: &mut Vec<u8>,
+) {
+    let reserved = uncompressed_literals_header_bytes(block.len());
+    output.reserve(reserved + block.len());
+    let start = output.len();
+    let base = output.as_mut_ptr();
+    // SAFETY: `reserve` left `reserved + block.len()` bytes of capacity past
+    // `start`, which `gather_into` writes at most `block.len()` of from
+    // `start + reserved`; the block is the matcher's, not `output`.
+    let literals = unsafe {
+        literal_runs::gather_into::<K>(block, sequences, tail, base.add(start + reserved))
+    };
+    let width = uncompressed_literals_header_bytes(literals);
+    debug_assert!(width <= reserved);
+    // Raw section header (RFC 8878 §3.1.1.3.1.2), little-endian: type 0 in
+    // the low two bits, then the size format and the size, as
+    // `write_uncompressed_literals_header` writes them.
+    let header: u32 = match width {
+        1 => (literals as u32) << 3,
+        2 => (1 << 2) | ((literals as u32) << 4),
+        _ => (3 << 2) | ((literals as u32) << 4),
+    };
+    // SAFETY: all within the capacity reserved above; `copy` allows the
+    // overlap of moving the runs down by `reserved - width` bytes.
+    unsafe {
+        if width < reserved {
+            core::ptr::copy(
+                base.add(start + reserved),
+                base.add(start + width),
+                literals,
+            );
+        }
+        core::ptr::copy_nonoverlapping(header.to_le_bytes().as_ptr(), base.add(start), width);
+        output.set_len(start + width + literals);
+    }
 }
 
 pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
@@ -814,6 +884,21 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     parts: &mut EncodedBlockParts,
 ) {
     parts.literals.clear();
+    let tail = collect_block_sequences::<M, K>(state, parts);
+    literal_runs::gather_literals::<K>(
+        state.matcher.get_last_space(),
+        &parts.sequences,
+        tail,
+        &mut parts.literals,
+    );
+}
+
+/// The search half of [`collect_block_parts`]: the block's sequences into
+/// `parts.sequences`, returning the trailing literals that follow the last.
+fn collect_block_sequences<M: Matcher, K: EncodeTier>(
+    state: &mut CompressState<M>,
+    parts: &mut EncodedBlockParts,
+) -> usize {
     parts.sequences.clear();
     // Trailing literals, reported after the last sequence; the runs are read
     // back by position, so no sequence may follow them.
@@ -879,12 +964,7 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
             block_start_hist,
         );
     }
-    literal_runs::gather_literals::<K>(
-        state.matcher.get_last_space(),
-        &parts.sequences,
-        tail,
-        &mut parts.literals,
-    );
+    tail
 }
 
 /// The built-in matcher's search of the block under tier `K`, recorded as in
@@ -1037,10 +1117,6 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
     // What the block decided for its tables, for the caller to commit once it
     // knows the block is kept.
 ) -> BlockTables {
-    // A block with no sequences writes no tables, so every axis keeps what it
-    // had whatever the caller decides.
-    let mut decisions = [LastUsedTable::Keep; 3];
-
     // literals section
 
     let mut writer = BitWriter::from(output);
@@ -1114,13 +1190,25 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
         raw_literals(literals_vec, &mut writer);
         HuffOutcome::Keep
     };
+    let fse = encode_sequences_section::<M, K>(state, raw_sequences, &mut writer);
+    writer.flush();
+    BlockTables { fse, huff }
+}
 
-    // sequences section
-
+/// The sequences section of a compressed block, written after its literals
+/// section; returns what the block decided for each axis's table.
+fn encode_sequences_section<M: Matcher, K: EncodeTier>(
+    state: &mut CompressState<M>,
+    raw_sequences: &mut [RawSequence],
+    writer: &mut BitWriter<&mut Vec<u8>>,
+) -> [LastUsedTable; 3] {
+    // A block with no sequences writes no tables, so every axis keeps what it
+    // had whatever the caller decides.
+    let mut decisions = [LastUsedTable::Keep; 3];
     if raw_sequences.is_empty() {
         writer.write_bits(0u8, 8);
     } else {
-        encode_seqnum(raw_sequences.len(), &mut writer);
+        encode_seqnum(raw_sequences.len(), writer);
 
         // Single-pass histogram of ll/ml/of codes across all sequences.
         // Previously did three separate `sequences.iter().map(...)`
@@ -1212,13 +1300,13 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
-        encode_table(&ll_mode, &mut writer);
-        encode_table(&of_mode, &mut writer);
-        encode_table(&ml_mode, &mut writer);
+        encode_table(&ll_mode, writer);
+        encode_table(&of_mode, writer);
+        encode_table(&ml_mode, writer);
 
         encode_sequences::<K>(
             raw_sequences,
-            &mut writer,
+            writer,
             [&ll_mode, &ml_mode, &of_mode],
             [ll_default, ml_default, of_default],
         );
@@ -1234,11 +1322,7 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
             into_last_used_table(of_mode),
         ];
     }
-    writer.flush();
-    BlockTables {
-        fse: decisions,
-        huff,
-    }
+    decisions
 }
 
 /// What a block decided for the tables the next block may repeat, held until
