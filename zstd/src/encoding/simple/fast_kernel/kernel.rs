@@ -632,9 +632,20 @@ pub(crate) struct PrefixBounds {
 /// (mls, cmov) (`zstd_fast.c`, `ZSTD_GEN_FAST_FN`): inlined into the dispatcher,
 /// every combination shares one frame and one register allocation, and the
 /// scan loop spills on a 32-bit target.
+///
+/// `data` stands at position `origin` of the window (0 for a window that
+/// starts with it): positions, the table's and `bounds` included, count from
+/// the window's start, and `block_start` is an offset in `data`. Nothing
+/// before `data` is read, so `bounds` must keep every candidate at or past
+/// `origin`. A frame whose dictionary has left the window scans the rest of
+/// its input this way (upstream zstd `ZSTD_checkDictValidity` drops the
+/// dictionary and `ZSTD_compressBlock_fast` runs in place of the extDict
+/// kernel).
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TAGGED: bool>(
     data: &[u8],
+    origin: usize,
     block_start: usize,
     bounds: PrefixBounds,
     hash_table: &mut FastHashTable,
@@ -642,11 +653,24 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     step_size: usize,
     handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
-    let window = IndexBase(data.as_ptr().wrapping_sub(hash_table.bias() as usize));
+    // Every read lies at or past the window floor, so none reaches before
+    // `data` when the floor is past `origin`.
+    assert!(
+        origin == 0 || bounds.window_low as usize >= origin,
+        "a scan from position {origin} needs its window floor ({}) at or past it",
+        bounds.window_low,
+    );
+    let window = IndexBase(
+        data.as_ptr()
+            .wrapping_sub(hash_table.bias() as usize + origin),
+    );
+    let data_len = origin
+        .checked_add(data.len())
+        .expect("a window's length fits a usize");
     fast_scan::<MLS, USE_CMOV, TAGGED, _>(
         window,
-        data.len(),
-        block_start,
+        data_len,
+        origin + block_start,
         bounds,
         hash_table,
         rep,

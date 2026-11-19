@@ -32,6 +32,7 @@ fn run_block(
         4 => compress_block_fast::<4, false, false>(
             data,
             0,
+            0,
             PrefixBounds {
                 // Match production contract:
                 // `prefix_start_index >= 1` rejects the hash table
@@ -48,6 +49,7 @@ fn run_block(
         ),
         5 => compress_block_fast::<5, false, false>(
             data,
+            0,
             0,
             PrefixBounds {
                 // Match production contract:
@@ -138,6 +140,7 @@ fn run_block_with_rep(
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     let result = compress_block_fast::<4, false, false>(
         data,
+        0,
         0,
         PrefixBounds {
             // Match production contract:
@@ -278,6 +281,7 @@ fn prefix_start_index_filter_rejects_below_window() {
     let _ = compress_block_fast::<4, false, false>(
         &data,
         0,
+        0,
         PrefixBounds {
             prefix_start_index: 5,
             window_low: 5,
@@ -361,6 +365,7 @@ fn match_found_rejects_stale_entry_below_prefix_floor() {
     // `match_found`.
     let _ = compress_block_fast::<4, false, false>(
         &data,
+        0,
         50,
         PrefixBounds {
             prefix_start_index: 50,
@@ -445,6 +450,7 @@ fn rep_offset_save_restore_when_out_of_range() {
     let result = compress_block_fast::<4, false, false>(
         &data,
         0,
+        0,
         PrefixBounds {
             // Match production contract:
             // `prefix_start_index >= 1` rejects the hash table
@@ -492,6 +498,7 @@ fn cmov_variant_matches_branch_variant_output() {
             let _ = compress_block_fast::<4, true, false>(
                 &data,
                 0,
+                0,
                 PrefixBounds {
                     // Match production contract:
                     // `prefix_start_index >= 1` rejects the hash
@@ -507,6 +514,7 @@ fn cmov_variant_matches_branch_variant_output() {
         } else {
             let _ = compress_block_fast::<4, false, false>(
                 &data,
+                0,
                 0,
                 PrefixBounds {
                     // Match production contract:
@@ -754,6 +762,7 @@ fn split_window_scan_takes_the_joined_scan_parse() {
             let mut joined_seqs = Vec::new();
             let joined_result = compress_block_fast::<MLS, CMOV, false>(
                 &joined,
+                0,
                 dict.len(),
                 bounds,
                 &mut joined_table,
