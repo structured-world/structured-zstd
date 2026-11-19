@@ -1466,6 +1466,7 @@ pub(crate) fn resolve_frame_params(
                 row_plan: None,
                 dict_use: None,
                 split_strategy: params.strategy_tag,
+                dict_tables: None,
             }
         }
     }

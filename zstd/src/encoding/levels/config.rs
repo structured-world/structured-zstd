@@ -1009,6 +1009,11 @@ pub(crate) struct FrameParams {
     /// (`ZSTD_CCtx_init_compressStream2` resolves `postBlockSplitter` from the
     /// frame's own cParams, and `ZSTD_resetCCtx_usingCDict` leaves it alone).
     pub(crate) split_strategy: crate::encoding::strategy::StrategyTag,
+    /// The cParams the dictionary's tables are indexed at: the CDict's when it
+    /// is attached or copied, the frame's own when it is loaded; `None`
+    /// without a dictionary. Resolved with the rest, so a frame of the same
+    /// dictionary reads them from the memo rather than deriving them again.
+    pub(crate) dict_tables: Option<crate::encoding::cparams::CParams>,
 }
 
 /// [`resolve_level_params`] for a frame that compresses with a dictionary of
@@ -1041,6 +1046,7 @@ pub(crate) fn resolve_level_params_with_dict(
             row_plan: None,
             dict_use: None,
             split_strategy: params.strategy_tag,
+            dict_tables: None,
         };
     }
     // The pledged-size sentinel is an unknown size, which attaches the
@@ -1105,6 +1111,7 @@ pub(crate) fn resolve_level_params_with_dict(
             DictUse::Copy
         }),
         split_strategy,
+        dict_tables: Some(cdict),
     }
 }
 
@@ -1226,6 +1233,7 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
         row_plan,
         dict_use: Some(DictUse::Load),
         split_strategy: params.strategy_tag,
+        dict_tables: Some(frame),
     }
 }
 
