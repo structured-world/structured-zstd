@@ -2005,13 +2005,16 @@ impl Matcher for MatchGeneratorDriver {
         // upstream reuses its `ldmState_t`.
         #[cfg(feature = "ldm")]
         {
-            self.ldm = frame_ldm.map(|p| match self.ldm.take() {
-                Some(mut existing) if existing.params() == p => {
-                    existing.clear();
-                    existing
+            // Edited in place: the producer is never moved out and back.
+            match (frame_ldm, &mut self.ldm) {
+                (Some(p), Some(existing)) if existing.params() == p => existing.clear(),
+                (Some(p), slot) => *slot = Some(super::ldm::LdmProducer::new(p)),
+                (None, slot) => {
+                    if slot.is_some() {
+                        *slot = None;
+                    }
                 }
-                _ => super::ldm::LdmProducer::new(p),
-            });
+            }
             // A dictionary the reset kept in place is the frame's first bytes.
             self.ldm_committed_end = self.storage.committed_window().len();
             self.ldm_dict_end = self.ldm_committed_end;
