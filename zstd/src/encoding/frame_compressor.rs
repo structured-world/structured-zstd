@@ -3044,7 +3044,23 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         // A dictionary frame runs the CDict's strategy (upstream
         // `ZSTD_resetCCtx_usingCDict`), so resolve through the same
         // dictionary-aware path the matcher's reset took.
-        let params = self.resolve_frame_params(initial_size_hint, use_dictionary_state);
+        // The built-in matcher's reset has just resolved a dictionary frame
+        // with these inputs; any other frame is resolved here.
+        let resolved = self
+            .state
+            .matcher
+            .builtin_driver()
+            .and_then(|driver| driver.dict_frame_params().copied());
+        let params = match resolved {
+            Some(frame) => {
+                debug_assert!(
+                    frame == self.resolve_frame_params(initial_size_hint, use_dictionary_state),
+                    "the matcher resolved the dictionary frame differently from the encoder"
+                );
+                frame
+            }
+            None => self.resolve_frame_params(initial_size_hint, use_dictionary_state),
+        };
         self.sync_effective_strategy(&params);
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.

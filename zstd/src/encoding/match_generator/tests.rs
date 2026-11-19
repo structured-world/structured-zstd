@@ -3689,7 +3689,7 @@ fn dictionary_attach_preference_reaches_every_backend() {
             };
             frame(&mut driver);
             assert_eq!(
-                driver.reset_dict_use,
+                driver.reset_dict_use(),
                 Some(expected),
                 "level {level} under {mode:?} with a {source}-byte source resolved the wrong use",
             );
