@@ -2205,9 +2205,9 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
         MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
     };
     (
-        highest_used_code::<{ MAX_LITERAL_LENGTH_CODE as usize }>(ll_counts),
-        highest_used_code::<{ MAX_MATCH_LENGTH_CODE as usize }>(ml_counts),
-        highest_used_code::<{ MAX_OFFSET_CODE as usize }>(of_counts),
+        highest_used_code(ll_counts, MAX_LITERAL_LENGTH_CODE as usize),
+        highest_used_code(ml_counts, MAX_MATCH_LENGTH_CODE as usize),
+        highest_used_code(of_counts, MAX_OFFSET_CODE as usize),
     )
 }
 
@@ -2215,19 +2215,26 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
 /// would otherwise find by scanning all 256 slots.
 ///
 /// Carried as a running maximum through the counting loop until it was three
-/// compares a sequence there against one bounded scan a stream a block. Each
-/// scan starts at its own alphabet's last code (`MAX_CODE`: 35, 52 or 31),
-/// where upstream's `HIST_count_simple` starts its own, so nothing past the
-/// alphabet is read.
-fn highest_used_code<const MAX_CODE: usize>(counts: &SequenceHistogram) -> usize {
+/// compares a sequence there against one bounded scan a stream a block. Every
+/// slot past an alphabet's last code (`max_code`: 35, 52 or 31) stays zero, so
+/// one pass over the whole fixed-length histogram serves the three alphabets:
+/// a copy per alphabet, each unrolled to its length, was three times the code a
+/// frame runs, and a scan bounded at run time does not vectorise. The pass
+/// gathers a mask of the used slots, which compiles to compares and a mask
+/// move, and the highest set bit is the code.
+#[inline(never)]
+fn highest_used_code(counts: &SequenceHistogram, max_code: usize) -> usize {
     debug_assert!(
-        counts[MAX_CODE + 1..].iter().all(|&count| count == 0),
-        "a code past the alphabet's last ({MAX_CODE}) was counted",
+        counts[max_code + 1..].iter().all(|&count| count == 0),
+        "a code past the alphabet's last ({max_code}) was counted",
     );
-    counts[..=MAX_CODE]
-        .iter()
-        .rposition(|&count| count != 0)
-        .unwrap_or(0)
+    const _: () = assert!(SEQUENCE_CODE_SLOTS == 64);
+    let mut used = 0u64;
+    for (slot, &count) in counts.iter().enumerate() {
+        used |= u64::from(count != 0) << slot;
+    }
+    // No code used reads as code 0, as the scan it replaces returned.
+    (63 - (used | 1).leading_zeros()) as usize
 }
 
 /// The FSE tables a split probe's scratch state works with: the defaults, and
