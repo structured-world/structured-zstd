@@ -56,10 +56,14 @@ impl Source {
 #[cfg(test)]
 pub const BINDS_REMOVAL: bool = sys::BINDS_REMOVAL;
 
-/// Whether [`remove_if`] can also bind the check of a source named through a
-/// link; where it cannot, such a source is kept as [`Removal::Unconfirmed`].
+/// Whether [`remove_if`] can also bind the check of a source named through
+/// the symbolic link `path`, which depends on the kernel as well as the
+/// platform; where it cannot, such a source is kept as
+/// [`Removal::Unconfirmed`].
 #[cfg(test)]
-pub const BINDS_LINK_REMOVAL: bool = sys::BINDS_LINK_REMOVAL;
+pub fn binds_link_removal(path: &Path) -> bool {
+    sys::binds_link_removal(path)
+}
 
 /// Remove the entry `path` names if it is the file `expected`, checking and
 /// removing through one handle so no rename between the two can redirect the
@@ -69,7 +73,7 @@ pub const BINDS_LINK_REMOVAL: bool = sys::BINDS_LINK_REMOVAL;
 /// processed: the entry must then still be that link and point at
 /// `expected`, and the link is removed, as removing a path removes the name.
 /// Where both cannot be checked in the directory the link is removed from
-/// (Windows, NetBSD, OpenBSD, DragonFly), the link is kept as
+/// (Windows, NetBSD, OpenBSD, DragonFly, FreeBSD before 14), the link is kept as
 /// [`Removal::Unconfirmed`]. Without `link`, a link found at the path is not
 /// the file processed and is kept.
 pub fn remove_if(path: &Path, expected: FileId, link: Option<FileId>) -> io::Result<Removal> {
@@ -143,7 +147,7 @@ mod sys {
 
     pub use unlink::remove_if;
     #[cfg(test)]
-    pub use unlink::{BINDS_LINK_REMOVAL, BINDS_REMOVAL};
+    pub use unlink::{BINDS_REMOVAL, binds_link_removal};
 
     fn of(metadata: &fs::Metadata) -> FileId {
         FileId(metadata.dev(), u128::from(metadata.ino()))
@@ -179,8 +183,11 @@ mod sys {
 
         #[cfg(test)]
         pub const BINDS_REMOVAL: bool = false;
+
         #[cfg(test)]
-        pub const BINDS_LINK_REMOVAL: bool = false;
+        pub fn binds_link_removal(_: &Path) -> bool {
+            false
+        }
 
         pub fn remove_if(
             _: &Path,
@@ -227,8 +234,6 @@ mod sys {
 
         #[cfg(test)]
         pub const BINDS_REMOVAL: bool = true;
-        #[cfg(test)]
-        pub const BINDS_LINK_REMOVAL: bool = LINK_FLAGS.is_some();
 
         unsafe extern "C" {
             fn open(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -339,10 +344,10 @@ mod sys {
 
         /// How the entry is opened to read a symbolic link's own identity
         /// rather than the file it names: `O_PATH | O_NOFOLLOW` on Linux and
-        /// FreeBSD (14 and later; an older kernel does not open the link, and
-        /// the source is kept), `O_SYMLINK` on Apple systems. NetBSD, OpenBSD
-        /// and DragonFly cannot open a link itself, so there a source named
-        /// through one is kept.
+        /// FreeBSD, `O_SYMLINK` on Apple systems. FreeBSD before 14 has no
+        /// `O_PATH`, so `O_NOFOLLOW` refuses the link and the source is kept
+        /// as unconfirmed. NetBSD, OpenBSD and DragonFly cannot open a link
+        /// itself, so there a source named through one is kept.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const LINK_FLAGS: Option<c_int> = Some(DIR_FLAGS | NOFOLLOW);
         #[cfg(target_vendor = "apple")]
@@ -352,22 +357,65 @@ mod sys {
         #[cfg(any(target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
         const LINK_FLAGS: Option<c_int> = None;
 
-        /// The identity of `name` in `dir` opened with `flags`; `None` when
-        /// there is no such entry, or it is a link `O_NOFOLLOW` refused.
-        fn probe(dir: &OwnedFd, name: &CStr, flags: c_int) -> io::Result<Option<FileId>> {
+        /// What opening an entry found.
+        #[derive(PartialEq, Eq)]
+        enum Entry {
+            /// The file it opened.
+            Found(FileId),
+            /// No such entry.
+            Gone,
+            /// A symbolic link `O_NOFOLLOW` refused.
+            Link,
+        }
+
+        /// `name` in `dir` opened with `flags`.
+        fn probe(dir: &OwnedFd, name: &CStr, flags: c_int) -> io::Result<Entry> {
             // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated;
             // no `O_CREAT`, so no mode argument is read.
             let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(LINK_ERRNO) {
-                    return Ok(None);
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(Entry::Gone);
+                }
+                if err.raw_os_error() == Some(LINK_ERRNO) {
+                    return Ok(Entry::Link);
                 }
                 return Err(err);
             }
             // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
             let entry = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-            Ok(Some(of(&entry.metadata()?)))
+            Ok(Entry::Found(of(&entry.metadata()?)))
+        }
+
+        /// The parent directory of `path`, opened, and the entry's name in
+        /// it; `None` when `path` names no entry or its directory is gone.
+        fn held(path: &Path) -> io::Result<Option<(OwnedFd, CString)>> {
+            let Some(name) = path.file_name() else {
+                return Ok(None);
+            };
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty());
+            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            match open_dir(parent.unwrap_or(Path::new("."))) {
+                Ok(dir) => Ok(Some((dir, name))),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+
+        /// Whether this kernel opens the symbolic link `path` itself, so a
+        /// source named through it can be removed.
+        #[cfg(test)]
+        pub fn binds_link_removal(path: &Path) -> bool {
+            let (Some(flags), Some(own)) = (LINK_FLAGS, super::of_entry(path)) else {
+                return false;
+            };
+            let Ok(Some((dir, name))) = held(path) else {
+                return false;
+            };
+            probe(&dir, &name, flags).is_ok_and(|entry| entry == Entry::Found(own))
         }
 
         /// The parent directory is opened once and the checks and the unlink
@@ -387,23 +435,13 @@ mod sys {
             opened: impl FnOnce(),
             between: impl FnOnce(),
         ) -> io::Result<Removal> {
-            let Some(name) = path.file_name() else {
-                return Ok(Removal::Changed);
-            };
             let link = match (link, LINK_FLAGS) {
                 (None, _) => None,
                 (Some(link), Some(flags)) => Some((link, flags)),
                 (Some(_), None) => return Ok(Removal::Unconfirmed),
             };
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty());
-            let parent = parent.unwrap_or(Path::new("."));
-            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
-            let dir = match open_dir(parent) {
-                Ok(dir) => dir,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
-                Err(err) => return Err(err),
+            let Some((dir, name)) = held(path)? else {
+                return Ok(Removal::Changed);
             };
             opened();
             let flags = if link.is_some() {
@@ -411,13 +449,17 @@ mod sys {
             } else {
                 PROBE_FLAGS | NOFOLLOW
             };
-            if probe(&dir, &name, flags)? != Some(expected) {
+            if probe(&dir, &name, flags)? != Entry::Found(expected) {
                 return Ok(Removal::Changed);
             }
-            if let Some((link, flags)) = link
-                && probe(&dir, &name, flags)? != Some(link)
-            {
-                return Ok(Removal::Changed);
+            if let Some((link, flags)) = link {
+                match probe(&dir, &name, flags)? {
+                    Entry::Found(own) if own == link => {}
+                    // The kernel refused to open the link itself (FreeBSD
+                    // before 14): its identity cannot be read.
+                    Entry::Link => return Ok(Removal::Unconfirmed),
+                    Entry::Found(_) | Entry::Gone => return Ok(Removal::Changed),
+                }
             }
             between();
             // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated.
@@ -470,8 +512,11 @@ mod sys {
 
     #[cfg(test)]
     pub const BINDS_REMOVAL: bool = true;
+
     #[cfg(test)]
-    pub const BINDS_LINK_REMOVAL: bool = false;
+    pub fn binds_link_removal(_: &Path) -> bool {
+        false
+    }
 
     /// `FILE_FLAG_BACKUP_SEMANTICS`: lets a directory be opened too, as
     /// `fs::metadata` answers for any path on Unix.
@@ -700,8 +745,11 @@ mod sys {
 
     #[cfg(test)]
     pub const BINDS_REMOVAL: bool = false;
+
     #[cfg(test)]
-    pub const BINDS_LINK_REMOVAL: bool = false;
+    pub fn binds_link_removal(_: &Path) -> bool {
+        false
+    }
 
     pub fn of_path(_: &Path) -> Option<FileId> {
         None

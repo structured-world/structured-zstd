@@ -7014,11 +7014,11 @@ fn file_link(target: &Path, link: &Path) {
     std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
-/// Where the platform cannot read a link's own identity through the
-/// directory it removes from, `remove_if` removes no source named through a
-/// link; returns whether the caller's test applies.
+/// Where the platform or the kernel cannot read a link's own identity
+/// through the directory it removes from, `remove_if` removes no source
+/// named through a link; returns whether the caller's test applies.
 fn link_removal_is_bound(path: &Path, source: identity::Source) -> bool {
-    if identity::BINDS_LINK_REMOVAL {
+    if identity::binds_link_removal(path) {
         return true;
     }
     assert_eq!(
