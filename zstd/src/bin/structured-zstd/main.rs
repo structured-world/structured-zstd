@@ -3399,9 +3399,11 @@ fn process_concatenated(
                         }
                     }
                 };
+                // Read only when it can be used: on Windows it costs a query.
                 let processed_id = source
                     .as_ref()
                     .zip(metadata.as_ref())
+                    .filter(|_| removes_sources(opts))
                     .and_then(|(file, metadata)| identity::of_open(file, metadata));
                 let name = if source.is_some() {
                     input.display().to_string()
@@ -5735,7 +5737,7 @@ fn remove_source_if_requested(
     // reader is gone, a terminal, or anything else we cannot read back, so
     // there is no saved copy to justify deleting the original. Upstream keeps
     // the file for `-c` too.
-    if !opts.remove_source || opts.keep || opts.to_stdout {
+    if !removes_sources(opts) {
         return Ok(());
     }
     // Nor when a device or pipe took the output in place (`-o /dev/null`, a
@@ -5750,35 +5752,44 @@ fn remove_source_if_requested(
         );
         return Ok(());
     }
-    // The path is resolved again to remove it, and a parent directory renamed
-    // meanwhile makes it name another file: only the file that was processed
-    // is removed, as upstream zstd (fileio.c `FIO_removeFile`) checks device
-    // and inode. Where either identity cannot be read the file stays, since
-    // nothing confirms it is the one processed.
-    let Some(processed) = processed else {
-        display!(
-            opts.verbosity,
-            1,
-            "zstd: {}: cannot confirm it is the file processed -- ignored for removal",
-            input.display()
-        );
-        return Ok(());
-    };
-    if identity::of_path(input) != Some(processed) {
-        display!(
-            opts.verbosity,
-            1,
-            "zstd: {} changed while processing -- ignored for removal",
-            input.display()
-        );
-        return Ok(());
-    }
     // Removing the source is past the point where an interruption should
     // delete anything: the output is in place, and the guard would take it
     // along with the source.
     interrupt::clear();
-    fs::remove_file(input).wrap_err("failed to remove source file after success")?;
+    // The path is resolved again to remove it, and a parent directory renamed
+    // meanwhile makes it name another file: only the file that was processed
+    // is removed, as upstream zstd (fileio.c `FIO_removeFile`) checks device
+    // and inode, and the check and the removal go through one handle so the
+    // path cannot change between them. Where no identity can be read the file
+    // stays, since nothing confirms it is the one processed.
+    let removal = match processed {
+        Some(processed) => identity::remove_if(input, processed)
+            .wrap_err("failed to remove source file after success")?,
+        None => identity::Removal::Unconfirmed,
+    };
+    match removal {
+        identity::Removal::Removed => {}
+        identity::Removal::Changed => display!(
+            opts.verbosity,
+            1,
+            "zstd: {} changed while processing -- ignored for removal",
+            input.display()
+        ),
+        identity::Removal::Unconfirmed => display!(
+            opts.verbosity,
+            1,
+            "zstd: {}: cannot confirm it is the file processed -- ignored for removal",
+            input.display()
+        ),
+    }
     Ok(())
+}
+
+/// Whether a processed source can be removed at all: `--rm` without `-k`,
+/// and an output that is not stdout (which may be a pipe whose reader is
+/// gone, so nothing would hold the data). Test mode writes nothing.
+fn removes_sources(opts: &Options) -> bool {
+    opts.remove_source && !opts.keep && !opts.to_stdout && opts.mode != Mode::Test
 }
 
 /// Counts what passes through to the writer beneath, so the summary can say
@@ -6273,7 +6284,10 @@ fn process_file(
     let Some((source, metadata)) = open_input(opts, input)? else {
         return Ok(Outcome::Skipped);
     };
-    let processed_id = identity::of_open(&source, &metadata);
+    // Read only when it can be used: on Windows it costs a query per file.
+    let processed_id = removes_sources(opts)
+        .then(|| identity::of_open(&source, &metadata))
+        .flatten();
     let name = input.display().to_string();
 
     // Test mode: decompress into the void, report what was there.

@@ -7026,6 +7026,41 @@ fn rm_keeps_a_file_the_source_path_names_after_processing() {
     assert!(!source.exists(), "the processed file is removed");
 }
 
+/// The source's parent directory swapped for a link AFTER the identity check
+/// passed and before the removal. A check by path followed by a removal by
+/// path resolves the swapped path the second time and deletes the unrelated
+/// file; binding both to one directory handle removes the processed file.
+#[cfg(unix)]
+#[test]
+fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
+    let scratch = Scratch::new("rmlate");
+    let work = scratch.path().join("work");
+    let protected = scratch.path().join("protected");
+    let held = scratch.path().join("held");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(&protected).unwrap();
+    let source = work.join("victim");
+    fs::write(&source, b"processed content").unwrap();
+    fs::write(protected.join("victim"), b"protected content").unwrap();
+    let processed = identity::of_path(&source).unwrap();
+
+    let removal = identity::remove_if_racing(&source, processed, || {
+        fs::rename(&work, &held).unwrap();
+        std::os::unix::fs::symlink(&protected, &work).unwrap();
+    })
+    .unwrap();
+    assert_eq!(
+        fs::read(protected.join("victim")).unwrap(),
+        b"protected content",
+        "the file the path names after the swap is not the one checked"
+    );
+    assert_eq!(removal, identity::Removal::Removed);
+    assert!(
+        !held.join("victim").exists(),
+        "the checked file is the one removed"
+    );
+}
+
 /// Without an identity for the processed file nothing confirms the path still
 /// names it, so `--rm` leaves the file in place rather than guess.
 #[test]

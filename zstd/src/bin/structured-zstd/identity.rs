@@ -3,12 +3,42 @@
 //! redirected stdout) compare equal.
 
 use std::fs::{self, File};
+use std::io;
 use std::path::Path;
 
 /// A file as the filesystem identifies it: device and inode on Unix, volume
 /// serial number and the 128-bit file ID on Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(u64, u128);
+
+/// What [`remove_if`] did with the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// The path named the expected file, and that entry is gone.
+    Removed,
+    /// The path names another file, or none: nothing was removed.
+    Changed,
+    /// The platform cannot bind the check to the removal: nothing was removed.
+    Unconfirmed,
+}
+
+/// Remove the entry `path` names if it is the file `expected`, checking and
+/// removing through one handle so no rename between the two can redirect the
+/// removal elsewhere.
+pub fn remove_if(path: &Path, expected: FileId) -> io::Result<Removal> {
+    sys::remove_if(path, expected, || {})
+}
+
+/// [`remove_if`] with `between` run after the check and before the removal,
+/// where a concurrent rename would land.
+#[cfg(test)]
+pub fn remove_if_racing(
+    path: &Path,
+    expected: FileId,
+    between: impl FnOnce(),
+) -> io::Result<Removal> {
+    sys::remove_if(path, expected, between)
+}
 
 /// The file `path` names, following symlinks; `None` when there is none, or
 /// the platform reads no identity.
@@ -40,14 +70,121 @@ pub fn of_stderr() -> Option<FileId> {
 
 #[cfg(unix)]
 mod sys {
-    use super::FileId;
+    use super::{FileId, Removal};
+    use core::ffi::{c_char, c_int};
+    use std::ffi::CString;
     use std::fs::{self, File};
-    use std::os::fd::AsFd;
+    use std::io;
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
+    unsafe extern "C" {
+        fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    }
+
+    /// `O_RDONLY | O_NONBLOCK | O_NOCTTY`: the entry is opened only to read
+    /// its identity, so a FIFO must not block and a terminal must not become
+    /// the controlling one. BSD and Apple systems never take a controlling
+    /// terminal on open, so `O_NOCTTY` is 0 there.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
+        )
+    ))]
+    const PROBE_FLAGS: Option<c_int> = Some(0o4000 | 0o400);
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    const PROBE_FLAGS: Option<c_int> = Some(0x4);
+    /// Another Unix: flag values not spelled out here, so nothing is removed.
+    #[cfg(not(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
+        ),
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    const PROBE_FLAGS: Option<c_int> = None;
+
     fn of(metadata: &fs::Metadata) -> FileId {
         FileId(metadata.dev(), u128::from(metadata.ino()))
+    }
+
+    /// The parent directory is opened once and both the check and the unlink
+    /// go through it, so renaming any ancestor afterwards changes nothing.
+    /// The entry itself can still be swapped inside that directory between
+    /// the two, but only by someone who may write the directory and could
+    /// remove the entry anyway; unlinking a name never reaches a file through
+    /// another directory.
+    pub fn remove_if(path: &Path, expected: FileId, between: impl FnOnce()) -> io::Result<Removal> {
+        let Some(flags) = PROBE_FLAGS else {
+            return Ok(Removal::Unconfirmed);
+        };
+        let Some(name) = path.file_name() else {
+            return Ok(Removal::Changed);
+        };
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        let dir = match File::open(parent) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
+            Err(err) => return Err(err),
+        };
+        // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated; no
+        // `O_CREAT`, so no mode argument is read.
+        let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(Removal::Changed);
+            }
+            return Err(err);
+        }
+        // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
+        let entry = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        if of(&entry.metadata()?) != expected {
+            return Ok(Removal::Changed);
+        }
+        drop(entry);
+        between();
+        // SAFETY: as for `openat`.
+        if unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Removal::Removed)
     }
 
     pub fn of_path(path: &Path) -> Option<FileId> {
@@ -78,9 +215,10 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use super::FileId;
+    use super::{FileId, Removal};
     use core::ffi::c_void;
     use std::fs::{self, File, OpenOptions};
+    use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, RawHandle};
     use std::path::Path;
@@ -88,9 +226,17 @@ mod sys {
     /// `FILE_FLAG_BACKUP_SEMANTICS`: lets a directory be opened too, as
     /// `fs::metadata` answers for any path on Unix.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
 
     /// `FileIdInfo` of `FILE_INFO_BY_HANDLE_CLASS`.
     const FILE_ID_INFO_CLASS: i32 = 18;
+    /// `FileDispositionInfo` of `FILE_INFO_BY_HANDLE_CLASS`.
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
 
     /// `FILE_ID_INFO`: the volume and the 128-bit file ID. The 64-bit index
     /// of `BY_HANDLE_FILE_INFORMATION` is not unique on ReFS, which is why
@@ -131,6 +277,13 @@ mod sys {
         fn GetFileInformationByHandle(
             file: *mut c_void,
             information: *mut ByHandleFileInformation,
+        ) -> i32;
+
+        fn SetFileInformationByHandle(
+            file: *mut c_void,
+            class: i32,
+            information: *const c_void,
+            size: u32,
         ) -> i32;
     }
 
@@ -184,6 +337,45 @@ mod sys {
         of_handle(file.as_raw_handle())
     }
 
+    /// The entry is opened itself, a link as the link
+    /// (`FILE_FLAG_OPEN_REPARSE_POINT`), its identity read from that handle,
+    /// and the same handle marked for deletion: no path is resolved twice.
+    pub fn remove_if(path: &Path, expected: FileId, between: impl FnOnce()) -> io::Result<Removal> {
+        let file = match OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
+            Err(err) => return Err(err),
+        };
+        match of_handle(file.as_raw_handle()) {
+            None => return Ok(Removal::Unconfirmed),
+            Some(found) if found != expected => return Ok(Removal::Changed),
+            Some(_) => {}
+        }
+        between();
+        // `FILE_DISPOSITION_INFO` is one `BOOLEAN`: true deletes the file
+        // when its last handle closes, which is this one, dropped below.
+        let delete: u8 = 1;
+        // SAFETY: `file` is open with `DELETE` access and `delete` is a
+        // readable `FILE_DISPOSITION_INFO` of the size passed.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&raw const delete).cast(),
+                1,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Removal::Removed)
+    }
+
     pub fn of_stdout() -> Option<FileId> {
         of_handle(std::io::stdout().as_raw_handle())
     }
@@ -199,8 +391,9 @@ mod sys {
 
 #[cfg(not(any(unix, windows)))]
 mod sys {
-    use super::FileId;
+    use super::{FileId, Removal};
     use std::fs::{self, File};
+    use std::io;
     use std::path::Path;
 
     pub fn of_path(_: &Path) -> Option<FileId> {
@@ -209,6 +402,10 @@ mod sys {
 
     pub fn of_open(_: &File, _: &fs::Metadata) -> Option<FileId> {
         None
+    }
+
+    pub fn remove_if(_: &Path, _: FileId, _: impl FnOnce()) -> io::Result<Removal> {
+        Ok(Removal::Unconfirmed)
     }
 
     pub fn of_stdout() -> Option<FileId> {
