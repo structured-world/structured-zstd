@@ -7061,6 +7061,28 @@ fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
     );
 }
 
+/// Unlinking an entry needs write and search permission on its directory, not
+/// read permission: a source in a directory its owner may write and search
+/// but not list (mode 0300) is removed as a plain unlink removes it. (Root
+/// ignores the mode, so there the test proves less.)
+#[cfg(unix)]
+#[test]
+fn rm_removes_a_source_in_a_directory_without_read_permission() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("rmnoread");
+    let dir = scratch.path().join("dir");
+    fs::create_dir(&dir).unwrap();
+    let source = dir.join("data.txt");
+    fs::write(&source, b"payload").unwrap();
+    let processed = identity::of_path(&source).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let removal = identity::remove_if(&source, processed);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(removal.unwrap(), identity::Removal::Removed);
+    assert!(!source.exists());
+}
+
 /// Without an identity for the processed file nothing confirms the path still
 /// names it, so `--rm` leaves the file in place rather than guess.
 #[test]

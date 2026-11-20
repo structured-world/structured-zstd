@@ -81,8 +81,78 @@ mod sys {
     use std::path::Path;
 
     unsafe extern "C" {
+        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
         fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
         fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    }
+
+    /// How the parent directory is opened: for search only (`O_PATH` on
+    /// Linux, `O_SEARCH` elsewhere), since unlinking an entry needs write and
+    /// search permission on the directory, not read. 0 (`O_RDONLY`) where the
+    /// system has no such flag, which then also asks for read permission.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
+        )
+    ))]
+    const DIR_FLAGS: c_int = 0o10000000;
+    #[cfg(target_vendor = "apple")]
+    const DIR_FLAGS: c_int = 0x4010_0000;
+    #[cfg(target_os = "freebsd")]
+    const DIR_FLAGS: c_int = 0x0004_0000;
+    #[cfg(target_os = "netbsd")]
+    const DIR_FLAGS: c_int = 0x0080_0000;
+    #[cfg(not(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
+        ),
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
+    const DIR_FLAGS: c_int = 0;
+
+    /// `EINVAL`, which a system older than its search-only open flag answers.
+    const EINVAL: i32 = 22;
+
+    /// The parent directory as a descriptor for `openat` and `unlinkat`.
+    fn open_dir(parent: &Path) -> io::Result<OwnedFd> {
+        let parent = CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        for flags in [DIR_FLAGS, 0] {
+            // SAFETY: `parent` is NUL-terminated; no `O_CREAT`, so no mode
+            // argument is read.
+            let fd = unsafe { open(parent.as_ptr(), flags) };
+            if fd >= 0 {
+                // SAFETY: `fd` was just returned by `open` and nothing else
+                // owns it.
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            let err = io::Error::last_os_error();
+            if flags == 0 || err.raw_os_error() != Some(EINVAL) {
+                return Err(err);
+            }
+        }
+        unreachable!("the plain open either returns or fails")
     }
 
     /// `O_RDONLY | O_NONBLOCK | O_NOCTTY`: the entry is opened only to read
@@ -158,7 +228,7 @@ mod sys {
             _ => Path::new("."),
         };
         let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
-        let dir = match File::open(parent) {
+        let dir = match open_dir(parent) {
             Ok(dir) => dir,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
             Err(err) => return Err(err),
