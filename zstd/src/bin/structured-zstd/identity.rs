@@ -70,119 +70,37 @@ pub fn of_stderr() -> Option<FileId> {
 
 #[cfg(unix)]
 mod sys {
-    use super::{FileId, Removal};
-    use core::ffi::{c_char, c_int};
-    use std::ffi::CString;
+    use super::FileId;
     use std::fs::{self, File};
-    use std::io;
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    unsafe extern "C" {
-        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-        fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
-        fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
-    }
-
-    /// How the parent directory is opened: for search only (`O_PATH` on
-    /// Linux, `O_SEARCH` elsewhere), since unlinking an entry needs write and
-    /// search permission on the directory, not read. 0 (`O_RDONLY`) where the
-    /// system has no such flag, which then also asks for read permission.
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "arm",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "powerpc",
-            target_arch = "powerpc64",
-            target_arch = "s390x",
-            target_arch = "loongarch64"
-        )
-    ))]
-    const DIR_FLAGS: c_int = 0o10000000;
-    #[cfg(target_vendor = "apple")]
-    const DIR_FLAGS: c_int = 0x4010_0000;
-    #[cfg(target_os = "freebsd")]
-    const DIR_FLAGS: c_int = 0x0004_0000;
-    #[cfg(target_os = "netbsd")]
-    const DIR_FLAGS: c_int = 0x0080_0000;
-    #[cfg(not(any(
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ),
-        target_vendor = "apple",
-        target_os = "freebsd",
-        target_os = "netbsd"
-    )))]
-    const DIR_FLAGS: c_int = 0;
-
-    /// `EINVAL`, which a system older than its search-only open flag answers.
-    const EINVAL: i32 = 22;
-
-    /// The parent directory as a descriptor for `openat` and `unlinkat`.
-    fn open_dir(parent: &Path) -> io::Result<OwnedFd> {
-        let parent = CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        for flags in [DIR_FLAGS, 0] {
-            // SAFETY: `parent` is NUL-terminated; no `O_CREAT`, so no mode
-            // argument is read.
-            let fd = unsafe { open(parent.as_ptr(), flags) };
-            if fd >= 0 {
-                // SAFETY: `fd` was just returned by `open` and nothing else
-                // owns it.
-                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-            }
-            let err = io::Error::last_os_error();
-            if flags == 0 || err.raw_os_error() != Some(EINVAL) {
-                return Err(err);
-            }
-        }
-        unreachable!("the plain open either returns or fails")
-    }
-
-    /// `O_RDONLY | O_NONBLOCK | O_NOCTTY`: the entry is opened only to read
-    /// its identity, so a FIFO must not block and a terminal must not become
-    /// the controlling one. BSD and Apple systems never take a controlling
-    /// terminal on open, so `O_NOCTTY` is 0 there.
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "arm",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-            target_arch = "powerpc",
-            target_arch = "powerpc64",
-            target_arch = "s390x",
-            target_arch = "loongarch64"
-        )
-    ))]
-    const PROBE_FLAGS: Option<c_int> = Some(0o4000 | 0o400);
     #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
+        ),
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly"
     ))]
-    const PROBE_FLAGS: Option<c_int> = Some(0x4);
-    /// Another Unix: flag values not spelled out here, so nothing is removed.
+    pub use unlink::remove_if;
+
+    /// Another Unix: the open flag values are not spelled out here, so the
+    /// check cannot be bound to the removal and nothing is removed.
     #[cfg(not(any(
         all(
             any(target_os = "linux", target_os = "android"),
@@ -204,57 +122,139 @@ mod sys {
         target_os = "openbsd",
         target_os = "dragonfly"
     )))]
-    const PROBE_FLAGS: Option<c_int> = None;
+    pub fn remove_if(_: &Path, _: FileId, _: impl FnOnce()) -> std::io::Result<super::Removal> {
+        Ok(super::Removal::Unconfirmed)
+    }
 
     fn of(metadata: &fs::Metadata) -> FileId {
         FileId(metadata.dev(), u128::from(metadata.ino()))
     }
 
-    /// The parent directory is opened once and both the check and the unlink
-    /// go through it, so renaming any ancestor afterwards changes nothing.
-    /// The entry itself can still be swapped inside that directory between
-    /// the two, but only by someone who may write the directory and could
-    /// remove the entry anyway; unlinking a name never reaches a file through
-    /// another directory.
-    pub fn remove_if(path: &Path, expected: FileId, between: impl FnOnce()) -> io::Result<Removal> {
-        let Some(flags) = PROBE_FLAGS else {
-            return Ok(Removal::Unconfirmed);
-        };
-        let Some(name) = path.file_name() else {
-            return Ok(Removal::Changed);
-        };
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
-        let dir = match open_dir(parent) {
-            Ok(dir) => dir,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
-            Err(err) => return Err(err),
-        };
-        // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated; no
-        // `O_CREAT`, so no mode argument is read.
-        let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::NotFound {
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
+        ),
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    mod unlink {
+        use super::super::{FileId, Removal};
+        use super::of;
+        use core::ffi::{c_char, c_int};
+        use std::ffi::CString;
+        use std::fs::File;
+        use std::io;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        unsafe extern "C" {
+            fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+            fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+            fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+        }
+
+        /// How the parent directory is opened: for search only (`O_PATH` on
+        /// Linux, `O_SEARCH` elsewhere), since unlinking an entry needs write and
+        /// search permission on the directory, not read. 0 (`O_RDONLY`) where the
+        /// system has no such flag, which then also asks for read permission.
+        /// Every kernel Rust supports knows its flag (`O_PATH` since Linux 2.6.39,
+        /// `O_SEARCH` since FreeBSD 8 and NetBSD 7); macOS before 13 ignores the
+        /// `O_EXEC` bit of its `O_SEARCH` and opens for reading.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const DIR_FLAGS: c_int = 0o10000000;
+        #[cfg(target_vendor = "apple")]
+        const DIR_FLAGS: c_int = 0x4010_0000;
+        #[cfg(target_os = "freebsd")]
+        const DIR_FLAGS: c_int = 0x0004_0000;
+        #[cfg(target_os = "netbsd")]
+        const DIR_FLAGS: c_int = 0x0080_0000;
+        #[cfg(any(target_os = "openbsd", target_os = "dragonfly"))]
+        const DIR_FLAGS: c_int = 0;
+
+        /// The parent directory as a descriptor for `openat` and `unlinkat`.
+        fn open_dir(parent: &Path) -> io::Result<OwnedFd> {
+            let parent = CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
+            // SAFETY: `parent` is NUL-terminated; no `O_CREAT`, so no mode
+            // argument is read.
+            let fd = unsafe { open(parent.as_ptr(), DIR_FLAGS) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned by `open` and nothing else owns it.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+
+        /// `O_RDONLY | O_NONBLOCK | O_NOCTTY`: the entry is opened only to read
+        /// its identity, so a FIFO must not block and a terminal must not become
+        /// the controlling one. BSD and Apple systems never take a controlling
+        /// terminal on open, so `O_NOCTTY` is 0 there.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const PROBE_FLAGS: c_int = 0o4000 | 0o400;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const PROBE_FLAGS: c_int = 0x4;
+
+        /// The parent directory is opened once and both the check and the unlink
+        /// go through it, so renaming any ancestor afterwards changes nothing.
+        /// The entry itself can still be swapped inside that directory between
+        /// the two, but only by someone who may write the directory and could
+        /// remove the entry anyway; unlinking a name never reaches a file through
+        /// another directory.
+        pub fn remove_if(
+            path: &Path,
+            expected: FileId,
+            between: impl FnOnce(),
+        ) -> io::Result<Removal> {
+            let Some(name) = path.file_name() else {
+                return Ok(Removal::Changed);
+            };
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty());
+            let parent = parent.unwrap_or(Path::new("."));
+            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            let dir = match open_dir(parent) {
+                Ok(dir) => dir,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Removal::Changed),
+                Err(err) => return Err(err),
+            };
+            // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated; no
+            // `O_CREAT`, so no mode argument is read.
+            let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), PROBE_FLAGS) };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(Removal::Changed);
+                }
+                return Err(err);
+            }
+            // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
+            let entry = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            if of(&entry.metadata()?) != expected {
                 return Ok(Removal::Changed);
             }
-            return Err(err);
+            drop(entry);
+            between();
+            // SAFETY: as for `openat`.
+            if unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Removal::Removed)
         }
-        // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
-        let entry = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        if of(&entry.metadata()?) != expected {
-            return Ok(Removal::Changed);
-        }
-        drop(entry);
-        between();
-        // SAFETY: as for `openat`.
-        if unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Removal::Removed)
     }
 
     pub fn of_path(path: &Path) -> Option<FileId> {

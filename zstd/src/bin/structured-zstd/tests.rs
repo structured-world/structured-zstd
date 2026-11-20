@@ -7083,6 +7083,53 @@ fn rm_removes_a_source_in_a_directory_without_read_permission() {
     assert!(!source.exists());
 }
 
+/// A path that names no file any more (no final name, a missing directory, a
+/// missing entry) is reported as changed, and nothing is removed.
+#[cfg(unix)]
+#[test]
+fn rm_reports_a_path_naming_nothing_as_changed() {
+    let scratch = Scratch::new("rmgone");
+    let source = scratch.file("data.txt", b"payload");
+    let processed = identity::of_path(&source).unwrap();
+    for gone in [
+        Path::new("..").to_path_buf(),
+        scratch.path().join("missing-dir").join("data.txt"),
+        scratch.path().join("missing.txt"),
+    ] {
+        assert_eq!(
+            identity::remove_if(&gone, processed).unwrap(),
+            identity::Removal::Changed,
+            "{}",
+            gone.display()
+        );
+    }
+    assert!(source.exists());
+}
+
+/// A path that runs through a regular file, or an entry the system refuses
+/// to unlink (a directory, refused even to root), is an error rather than a
+/// silent keep: the caller reports the failed removal.
+#[cfg(unix)]
+#[test]
+fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
+    let scratch = Scratch::new("rmerr");
+    let file = scratch.file("plain.txt", b"payload");
+    let processed = identity::of_path(&file).unwrap();
+    for through_file in [file.join("x"), file.join("sub").join("x")] {
+        assert!(
+            identity::remove_if(&through_file, processed).is_err(),
+            "{}",
+            through_file.display()
+        );
+    }
+
+    let dir = scratch.path().join("dir");
+    fs::create_dir(&dir).unwrap();
+    let dir_id = identity::of_path(&dir).unwrap();
+    assert!(identity::remove_if(&dir, dir_id).is_err());
+    assert!(dir.is_dir(), "a directory is not unlinked as a file");
+}
+
 /// Without an identity for the processed file nothing confirms the path still
 /// names it, so `--rm` leaves the file in place rather than guess.
 #[test]
