@@ -589,36 +589,33 @@ pub(crate) fn compress_block<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     output: &mut Vec<u8>,
 ) -> BlockTables {
-    let mut scratch = core::mem::take(&mut state.block_scratch);
+    // Only the two buffers a block fills are taken out while `state` is lent
+    // whole: they move as a few words, where taking the whole scratch moved
+    // its 320 bytes out and back through three `memcpy` calls a block.
+    let mut parts = core::mem::take(&mut state.block_scratch.parts);
     let tables = if state.literal_compression_disabled {
         // Raw literals go to the output as they are gathered: the section is
         // the runs behind a header, so staging them in the literals buffer
         // first would copy every literal byte twice.
-        let tail = collect_block_sequences::<M, K>(state, &mut scratch.parts);
+        let tail = collect_block_sequences::<M, K>(state, &mut parts);
         write_raw_literals_from_runs::<K>(
             state.matcher.get_last_space(),
-            &scratch.parts.sequences,
+            &parts.sequences,
             tail,
             output,
         );
         let mut writer = BitWriter::from(output);
-        let fse =
-            encode_sequences_section::<M, K>(state, &mut scratch.parts.sequences, &mut writer);
+        let fse = encode_sequences_section::<M, K>(state, &mut parts.sequences, &mut writer);
         writer.flush();
         BlockTables {
             fse,
             huff: HuffOutcome::Keep,
         }
     } else {
-        collect_block_parts::<M, K>(state, &mut scratch.parts);
-        encode_block_parts::<M, K>(
-            state,
-            &scratch.parts.literals,
-            &mut scratch.parts.sequences,
-            output,
-        )
+        collect_block_parts::<M, K>(state, &mut parts);
+        encode_block_parts::<M, K>(state, &parts.literals, &mut parts.sequences, output)
     };
-    state.block_scratch = scratch;
+    state.block_scratch.parts = parts;
     tables
 }
 
