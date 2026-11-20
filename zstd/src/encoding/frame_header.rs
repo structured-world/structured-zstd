@@ -88,23 +88,23 @@ impl FrameHeader {
             header[len..len + 8].copy_from_slice(&stored.to_le_bytes());
             len += field_size;
         }
+        // One path: room is made first, then a copy of constant width, a pair
+        // of loads and stores, of which only `len` bytes are kept. With an
+        // `extend_from_slice` fallback beside it, the compiler merged the two
+        // copies into one `memcpy` call taking either length, so every header
+        // paid the call.
+        output.reserve(MAX_FRAME_HEADER_LEN);
         let start = output.len();
-        if output.capacity() - start >= MAX_FRAME_HEADER_LEN {
-            // A copy of constant width, a pair of loads and stores, into the
-            // room the frame's caller reserved; only `len` bytes are kept.
-            // SAFETY: the buffer has `MAX_FRAME_HEADER_LEN` bytes of spare
-            // capacity past `start`, and `len <= MAX_FRAME_HEADER_LEN` bytes of
-            // them are initialized by the copy before the length covers them.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    header.as_ptr(),
-                    output.as_mut_ptr().add(start),
-                    MAX_FRAME_HEADER_LEN,
-                );
-                output.set_len(start + len);
-            }
-        } else {
-            output.extend_from_slice(&header[..len]);
+        // SAFETY: `reserve` leaves `MAX_FRAME_HEADER_LEN` bytes of spare
+        // capacity past `start`, and `len <= MAX_FRAME_HEADER_LEN` bytes of
+        // them are initialized by the copy before the length covers them.
+        unsafe {
+            output
+                .as_mut_ptr()
+                .add(start)
+                .cast::<[u8; MAX_FRAME_HEADER_LEN]>()
+                .write_unaligned(header);
+            output.set_len(start + len);
         }
     }
 
