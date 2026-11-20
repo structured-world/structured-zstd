@@ -7004,15 +7004,28 @@ fn open_source(path: &Path) -> (File, identity::Source) {
     (opened, source)
 }
 
-/// A symbolic link to a file at `link`; false where the system refuses to
-/// make one (Windows without the privilege), and the caller's test then
-/// does not apply.
-fn file_link(target: &Path, link: &Path) -> bool {
+/// A symbolic link to a file at `link`. Windows makes one only with the
+/// privilege (an administrator, or developer mode), which the CI runners
+/// have; a refusal fails the test rather than skipping the path it covers.
+fn file_link(target: &Path, link: &Path) {
     #[cfg(unix)]
-    let made = std::os::unix::fs::symlink(target, link);
+    std::os::unix::fs::symlink(target, link).unwrap();
     #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_file(target, link);
-    made.is_ok()
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
+/// Where the platform cannot read a link's own identity through the
+/// directory it removes from, `remove_if` removes no source named through a
+/// link; returns whether the caller's test applies.
+fn link_removal_is_bound(path: &Path, source: identity::Source) -> bool {
+    if identity::BINDS_LINK_REMOVAL {
+        return true;
+    }
+    assert_eq!(
+        identity::remove_if(path, source.id, source.link).unwrap(),
+        identity::Removal::Unconfirmed
+    );
+    false
 }
 
 /// Where the platform cannot bind the check to the removal, `remove_if`
@@ -7224,12 +7237,10 @@ fn rm_removes_a_linked_source_by_its_link() {
     let scratch = Scratch::new("rmlinked");
     let target = scratch.file("target.txt", b"payload");
     let link = scratch.path().join("link.txt");
-    if !file_link(&target, &link) {
-        return;
-    }
+    file_link(&target, &link);
     let (opened, source) = open_source(&link);
     assert!(source.link.is_some(), "the source was named through a link");
-    if !removal_is_bound(&link, source.id) {
+    if !link_removal_is_bound(&link, source) {
         return;
     }
 
@@ -7254,9 +7265,7 @@ fn rm_keeps_a_link_put_at_a_plain_source_once_it_is_open() {
     let opened = File::open(&source).unwrap();
     let moved = scratch.path().join("moved.txt");
     fs::rename(&source, &moved).unwrap();
-    if !file_link(&moved, &source) {
-        return;
-    }
+    file_link(&moved, &source);
     let processed = identity::Source::opened(entry, &opened, &opened.metadata().unwrap()).unwrap();
     assert_eq!(processed.link, None, "the path was the file itself");
     if !removal_is_bound(&source, processed.id) {
@@ -7280,11 +7289,9 @@ fn rm_keeps_the_target_renamed_over_a_linked_source() {
     let scratch = Scratch::new("rmlinktarget");
     let target = scratch.file("target.txt", b"payload");
     let link = scratch.path().join("link.txt");
-    if !file_link(&target, &link) {
-        return;
-    }
+    file_link(&target, &link);
     let (opened, source) = open_source(&link);
-    if !removal_is_bound(&link, source.id) {
+    if !link_removal_is_bound(&link, source) {
         return;
     }
     fs::rename(&target, &link).unwrap();
@@ -7305,15 +7312,13 @@ fn rm_keeps_another_link_put_in_place_of_a_linked_source() {
     let scratch = Scratch::new("rmlinkother");
     let target = scratch.file("target.txt", b"payload");
     let link = scratch.path().join("link.txt");
-    if !file_link(&target, &link) {
-        return;
-    }
+    file_link(&target, &link);
     let (opened, source) = open_source(&link);
-    if !removal_is_bound(&link, source.id) {
+    if !link_removal_is_bound(&link, source) {
         return;
     }
     fs::rename(&link, scratch.path().join("held.txt")).unwrap();
-    assert!(file_link(&target, &link));
+    file_link(&target, &link);
 
     assert_eq!(
         identity::remove_if(&link, source.id, source.link).unwrap(),
@@ -7321,6 +7326,43 @@ fn rm_keeps_another_link_put_in_place_of_a_linked_source() {
     );
     drop(opened);
     assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+}
+
+/// A source named through a link, whose directory is renamed away once the
+/// removal holds it, a new directory put at its path with the link moved
+/// into it, and another link to the same file left in the directory held:
+/// that link is not the one processed, so it stays. Reading the link by its
+/// path finds the original in the new directory and removes the other one.
+#[cfg(unix)]
+#[test]
+fn rm_keeps_another_link_left_in_the_directory_it_holds() {
+    let scratch = Scratch::new("rmlinkparent");
+    let target = scratch.file("target.txt", b"payload");
+    let work = scratch.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let link = work.join("link.txt");
+    file_link(&target, &link);
+    let (opened, source) = open_source(&link);
+    if !link_removal_is_bound(&link, source) {
+        return;
+    }
+    let held = scratch.path().join("held");
+
+    let removal = identity::remove_if_after_open(&link, source.id, source.link, || {
+        fs::rename(&work, &held).unwrap();
+        fs::create_dir(&work).unwrap();
+        fs::rename(held.join("link.txt"), &link).unwrap();
+        file_link(&target, &held.join("link.txt"));
+    })
+    .unwrap();
+    drop(opened);
+    assert_eq!(removal, identity::Removal::Changed);
+    assert!(
+        fs::symlink_metadata(held.join("link.txt"))
+            .unwrap()
+            .is_symlink(),
+        "the other link stays"
+    );
 }
 
 /// A source of 2 GiB or more is removed like any other: on 32-bit Linux the
