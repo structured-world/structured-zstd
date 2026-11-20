@@ -2,6 +2,7 @@
 //! so two names for one file (another spelling, a symlink, a hard link, a
 //! redirected stdout) compare equal.
 
+use std::fs::{self, File};
 use std::path::Path;
 
 /// A file as the filesystem identifies it: device and inode on Unix, volume
@@ -13,6 +14,12 @@ pub struct FileId(u64, u128);
 /// the platform reads no identity.
 pub fn of_path(path: &Path) -> Option<FileId> {
     sys::of_path(path)
+}
+
+/// The file `file` is open on, whatever its path names by now. `metadata` is
+/// what the open file reported; Unix reads the identity from it.
+pub fn of_open(file: &File, metadata: &fs::Metadata) -> Option<FileId> {
+    sys::of_open(file, metadata)
 }
 
 /// The file standard output writes to. A pipe or a console is one too, so it
@@ -47,6 +54,10 @@ mod sys {
         fs::metadata(path).ok().as_ref().map(of)
     }
 
+    pub fn of_open(_: &File, metadata: &fs::Metadata) -> Option<FileId> {
+        Some(of(metadata))
+    }
+
     fn of_stream(stream: impl AsFd) -> Option<FileId> {
         let fd = stream.as_fd().try_clone_to_owned().ok()?;
         File::from(fd).metadata().ok().as_ref().map(of)
@@ -69,7 +80,7 @@ mod sys {
 mod sys {
     use super::FileId;
     use core::ffi::c_void;
-    use std::fs::OpenOptions;
+    use std::fs::{self, File, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, RawHandle};
     use std::path::Path;
@@ -169,6 +180,10 @@ mod sys {
         of_handle(file.as_raw_handle())
     }
 
+    pub fn of_open(file: &File, _: &fs::Metadata) -> Option<FileId> {
+        of_handle(file.as_raw_handle())
+    }
+
     pub fn of_stdout() -> Option<FileId> {
         of_handle(std::io::stdout().as_raw_handle())
     }
@@ -185,9 +200,14 @@ mod sys {
 #[cfg(not(any(unix, windows)))]
 mod sys {
     use super::FileId;
+    use std::fs::{self, File};
     use std::path::Path;
 
     pub fn of_path(_: &Path) -> Option<FileId> {
+        None
+    }
+
+    pub fn of_open(_: &File, _: &fs::Metadata) -> Option<FileId> {
         None
     }
 

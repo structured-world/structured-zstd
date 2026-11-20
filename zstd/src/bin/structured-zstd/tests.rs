@@ -6949,7 +6949,8 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
 
     let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
-    let result = remove_source_if_requested(&opts, &path, Placement::File);
+    let result =
+        remove_source_if_requested(&opts, &path, identity::of_path(&path), Placement::File);
 
     let survived = path.exists();
     let _ = fs::remove_file(&path);
@@ -6981,6 +6982,59 @@ fn a_source_written_only_to_a_device_is_not_removed() {
     opts.output = Some(archive.clone());
     assert_eq!(run(opts).unwrap(), 0);
     assert!(archive.exists() && !source.exists());
+}
+
+/// `--rm` resolves the source's path again to remove it. A parent directory
+/// renamed and replaced by a link meanwhile makes that path name another file,
+/// which must survive: only the file that was processed is removed. Removing
+/// by path alone deletes the unrelated file and keeps the processed one.
+#[cfg(unix)]
+#[test]
+fn rm_keeps_a_file_the_source_path_names_after_processing() {
+    let scratch = Scratch::new("rmrace");
+    let work = scratch.path().join("work");
+    let protected = scratch.path().join("protected");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(&protected).unwrap();
+    let source = work.join("victim");
+    fs::write(&source, b"processed content").unwrap();
+    fs::write(protected.join("victim"), b"protected content").unwrap();
+
+    let opened = File::open(&source).unwrap();
+    let processed = identity::of_open(&opened, &opened.metadata().unwrap());
+    assert!(processed.is_some(), "Unix reads an identity");
+    let held = scratch.path().join("held");
+    fs::rename(&work, &held).unwrap();
+    std::os::unix::fs::symlink(&protected, &work).unwrap();
+
+    let opts = parse(&["--rm", "-q", "x"]).unwrap();
+    remove_source_if_requested(&opts, &source, processed, Placement::File).unwrap();
+    assert_eq!(
+        fs::read(protected.join("victim")).unwrap(),
+        b"protected content",
+        "the file the path names now is not the one processed"
+    );
+    assert!(
+        held.join("victim").exists(),
+        "the processed file was not reached by that path"
+    );
+
+    // The path back on the processed file: removed as before.
+    fs::remove_file(&work).unwrap();
+    fs::rename(&held, &work).unwrap();
+    remove_source_if_requested(&opts, &source, processed, Placement::File).unwrap();
+    assert!(!source.exists(), "the processed file is removed");
+}
+
+/// Without an identity for the processed file nothing confirms the path still
+/// names it, so `--rm` leaves the file in place rather than guess.
+#[test]
+fn rm_keeps_the_source_when_its_identity_is_unknown() {
+    let scratch = Scratch::new("rmnoid");
+    let source = scratch.file("data.txt", b"payload");
+    let opts = parse(&["--rm", "-q", "x"]).unwrap();
+    remove_source_if_requested(&opts, &source, None, Placement::File).unwrap();
+    assert!(source.exists(), "an unconfirmed source is not removed");
 }
 
 /// `-c` and `-o` name competing destinations, so the later one on the command

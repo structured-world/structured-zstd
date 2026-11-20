@@ -3399,6 +3399,10 @@ fn process_concatenated(
                         }
                     }
                 };
+                let processed_id = source
+                    .as_ref()
+                    .zip(metadata.as_ref())
+                    .and_then(|(file, metadata)| identity::of_open(file, metadata));
                 let name = if source.is_some() {
                     input.display().to_string()
                 } else {
@@ -3426,7 +3430,7 @@ fn process_concatenated(
                             &processed,
                         );
                         if remove_source && input != Path::new("-") {
-                            remove_source_if_requested(opts, input, placement)?;
+                            remove_source_if_requested(opts, input, processed_id, placement)?;
                         }
                         tally.record(Outcome::Done(processed));
                     }
@@ -5718,9 +5722,15 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
 }
 
 /// Remove the source file after a successful (de)compression when `--rm` is set
-/// (and `-k` was not) and a regular file now holds the output (`placement`).
+/// (and `-k` was not), a regular file now holds the output (`placement`), and
+/// `input` still names `processed`, the file that was opened and read.
 /// A no-op otherwise.
-fn remove_source_if_requested(opts: &Options, input: &Path, placement: Placement) -> Result<()> {
+fn remove_source_if_requested(
+    opts: &Options,
+    input: &Path,
+    processed: Option<identity::FileId>,
+    placement: Placement,
+) -> Result<()> {
     // Never when the output went to stdout: that may have been a pipe whose
     // reader is gone, a terminal, or anything else we cannot read back, so
     // there is no saved copy to justify deleting the original. Upstream keeps
@@ -5736,6 +5746,29 @@ fn remove_source_if_requested(opts: &Options, input: &Path, placement: Placement
             opts.verbosity,
             3,
             "Note: {} is not removed: its output is not a regular file",
+            input.display()
+        );
+        return Ok(());
+    }
+    // The path is resolved again to remove it, and a parent directory renamed
+    // meanwhile makes it name another file: only the file that was processed
+    // is removed, as upstream zstd (fileio.c `FIO_removeFile`) checks device
+    // and inode. Where either identity cannot be read the file stays, since
+    // nothing confirms it is the one processed.
+    let Some(processed) = processed else {
+        display!(
+            opts.verbosity,
+            1,
+            "zstd: {}: cannot confirm it is the file processed -- ignored for removal",
+            input.display()
+        );
+        return Ok(());
+    };
+    if identity::of_path(input) != Some(processed) {
+        display!(
+            opts.verbosity,
+            1,
+            "zstd: {} changed while processing -- ignored for removal",
             input.display()
         );
         return Ok(());
@@ -6240,6 +6273,7 @@ fn process_file(
     let Some((source, metadata)) = open_input(opts, input)? else {
         return Ok(Outcome::Skipped);
     };
+    let processed_id = identity::of_open(&source, &metadata);
     let name = input.display().to_string();
 
     // Test mode: decompress into the void, report what was there.
@@ -6267,7 +6301,7 @@ fn process_file(
         &output.display().to_string(),
         &processed,
     );
-    remove_source_if_requested(opts, input, placement)?;
+    remove_source_if_requested(opts, input, processed_id, placement)?;
     Ok(Outcome::Done(processed))
 }
 
