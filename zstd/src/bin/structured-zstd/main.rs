@@ -3387,11 +3387,13 @@ fn process_concatenated(
             // the output takes the source's permissions; several inputs share
             // an output that takes none of theirs.
             if let [input] = inputs[..] {
-                let (source, metadata) = if input == Path::new("-") {
-                    (None, None)
+                let (source, metadata, processed_id) = if input == Path::new("-") {
+                    (None, None, None)
                 } else {
                     match open_input(opts, input) {
-                        Ok(Some((source, metadata))) => (Some(source), Some(metadata)),
+                        Ok(Some((source, metadata, processed))) => {
+                            (Some(source), Some(metadata), processed)
+                        }
                         Ok(None) => return Ok(0),
                         Err(err) => {
                             display!(opts.verbosity, 1, "zstd: {err}");
@@ -3399,12 +3401,6 @@ fn process_concatenated(
                         }
                     }
                 };
-                // Read only when it can be used: on Windows it costs a query.
-                let processed_id = source
-                    .as_ref()
-                    .zip(metadata.as_ref())
-                    .filter(|_| removes_sources(opts))
-                    .and_then(|(file, metadata)| identity::Source::opened(input, file, metadata));
                 let name = if source.is_some() {
                     input.display().to_string()
                 } else {
@@ -3727,6 +3723,9 @@ impl Tally {
             Outcome::Skipped => {}
             Outcome::Refused => self.failed += 1,
             Outcome::SourceKept(processed) => {
+                // Its output is written, so it is one of the files the
+                // summary counts, as the reference counts it before removing.
+                self.processed += 1;
                 self.failed += 1;
                 self.read += processed.read;
                 self.written += processed.written;
@@ -5799,10 +5798,13 @@ fn remove_source_if_requested(
     // path cannot change between them. Where no identity can be read the file
     // stays, since nothing confirms it is the one processed.
     let removal = match processed {
-        Some(processed) => identity::remove_if(input, processed.id, processed.through_link)
+        Some(processed) => identity::remove_if(input, processed.id, processed.link)
             .wrap_err("failed to remove source file after success")?,
         None => identity::Removal::Unconfirmed,
     };
+    // A source kept because it cannot be confirmed is a safe refusal, not a
+    // failure: the exit status stays 0, as upstream zstd's `FIO_removeFile`
+    // (fileio.c) returns 0 "on success or safe refusal".
     match removal {
         identity::Removal::Removed => {}
         identity::Removal::Changed => display!(
@@ -5907,8 +5909,12 @@ fn is_block_device_type(kind: &fs::FileType) -> bool {
 /// way the reference command refuses them ("-- ignored"); `-f` admits block
 /// devices. The kind and length that matter are those of the OPEN file: a
 /// path is only a name, and can be made to name something else between the
-/// look and the open.
-fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata)>> {
+/// look and the open. Under `--rm` it also returns the file opened as its
+/// removal needs it.
+fn open_input(
+    opts: &Options,
+    input: &Path,
+) -> Result<Option<(File, fs::Metadata, Option<identity::Source>)>> {
     // The reference's lines, trailing space included (`fileio.c:555-564`,
     // 2040).
     let named = fs::metadata(input).map_err(|err| {
@@ -5951,6 +5957,9 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
         );
         return Ok(None);
     }
+    // Read only when it can be used, and before the open: `Source::opened`
+    // tells from it whether the open went through a link.
+    let entry = removes_sources(opts).then(|| identity::of_entry(input));
     let source = File::open(input).wrap_err_with(|| input.display().to_string())?;
     let metadata = source
         .metadata()
@@ -5958,7 +5967,8 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
     if metadata.is_dir() || !admissible(&metadata.file_type()) {
         bail!("{} is not a regular file -- ignored ", input.display());
     }
-    Ok(Some((source, metadata)))
+    let processed = entry.and_then(|entry| identity::Source::opened(entry, &source, &metadata));
+    Ok(Some((source, metadata, processed)))
 }
 
 /// The system's description of `err`, as `strerror` gives it: without the
@@ -6091,7 +6101,7 @@ fn stream_input_to<W: Write>(
         )
     } else {
         match open_input(opts, input) {
-            Ok(Some((source, metadata))) => (
+            Ok(Some((source, metadata, _))) => (
                 input.display().to_string(),
                 stream_opened(opts, codecs, &source, &metadata, &mut sink),
             ),
@@ -6317,13 +6327,9 @@ fn process_file(
     codecs: &mut Codecs,
     total: usize,
 ) -> Result<Outcome> {
-    let Some((source, metadata)) = open_input(opts, input)? else {
+    let Some((source, metadata, processed_id)) = open_input(opts, input)? else {
         return Ok(Outcome::Skipped);
     };
-    // Read only when it can be used: on Windows it costs a query per file.
-    let processed_id = removes_sources(opts)
-        .then(|| identity::Source::opened(input, &source, &metadata))
-        .flatten();
     let name = input.display().to_string();
 
     // Test mode: decompress into the void, report what was there.

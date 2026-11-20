@@ -6992,8 +6992,27 @@ fn a_source_written_only_to_a_device_is_not_removed() {
 fn source_at(path: &Path) -> Option<identity::Source> {
     Some(identity::Source {
         id: identity::of_path(path)?,
-        through_link: false,
+        link: None,
     })
+}
+
+/// `path` opened as `--rm` records a source: its entry read first.
+fn open_source(path: &Path) -> (File, identity::Source) {
+    let entry = identity::of_entry(path);
+    let opened = File::open(path).unwrap();
+    let source = identity::Source::opened(entry, &opened, &opened.metadata().unwrap()).unwrap();
+    (opened, source)
+}
+
+/// A symbolic link to a file at `link`; false where the system refuses to
+/// make one (Windows without the privilege), and the caller's test then
+/// does not apply.
+fn file_link(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    made.is_ok()
 }
 
 /// Where the platform cannot bind the check to the removal, `remove_if`
@@ -7004,7 +7023,7 @@ fn removal_is_bound(path: &Path, id: identity::FileId) -> bool {
         return true;
     }
     assert_eq!(
-        identity::remove_if(path, id, false).unwrap(),
+        identity::remove_if(path, id, None).unwrap(),
         identity::Removal::Unconfirmed
     );
     false
@@ -7026,9 +7045,8 @@ fn rm_keeps_a_file_the_source_path_names_after_processing() {
     fs::write(&source, b"processed content").unwrap();
     fs::write(protected.join("victim"), b"protected content").unwrap();
 
-    let opened = File::open(&source).unwrap();
-    let processed = identity::Source::opened(&source, &opened, &opened.metadata().unwrap());
-    assert!(processed.is_some(), "Unix reads an identity");
+    let (_opened, processed) = open_source(&source);
+    let processed = Some(processed);
     let held = scratch.path().join("held");
     fs::rename(&work, &held).unwrap();
     std::os::unix::fs::symlink(&protected, &work).unwrap();
@@ -7114,7 +7132,7 @@ fn rm_removes_a_source_in_a_directory_without_read_permission() {
     }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
 
-    let removal = identity::remove_if(&source, processed, false);
+    let removal = identity::remove_if(&source, processed, None);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(removal.unwrap(), identity::Removal::Removed);
     assert!(!source.exists());
@@ -7137,7 +7155,7 @@ fn rm_reports_a_path_naming_nothing_as_changed() {
         scratch.path().join("missing.txt"),
     ] {
         assert_eq!(
-            identity::remove_if(&gone, processed, false).unwrap(),
+            identity::remove_if(&gone, processed, None).unwrap(),
             identity::Removal::Changed,
             "{}",
             gone.display()
@@ -7160,7 +7178,7 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     }
     for through_file in [file.join("x"), file.join("sub").join("x")] {
         assert!(
-            identity::remove_if(&through_file, processed, false).is_err(),
+            identity::remove_if(&through_file, processed, None).is_err(),
             "{}",
             through_file.display()
         );
@@ -7169,7 +7187,7 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     let dir = scratch.path().join("dir");
     fs::create_dir(&dir).unwrap();
     let dir_id = identity::of_path(&dir).unwrap();
-    assert!(identity::remove_if(&dir, dir_id, false).is_err());
+    assert!(identity::remove_if(&dir, dir_id, None).is_err());
     assert!(dir.is_dir(), "a directory is not unlinked as a file");
 }
 
@@ -7191,7 +7209,7 @@ fn rm_keeps_a_link_put_in_place_of_the_source() {
     std::os::unix::fs::symlink(&moved, &source).unwrap();
 
     assert_eq!(
-        identity::remove_if(&source, processed, false).unwrap(),
+        identity::remove_if(&source, processed, None).unwrap(),
         identity::Removal::Changed
     );
     assert!(fs::symlink_metadata(&source).unwrap().is_symlink());
@@ -7201,26 +7219,148 @@ fn rm_keeps_a_link_put_in_place_of_the_source() {
 /// A source named through a link (`-f` follows it) is checked by the file it
 /// points at, and the link is what goes, as removing a path removes the name:
 /// the file it pointed at stays.
-#[cfg(unix)]
 #[test]
 fn rm_removes_a_linked_source_by_its_link() {
     let scratch = Scratch::new("rmlinked");
     let target = scratch.file("target.txt", b"payload");
     let link = scratch.path().join("link.txt");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let opened = File::open(&link).unwrap();
-    let source = identity::Source::opened(&link, &opened, &opened.metadata().unwrap()).unwrap();
-    assert!(source.through_link, "the source was named through a link");
+    if !file_link(&target, &link) {
+        return;
+    }
+    let (opened, source) = open_source(&link);
+    assert!(source.link.is_some(), "the source was named through a link");
     if !removal_is_bound(&link, source.id) {
         return;
     }
 
     assert_eq!(
-        identity::remove_if(&link, source.id, source.through_link).unwrap(),
+        identity::remove_if(&link, source.id, source.link).unwrap(),
         identity::Removal::Removed
     );
+    drop(opened);
     assert!(fs::symlink_metadata(&link).is_err(), "the link is removed");
     assert!(target.exists(), "the file it named stays");
+}
+
+/// A plain source moved away once it is open, and a link to it put at its
+/// name: the link was not what the source was named through, so it stays,
+/// and so does the file. Telling a link from the path after the open takes
+/// that link for the source's own and removes it.
+#[test]
+fn rm_keeps_a_link_put_at_a_plain_source_once_it_is_open() {
+    let scratch = Scratch::new("rmlinklate");
+    let source = scratch.file("data.txt", b"payload");
+    let entry = identity::of_entry(&source);
+    let opened = File::open(&source).unwrap();
+    let moved = scratch.path().join("moved.txt");
+    fs::rename(&source, &moved).unwrap();
+    if !file_link(&moved, &source) {
+        return;
+    }
+    let processed = identity::Source::opened(entry, &opened, &opened.metadata().unwrap()).unwrap();
+    assert_eq!(processed.link, None, "the path was the file itself");
+    if !removal_is_bound(&source, processed.id) {
+        return;
+    }
+
+    assert_eq!(
+        identity::remove_if(&source, processed.id, processed.link).unwrap(),
+        identity::Removal::Changed
+    );
+    assert!(fs::symlink_metadata(&source).unwrap().is_symlink());
+    assert!(moved.exists());
+}
+
+/// A source named through a link, whose target is then renamed over the
+/// link: the entry is now the file the link pointed at, not the link, so it
+/// stays. Checking only what the entry leads to finds the file processed and
+/// removes the target the link was meant to keep.
+#[test]
+fn rm_keeps_the_target_renamed_over_a_linked_source() {
+    let scratch = Scratch::new("rmlinktarget");
+    let target = scratch.file("target.txt", b"payload");
+    let link = scratch.path().join("link.txt");
+    if !file_link(&target, &link) {
+        return;
+    }
+    let (opened, source) = open_source(&link);
+    if !removal_is_bound(&link, source.id) {
+        return;
+    }
+    fs::rename(&target, &link).unwrap();
+
+    assert_eq!(
+        identity::remove_if(&link, source.id, source.link).unwrap(),
+        identity::Removal::Changed
+    );
+    drop(opened);
+    assert_eq!(fs::read(&link).unwrap(), b"payload", "the target stays");
+}
+
+/// A source named through a link, and that link replaced by another one to
+/// the same file: the entry is not the link the source was read through, so
+/// it stays. Checking by what the path leads to removes the new link.
+#[test]
+fn rm_keeps_another_link_put_in_place_of_a_linked_source() {
+    let scratch = Scratch::new("rmlinkother");
+    let target = scratch.file("target.txt", b"payload");
+    let link = scratch.path().join("link.txt");
+    if !file_link(&target, &link) {
+        return;
+    }
+    let (opened, source) = open_source(&link);
+    if !removal_is_bound(&link, source.id) {
+        return;
+    }
+    fs::rename(&link, scratch.path().join("held.txt")).unwrap();
+    assert!(file_link(&target, &link));
+
+    assert_eq!(
+        identity::remove_if(&link, source.id, source.link).unwrap(),
+        identity::Removal::Changed
+    );
+    drop(opened);
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+}
+
+/// A source of 2 GiB or more is removed like any other: on 32-bit Linux the
+/// probe that reads the entry's identity needs `O_LARGEFILE`, or the open
+/// fails with `EOVERFLOW` and the source is kept with an error. The file is
+/// sparse, so it takes no space.
+#[cfg(unix)]
+#[test]
+fn rm_removes_a_source_of_more_than_2_gib() {
+    let scratch = Scratch::new("rmlarge");
+    let source = scratch.path().join("large.bin");
+    File::create(&source).unwrap().set_len(3 << 30).unwrap();
+    let (opened, processed) = open_source(&source);
+    if !removal_is_bound(&source, processed.id) {
+        return;
+    }
+
+    assert_eq!(
+        identity::remove_if(&source, processed.id, processed.link).unwrap(),
+        identity::Removal::Removed
+    );
+    drop(opened);
+    assert!(!source.exists());
+}
+
+/// An input whose output was placed though its source could not be removed
+/// is one more file the run compressed: the closing summary counts it with
+/// the bytes it already includes, and the run still fails for it.
+#[test]
+fn a_kept_source_counts_as_processed_and_failed() {
+    let mut tally = Tally::default();
+    tally.record(Outcome::SourceKept(Processed {
+        read: 10,
+        written: 4,
+        passed_through: false,
+    }));
+    assert_eq!(
+        (tally.processed, tally.failed, tally.read, tally.written),
+        (1, 1, 10, 4)
+    );
 }
 
 /// A read-only source is removed as `fs::remove_file` removes it: on Windows
@@ -7239,7 +7379,7 @@ fn rm_removes_a_read_only_source() {
     fs::set_permissions(&source, permissions).unwrap();
 
     assert_eq!(
-        identity::remove_if(&source, processed, false).unwrap(),
+        identity::remove_if(&source, processed, None).unwrap(),
         identity::Removal::Removed
     );
     assert!(!source.exists());
