@@ -6949,8 +6949,7 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
 
     let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
-    let result =
-        remove_source_if_requested(&opts, &path, identity::of_path(&path), Placement::File);
+    let result = remove_source_if_requested(&opts, &path, source_at(&path), Placement::File);
 
     let survived = path.exists();
     let _ = fs::remove_file(&path);
@@ -6981,7 +6980,34 @@ fn a_source_written_only_to_a_device_is_not_removed() {
     opts.inputs = vec![source.clone()];
     opts.output = Some(archive.clone());
     assert_eq!(run(opts).unwrap(), 0);
-    assert!(archive.exists() && !source.exists());
+    assert!(archive.exists());
+    assert_eq!(
+        !source.exists(),
+        identity::BINDS_REMOVAL,
+        "removed exactly where the removal can be bound to the file read"
+    );
+}
+
+/// The processed file `path` names, read as `--rm` records it.
+fn source_at(path: &Path) -> Option<identity::Source> {
+    Some(identity::Source {
+        id: identity::of_path(path)?,
+        through_link: false,
+    })
+}
+
+/// Where the platform cannot bind the check to the removal, `remove_if`
+/// removes nothing whatever the path names; returns whether the caller's
+/// test applies.
+fn removal_is_bound(path: &Path, id: identity::FileId) -> bool {
+    if identity::BINDS_REMOVAL {
+        return true;
+    }
+    assert_eq!(
+        identity::remove_if(path, id, false).unwrap(),
+        identity::Removal::Unconfirmed
+    );
+    false
 }
 
 /// `--rm` resolves the source's path again to remove it. A parent directory
@@ -7001,7 +7027,7 @@ fn rm_keeps_a_file_the_source_path_names_after_processing() {
     fs::write(protected.join("victim"), b"protected content").unwrap();
 
     let opened = File::open(&source).unwrap();
-    let processed = identity::of_open(&opened, &opened.metadata().unwrap());
+    let processed = identity::Source::opened(&source, &opened, &opened.metadata().unwrap());
     assert!(processed.is_some(), "Unix reads an identity");
     let held = scratch.path().join("held");
     fs::rename(&work, &held).unwrap();
@@ -7023,7 +7049,11 @@ fn rm_keeps_a_file_the_source_path_names_after_processing() {
     fs::remove_file(&work).unwrap();
     fs::rename(&held, &work).unwrap();
     remove_source_if_requested(&opts, &source, processed, Placement::File).unwrap();
-    assert!(!source.exists(), "the processed file is removed");
+    assert_eq!(
+        !source.exists(),
+        identity::BINDS_REMOVAL,
+        "the processed file is removed where the removal can be bound to it"
+    );
 }
 
 /// The source's parent directory swapped for a link AFTER the identity check
@@ -7043,6 +7073,9 @@ fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
     fs::write(&source, b"processed content").unwrap();
     fs::write(protected.join("victim"), b"protected content").unwrap();
     let processed = identity::of_path(&source).unwrap();
+    if !removal_is_bound(&source, processed) {
+        return;
+    }
 
     let removal = identity::remove_if_racing(&source, processed, || {
         fs::rename(&work, &held).unwrap();
@@ -7064,8 +7097,9 @@ fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
 /// Unlinking an entry needs write and search permission on its directory, not
 /// read permission: a source in a directory its owner may write and search
 /// but not list (mode 0300) is removed as a plain unlink removes it. (Root
-/// ignores the mode, so there the test proves less.)
-#[cfg(unix)]
+/// ignores the mode, so there the test proves less.) OpenBSD and DragonFly
+/// have no search-only open, so there the directory is opened for reading.
+#[cfg(all(unix, not(any(target_os = "openbsd", target_os = "dragonfly"))))]
 #[test]
 fn rm_removes_a_source_in_a_directory_without_read_permission() {
     use std::os::unix::fs::PermissionsExt;
@@ -7075,9 +7109,12 @@ fn rm_removes_a_source_in_a_directory_without_read_permission() {
     let source = dir.join("data.txt");
     fs::write(&source, b"payload").unwrap();
     let processed = identity::of_path(&source).unwrap();
+    if !removal_is_bound(&source, processed) {
+        return;
+    }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
 
-    let removal = identity::remove_if(&source, processed);
+    let removal = identity::remove_if(&source, processed, false);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(removal.unwrap(), identity::Removal::Removed);
     assert!(!source.exists());
@@ -7091,13 +7128,16 @@ fn rm_reports_a_path_naming_nothing_as_changed() {
     let scratch = Scratch::new("rmgone");
     let source = scratch.file("data.txt", b"payload");
     let processed = identity::of_path(&source).unwrap();
+    if !removal_is_bound(&source, processed) {
+        return;
+    }
     for gone in [
         Path::new("..").to_path_buf(),
         scratch.path().join("missing-dir").join("data.txt"),
         scratch.path().join("missing.txt"),
     ] {
         assert_eq!(
-            identity::remove_if(&gone, processed).unwrap(),
+            identity::remove_if(&gone, processed, false).unwrap(),
             identity::Removal::Changed,
             "{}",
             gone.display()
@@ -7115,9 +7155,12 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     let scratch = Scratch::new("rmerr");
     let file = scratch.file("plain.txt", b"payload");
     let processed = identity::of_path(&file).unwrap();
+    if !removal_is_bound(&file, processed) {
+        return;
+    }
     for through_file in [file.join("x"), file.join("sub").join("x")] {
         assert!(
-            identity::remove_if(&through_file, processed).is_err(),
+            identity::remove_if(&through_file, processed, false).is_err(),
             "{}",
             through_file.display()
         );
@@ -7126,8 +7169,125 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     let dir = scratch.path().join("dir");
     fs::create_dir(&dir).unwrap();
     let dir_id = identity::of_path(&dir).unwrap();
-    assert!(identity::remove_if(&dir, dir_id).is_err());
+    assert!(identity::remove_if(&dir, dir_id, false).is_err());
     assert!(dir.is_dir(), "a directory is not unlinked as a file");
+}
+
+/// The source moved away and a link to it put at its old name: the entry
+/// there is a link, not the file processed, so it stays, and so does the
+/// file. Following the link matches the file's identity and unlinks the link
+/// instead of the entry that was checked.
+#[cfg(unix)]
+#[test]
+fn rm_keeps_a_link_put_in_place_of_the_source() {
+    let scratch = Scratch::new("rmlinkswap");
+    let source = scratch.file("data.txt", b"payload");
+    let processed = identity::of_path(&source).unwrap();
+    if !removal_is_bound(&source, processed) {
+        return;
+    }
+    let moved = scratch.path().join("moved.txt");
+    fs::rename(&source, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &source).unwrap();
+
+    assert_eq!(
+        identity::remove_if(&source, processed, false).unwrap(),
+        identity::Removal::Changed
+    );
+    assert!(fs::symlink_metadata(&source).unwrap().is_symlink());
+    assert!(moved.exists());
+}
+
+/// A source named through a link (`-f` follows it) is checked by the file it
+/// points at, and the link is what goes, as removing a path removes the name:
+/// the file it pointed at stays.
+#[cfg(unix)]
+#[test]
+fn rm_removes_a_linked_source_by_its_link() {
+    let scratch = Scratch::new("rmlinked");
+    let target = scratch.file("target.txt", b"payload");
+    let link = scratch.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let opened = File::open(&link).unwrap();
+    let source = identity::Source::opened(&link, &opened, &opened.metadata().unwrap()).unwrap();
+    assert!(source.through_link, "the source was named through a link");
+    if !removal_is_bound(&link, source.id) {
+        return;
+    }
+
+    assert_eq!(
+        identity::remove_if(&link, source.id, source.through_link).unwrap(),
+        identity::Removal::Removed
+    );
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is removed");
+    assert!(target.exists(), "the file it named stays");
+}
+
+/// A read-only source is removed as `fs::remove_file` removes it: on Windows
+/// that takes the extended disposition, which ignores the read-only
+/// attribute.
+#[test]
+fn rm_removes_a_read_only_source() {
+    let scratch = Scratch::new("rmreadonly");
+    let source = scratch.file("data.txt", b"payload");
+    let processed = identity::of_path(&source).unwrap();
+    if !removal_is_bound(&source, processed) {
+        return;
+    }
+    let mut permissions = fs::metadata(&source).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&source, permissions).unwrap();
+
+    assert_eq!(
+        identity::remove_if(&source, processed, false).unwrap(),
+        identity::Removal::Removed
+    );
+    assert!(!source.exists());
+}
+
+/// An input whose output was placed but whose source `--rm` could not remove
+/// still wrote that output: a later input that lands on the same file (names
+/// differing only in case, on a file system that ignores case) is refused
+/// rather than written over it. The failed removal counts as a failure.
+#[cfg(unix)]
+#[test]
+fn a_placed_output_is_guarded_when_its_source_could_not_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("flat-rm-kept");
+    let probe = scratch.file("probe", b"");
+    if !scratch.path().join("PROBE").exists() {
+        return;
+    }
+    fs::remove_file(probe).unwrap();
+    let first = scratch.file("d1/a.txt", b"first input\n");
+    let second = scratch.file("d2/A.txt", b"second input\n");
+    let locked = scratch.path().join("d1");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    // Root writes a read-only directory regardless; the removal then works
+    // and the case is the one the plain collision test covers.
+    let privileged = fs::write(locked.join("w"), b"").is_ok();
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-f",
+        "--rm",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ])
+    .unwrap();
+    let failed = run(opts).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if privileged {
+        return;
+    }
+    assert_eq!(failed, 2, "the kept source and the refused input both fail");
+    assert!(first.exists(), "its removal failed");
+    assert_eq!(fs::read(&second).unwrap(), b"second input\n");
+    let archive = fs::read(out.join("a.txt.zst")).unwrap();
+    assert_eq!(decoded(&archive).unwrap(), b"first input\n");
 }
 
 /// Without an identity for the processed file nothing confirms the path still
