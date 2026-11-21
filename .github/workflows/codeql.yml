@@ -36,7 +36,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@e9c4b4b153701845b921f167180044d14fe89b94 # v4
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           languages: ${{ matrix.language }}
           # Match Default setup without running contributor-controlled builds.
@@ -48,6 +48,6 @@ jobs:
               - exclude:
                   id: rust/hard-coded-cryptographic-value
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@3ea37a44b6e4e6847c46edae209410d258d548d1 # v4
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           category: /language:${{ matrix.language }}
