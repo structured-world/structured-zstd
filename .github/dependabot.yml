@@ -20,5 +20,11 @@ updates:
       interval: "weekly"
     ignore:
       - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      # The CodeQL init and analyze steps refuse to run on different
+      # versions, so they are always bumped together.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
     commit-message:
       prefix: "ci(deps)"
