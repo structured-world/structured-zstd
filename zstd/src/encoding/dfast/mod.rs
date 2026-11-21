@@ -3904,10 +3904,10 @@ macro_rules! start_matching_dict_loop_body {
                 }
             };
 
-            // Absolute position to byte, one base per segment, for the rep
-            // gate's select.
-            let live_rebase = live_ptr.wrapping_sub(live_abs);
-            let dict_rebase = window_ptr.wrapping_sub(history_abs_start);
+            // The dictionary's bytes numbered from the live start, for the rep
+            // gate's select: a dictionary position `live_abs + rel` (`rel`
+            // negative) lies at `dict_live_ptr + rel`.
+            let dict_live_ptr = window_ptr.wrapping_add(live_abs - history_abs_start);
             // These repeat offsets only steer the search: the emitter codes
             // each match from its own history. Every one is brought within the
             // window in front of the block, so a candidate `ip + 1 - rep`
@@ -3928,6 +3928,14 @@ macro_rules! start_matching_dict_loop_body {
                     break 'outer;
                 }
                 let rep1 = reps[0] as usize;
+                // The repeat candidate of the cursor `ip`, `ip + 1 - rep1`,
+                // counted from the live bytes' first position: `ip + rep_rel`,
+                // negative (wrapped) in the dictionary. The offset holds for the
+                // whole scan, so the gate costs one add a position where the
+                // absolute candidate took an add, a subtraction and two compares
+                // against the segment bounds (upstream likewise forms `repIndex`
+                // from one index, zstd_double_fast.c:400).
+                let rep_rel = (block_bias + 1).wrapping_sub(rep1);
 
                 let mut ip = pos;
                 let inner_exit: DfastInnerExit = 'inner: loop {
@@ -3962,22 +3970,26 @@ macro_rules! start_matching_dict_loop_body {
                     // a count (upstream zstd (zstd_double_fast.c:400-410)).
                     {
                         debug_assert!(rep1 != 0 && rep1 <= abs_ip + 1 - history_abs_start);
-                        let cand_r = abs_ip + 1 - rep1;
-                        let in_live = !$borrowed || cand_r >= live_abs;
-                        if dfast_branch!(1, !$borrowed || (live_abs - 1).wrapping_sub(cand_r) >= 3)
-                        {
-                            let rep_base = if in_live { live_rebase } else { dict_rebase };
-                            // SAFETY: `cand_r` is at or after the dictionary's start
-                            // and before the cursor; off the seam, its 4 bytes lie
-                            // whole in the segment `rep_base` numbers. The cursor's
-                            // read is inside the block.
+                        // `cand_r - live_abs`, wrapping below zero in the
+                        // dictionary.
+                        let cand_rel = ip.wrapping_add(rep_rel);
+                        let in_live = !$borrowed || (cand_rel as isize) >= 0;
+                        // Off the seam: not one of the three positions right
+                        // before the live bytes, whose 4 bytes would straddle it.
+                        if dfast_branch!(1, !$borrowed || cand_rel.wrapping_add(3) >= 3) {
+                            let rep_ptr = if in_live { live_ptr } else { dict_live_ptr };
+                            // SAFETY: the candidate is at or after the dictionary's
+                            // start and before the cursor; off the seam, its 4 bytes
+                            // lie whole in the segment `rep_ptr` numbers from the
+                            // live start. The cursor's read is inside the block.
                             let (cand4, cur4) = unsafe {
                                 (
-                                    (rep_base.wrapping_add(cand_r) as *const u32).read_unaligned(),
+                                    (rep_ptr.wrapping_add(cand_rel) as *const u32).read_unaligned(),
                                     (block_ptr.add(ip + 1) as *const u32).read_unaligned(),
                                 )
                             };
                             if dfast_branch!(2, cand4 == cur4) {
+                                let cand_r = live_abs.wrapping_add(cand_rel);
                                 let match_len = if in_live {
                                     // SAFETY: same buffer; the length caps the scan
                                     // to the block.
