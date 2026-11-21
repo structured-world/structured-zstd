@@ -36,12 +36,12 @@ autoexamples = false
 
 # The command-line tool ships from this crate rather than a second package, so
 # `cargo add structured-zstd` and `cargo install structured-zstd` name the same
-# thing. It carries no dependencies of its own — argument parsing, progress
-# display and its error type are written against `std` — so `required-features`
-# names only library capabilities, all of which are in `default`. That is what
-# makes `cargo install structured-zstd` work with no flags while a library
-# consumer's dependency graph stays untouched: a `no_std` build simply does not
-# select this target.
+# thing. Argument parsing, progress display and its error type are written
+# against `std`; its one dependency is `libc` on Unix (the `cli` feature), for
+# the directory-relative `fstatat` that `--rm` checks a source with and `std`
+# does not expose. `cli` is in `default`, which is what makes
+# `cargo install structured-zstd` work with no flags; a `no_std` build turns
+# default features off and simply does not select this target.
 #
 # The list is what the parser ADVERTISES, not the minimum that links: `-t` must
 # actually verify checksums (which needs `hash`, pulled in by `ldm`) and
@@ -58,7 +58,7 @@ autoexamples = false
 [[bin]]
 name = "structured-zstd"
 path = "src/bin/structured-zstd/main.rs"
-required-features = ["std", "dict-builder", "ldm"]
+required-features = ["cli"]
 
 # docs.rs builds the crate with the public feature set so feature-gated
 # items (e.g. the `dictionary` module behind `dict-builder`) appear in the
@@ -77,7 +77,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # Locked behind the `hash` feature flag
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"], optional = true }
-fastrand = {version = "2.3.0", optional = true }
 # Optional sync primitive for the FSE default-table cache on no-atomic
 # targets (Cortex-M0/M0+, AVR, MSP430 — anywhere `target_has_atomic =
 # "ptr"` is false). When this feature is enabled the cache uses a
@@ -96,6 +95,10 @@ critical-section = { version = "1.2", optional = true }
 compiler_builtins = { version = "0.1.2", optional = true }
 core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
 alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+
+# The command-line tool's `fstatat` / `unlinkat` (see the `cli` feature).
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 
 [dev-dependencies]
@@ -127,12 +130,15 @@ default = [
     "kernel-simd128",
     # Present in `default` so the bundled command-line tool, whose `--train`
     # needs it, builds from a plain `cargo install structured-zstd`. It adds
-    # one small dependency (`fastrand`) and no transitive ones; a build that
-    # does not want it turns default features off, as `no_std` builds already
-    # do.
+    # no dependency; a build that does not want it turns default features off,
+    # as `no_std` builds already do.
     "dict-builder",
     "legacy",
+    "cli",
 ]
+# What the bundled command-line tool needs: the capabilities its parser
+# advertises, and `libc` on Unix. The library itself uses none of `libc`.
+cli = ["std", "dict-builder", "ldm", "dep:libc"]
 # Per-CPU-tier kernel selection, covering the decoder and the encoder. The
 # default build enables every kernel except `kernel-vbmi2`; with `std`,
 # `detect_cpu_kernel()` (decode) and `fastpath::select_kernel()` (encode) pick
@@ -170,7 +176,7 @@ kernel-sve = ["kernel-neon"]
 # the 256-bit (AVX2/VBMI2) and scalar-bit-manip (BMI2) kernels have no
 # simd128 equivalent and stay scalar on wasm.
 kernel-simd128 = []
-dict-builder = ["std", "dep:fastrand"]
+dict-builder = ["std"]
 # Decode frames of the v0.5, v0.6 and v0.7 formats, the ones every libzstd
 # 1.5.7 build reads by default (upstream's legacy level 5). Without it such a
 # frame is refused as an unknown format, as a libzstd built at level 0

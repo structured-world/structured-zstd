@@ -33,17 +33,17 @@ pub struct Source {
 }
 
 impl Source {
-    /// The source open as `file`, whose path named `entry` (from [`of_entry`])
-    /// just before it was opened; `None` where the platform reads no
-    /// identity.
+    /// The source opened as the file `id` (from [`of_open`]), whose path
+    /// named `entry` (from [`of_entry`]) just before it was opened; `None`
+    /// where the platform reads no identity.
     ///
     /// An entry other than the file opened is a link the open followed. It is
     /// read before the open rather than after, so a link put at the path once
     /// the file is open is not taken for the one the source was named
-    /// through; an entry swapped in between only makes the removal refuse.
-    pub fn opened(entry: Option<FileId>, file: &File, metadata: &fs::Metadata) -> Option<Self> {
-        let id = of_open(file, metadata)?;
-        let entry = entry?;
+    /// through. An entry swapped in between can only be taken for a link to
+    /// the file opened, and removing such a link removes no file.
+    pub fn opened(entry: Option<FileId>, id: Option<FileId>) -> Option<Self> {
+        let (entry, id) = (entry?, id?);
         Some(Self {
             id,
             link: (entry != id).then_some(entry),
@@ -56,26 +56,26 @@ impl Source {
 #[cfg(test)]
 pub const BINDS_REMOVAL: bool = sys::BINDS_REMOVAL;
 
-/// Whether [`remove_if`] can also bind the check of a source named through
-/// the symbolic link `path`, which depends on the kernel as well as the
-/// platform; where it cannot, such a source is kept as
+/// Whether [`remove_if`] can also bind the check of a source named through a
+/// symbolic link; where it cannot, such a source is kept as
 /// [`Removal::Unconfirmed`].
 #[cfg(test)]
-pub fn binds_link_removal(path: &Path) -> bool {
-    sys::binds_link_removal(path)
-}
+pub const BINDS_LINK_REMOVAL: bool = sys::BINDS_LINK_REMOVAL;
 
 /// Remove the entry `path` names if it is the file `expected`, checking and
-/// removing through one handle so no rename between the two can redirect the
-/// removal elsewhere.
+/// removing through one handle (the parent directory on Unix, the entry on
+/// Windows), so renaming an ancestor between the two cannot redirect the
+/// removal elsewhere. On Unix the entry itself can still be replaced inside
+/// that directory between the check and the unlink, as upstream zstd's
+/// `FIO_removeFile` (fileio.c) states for its own: only by someone who may
+/// write the directory, and so could remove the entry anyway.
 ///
 /// `link` is the identity of the symbolic link the path was when it was
-/// processed: the entry must then still be that link and point at
+/// processed: the entry must then still be that link and lead to
 /// `expected`, and the link is removed, as removing a path removes the name.
-/// Where both cannot be checked in the directory the link is removed from
-/// (Windows, NetBSD, OpenBSD, DragonFly, FreeBSD before 14), the link is kept as
-/// [`Removal::Unconfirmed`]. Without `link`, a link found at the path is not
-/// the file processed and is kept.
+/// Where the link cannot be checked in the handle it is removed through
+/// (Windows), it is kept as [`Removal::Unconfirmed`]. Without `link`, a link
+/// found at the path is not the file processed and is kept.
 pub fn remove_if(path: &Path, expected: FileId, link: Option<FileId>) -> io::Result<Removal> {
     sys::remove_if(path, expected, link, || {}, || {})
 }
@@ -107,6 +107,14 @@ pub fn remove_if_after_open(
 /// the platform reads no identity.
 pub fn of_path(path: &Path) -> Option<FileId> {
     sys::of_path(path)
+}
+
+/// The file `path` named when it was looked up and reported `metadata`
+/// (`fs::metadata`, following symlinks). Unix reads the identity from
+/// `metadata`, so the lookup is not repeated; Windows looks the path up
+/// again, as `metadata` carries no file ID there.
+pub fn of_named(path: &Path, metadata: &fs::Metadata) -> Option<FileId> {
+    sys::of_named(path, metadata)
 }
 
 /// The entry `path` names itself, a symbolic link as the link; `None` when
@@ -147,29 +155,18 @@ mod sys {
 
     pub use unlink::remove_if;
     #[cfg(test)]
-    pub use unlink::{BINDS_REMOVAL, binds_link_removal};
+    pub use unlink::{BINDS_LINK_REMOVAL, BINDS_REMOVAL};
 
     fn of(metadata: &fs::Metadata) -> FileId {
         FileId(metadata.dev(), u128::from(metadata.ino()))
     }
 
-    /// Another Unix: the open flag values are not spelled out here, so the
-    /// check cannot be bound to the removal and nothing is removed.
+    /// Another Unix: how its parent directory is opened for search is not
+    /// spelled out here, so the check cannot be bound to the removal and
+    /// nothing is removed.
     #[cfg(not(any(
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ),
+        target_os = "linux",
+        target_os = "android",
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "netbsd",
@@ -185,9 +182,7 @@ mod sys {
         pub const BINDS_REMOVAL: bool = false;
 
         #[cfg(test)]
-        pub fn binds_link_removal(_: &Path) -> bool {
-            false
-        }
+        pub const BINDS_LINK_REMOVAL: bool = false;
 
         pub fn remove_if(
             _: &Path,
@@ -201,20 +196,8 @@ mod sys {
     }
 
     #[cfg(any(
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "riscv64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ),
+        target_os = "linux",
+        target_os = "android",
         target_vendor = "apple",
         target_os = "freebsd",
         target_os = "netbsd",
@@ -223,10 +206,9 @@ mod sys {
     ))]
     mod unlink {
         use super::super::{FileId, Removal};
-        use super::of;
-        use core::ffi::{c_char, c_int};
+        use core::ffi::c_int;
+        use core::mem::MaybeUninit;
         use std::ffi::{CStr, CString};
-        use std::fs::File;
         use std::io;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
@@ -235,42 +217,50 @@ mod sys {
         #[cfg(test)]
         pub const BINDS_REMOVAL: bool = true;
 
-        unsafe extern "C" {
-            fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-            fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
-            fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
-        }
+        #[cfg(test)]
+        pub const BINDS_LINK_REMOVAL: bool = true;
 
-        /// How the parent directory is opened: for search only (`O_PATH` on
-        /// Linux, `O_SEARCH` elsewhere), since unlinking an entry needs write
-        /// and search permission on the directory, not read. OpenBSD and
-        /// DragonFly have no such flag and open for reading. Every kernel Rust
-        /// supports knows its flag (`O_PATH` since Linux 2.6.39, `O_SEARCH`
-        /// since FreeBSD 8 and NetBSD 7); macOS before 13 ignores the `O_EXEC`
-        /// bit of its `O_SEARCH` and opens for reading.
-        ///
-        /// Outside Linux `O_DIRECTORY` is part of it, so a FIFO put where the
-        /// directory was is refused rather than opened, which would wait for
-        /// a writer. `O_PATH` opens nothing, so Linux needs no such guard.
+        #[cfg(not(all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_env = "musl", target_env = "ohos"))
+        )))]
+        use libc::{fstatat, stat as Stat};
+        /// The 64-bit `fstatat` of 32-bit glibc and Bionic: the default one
+        /// there answers `EOVERFLOW` for a file of 2 GiB or more. musl's is
+        /// 64-bit already.
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_env = "musl", target_env = "ohos"))
+        ))]
+        use libc::{fstatat64 as fstatat, stat64 as Stat};
+
+        /// How the parent directory is opened, as upstream zstd opens it
+        /// (util.c `UTIL_openParentDir`): for search only, since unlinking an
+        /// entry needs write and search permission on the directory, not
+        /// read. `O_PATH` on Linux; `O_SEARCH` on Apple systems, FreeBSD
+        /// (whose `O_PATH` came only in 14) and NetBSD; OpenBSD and DragonFly
+        /// have neither and open for reading, as macOS before 13 does too,
+        /// ignoring the `O_EXEC` bit of its `O_SEARCH`.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        const DIR_FLAGS: c_int = 0o10000000;
-        #[cfg(target_vendor = "apple")]
-        const DIR_FLAGS: c_int = 0x4000_0000 | 0x0010_0000;
-        #[cfg(target_os = "freebsd")]
-        const DIR_FLAGS: c_int = 0x0004_0000 | 0x0002_0000;
-        #[cfg(target_os = "netbsd")]
-        const DIR_FLAGS: c_int = 0x0080_0000 | 0x0020_0000;
-        #[cfg(target_os = "openbsd")]
-        const DIR_FLAGS: c_int = 0x0002_0000;
-        #[cfg(target_os = "dragonfly")]
-        const DIR_FLAGS: c_int = 0x0800_0000;
+        const SEARCH: c_int = libc::O_PATH;
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd"))]
+        const SEARCH: c_int = libc::O_SEARCH;
+        #[cfg(any(target_os = "openbsd", target_os = "dragonfly"))]
+        const SEARCH: c_int = libc::O_RDONLY;
 
-        /// The parent directory as a descriptor for `openat` and `unlinkat`.
+        /// The parent directory as a descriptor for `fstatat` and
+        /// `unlinkat`. `O_DIRECTORY` refuses a FIFO put where the directory
+        /// was, which opening for reading would wait on.
         fn open_dir(parent: &Path) -> io::Result<OwnedFd> {
             let parent = CString::new(parent.as_os_str().as_bytes()).map_err(io::Error::other)?;
             // SAFETY: `parent` is NUL-terminated; no `O_CREAT`, so no mode
             // argument is read.
-            let fd = unsafe { open(parent.as_ptr(), DIR_FLAGS) };
+            let fd = unsafe {
+                libc::open(
+                    parent.as_ptr(),
+                    SEARCH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -278,114 +268,35 @@ mod sys {
             Ok(unsafe { OwnedFd::from_raw_fd(fd) })
         }
 
-        /// `O_RDONLY | O_NONBLOCK | O_NOCTTY | O_LARGEFILE`: the entry is
-        /// opened only to read its identity, so a FIFO must not block and a
-        /// terminal must not become the controlling one. BSD and Apple systems
-        /// never take a controlling terminal on open, so `O_NOCTTY` is 0
-        /// there.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const PROBE_FLAGS: c_int = 0o4000 | 0o400 | LARGEFILE;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        const PROBE_FLAGS: c_int = 0x4;
-
-        /// `O_LARGEFILE`, which a 32-bit Linux kernel needs to open a file of
-        /// 2 GiB or more (`EOVERFLOW` otherwise) and which glibc's `openat`
-        /// does not add there; a 64-bit kernel implies it.
-        #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "x86"))]
-        const LARGEFILE: c_int = 0o100000;
-        #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "arm"))]
-        const LARGEFILE: c_int = 0o400000;
-        #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
-            target_arch = "powerpc"
-        ))]
-        const LARGEFILE: c_int = 0o200000;
-        #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
-            not(any(target_arch = "x86", target_arch = "arm", target_arch = "powerpc"))
-        ))]
-        const LARGEFILE: c_int = 0;
-
-        /// `O_NOFOLLOW`, whose value differs between Linux architectures.
-        #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
-            any(
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64"
-            )
-        ))]
-        const NOFOLLOW: c_int = 0o100000;
-        #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
-            not(any(
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "powerpc",
-                target_arch = "powerpc64"
-            ))
-        ))]
-        const NOFOLLOW: c_int = 0o400000;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        const NOFOLLOW: c_int = 0x100;
-
-        /// What `open` with `O_NOFOLLOW` answers for a symbolic link: `ELOOP`
-        /// on Linux, Apple and OpenBSD, `EMLINK` on FreeBSD and DragonFly,
-        /// `EFTYPE` on NetBSD.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const LINK_ERRNO: i32 = 40;
-        #[cfg(any(target_vendor = "apple", target_os = "openbsd"))]
-        const LINK_ERRNO: i32 = 62;
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        const LINK_ERRNO: i32 = 31;
-        #[cfg(target_os = "netbsd")]
-        const LINK_ERRNO: i32 = 79;
-
-        /// How the entry is opened to read a symbolic link's own identity
-        /// rather than the file it names: `O_PATH | O_NOFOLLOW` on Linux and
-        /// FreeBSD, `O_SYMLINK` on Apple systems. FreeBSD before 14 has no
-        /// `O_PATH`, so `O_NOFOLLOW` refuses the link and the source is kept
-        /// as unconfirmed. NetBSD, OpenBSD and DragonFly cannot open a link
-        /// itself, so there a source named through one is kept.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const LINK_FLAGS: Option<c_int> = Some(DIR_FLAGS | NOFOLLOW);
-        #[cfg(target_vendor = "apple")]
-        const LINK_FLAGS: Option<c_int> = Some(0x0020_0000 | PROBE_FLAGS);
-        #[cfg(target_os = "freebsd")]
-        const LINK_FLAGS: Option<c_int> = Some(0x0040_0000 | NOFOLLOW);
-        #[cfg(any(target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
-        const LINK_FLAGS: Option<c_int> = None;
-
-        /// What opening an entry found.
-        #[derive(PartialEq, Eq)]
-        enum Entry {
-            /// The file it opened.
-            Found(FileId),
-            /// No such entry.
-            Gone,
-            /// A symbolic link `O_NOFOLLOW` refused.
-            Link,
+        /// The entry `name` in `dir`, a symbolic link as the link unless
+        /// `follow`; `None` when there is no such entry. Only metadata is
+        /// read, as upstream zstd reads it (util.c `UTIL_statInDir`), so the
+        /// file needs no permission of its own.
+        fn stat_at(dir: &OwnedFd, name: &CStr, follow: bool) -> io::Result<Option<FileId>> {
+            let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            let mut stat = MaybeUninit::<Stat>::uninit();
+            // SAFETY: `dir` is an open descriptor, `name` is NUL-terminated
+            // and `stat` is writable storage of the type the call fills.
+            if unsafe { fstatat(dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), flags) } != 0 {
+                let err = io::Error::last_os_error();
+                return match err.kind() {
+                    io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(err),
+                };
+            }
+            // SAFETY: `fstatat` succeeded, so it filled `stat`.
+            let stat = unsafe { stat.assume_init() };
+            Ok(Some(id_of(&stat)))
         }
 
-        /// `name` in `dir` opened with `flags`.
-        fn probe(dir: &OwnedFd, name: &CStr, flags: c_int) -> io::Result<Entry> {
-            // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated;
-            // no `O_CREAT`, so no mode argument is read.
-            let fd = unsafe { openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-            if fd < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::NotFound {
-                    return Ok(Entry::Gone);
-                }
-                if err.raw_os_error() == Some(LINK_ERRNO) {
-                    return Ok(Entry::Link);
-                }
-                return Err(err);
-            }
-            // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
-            let entry = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-            Ok(Entry::Found(of(&entry.metadata()?)))
+        /// The identity in `stat`, widened as `std`'s `MetadataExt` widens
+        /// it, so it compares equal to the one [`super::of`] reads.
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "the field types differ between targets"
+        )]
+        fn id_of(stat: &Stat) -> FileId {
+            FileId(stat.st_dev as u64, u128::from(stat.st_ino as u64))
         }
 
         /// The parent directory of `path`, opened, and the entry's name in
@@ -405,29 +316,18 @@ mod sys {
             }
         }
 
-        /// Whether this kernel opens the symbolic link `path` itself, so a
-        /// source named through it can be removed.
-        #[cfg(test)]
-        pub fn binds_link_removal(path: &Path) -> bool {
-            let (Some(flags), Some(own)) = (LINK_FLAGS, super::of_entry(path)) else {
-                return false;
-            };
-            let Ok(Some((dir, name))) = held(path) else {
-                return false;
-            };
-            probe(&dir, &name, flags).is_ok_and(|entry| entry == Entry::Found(own))
-        }
-
         /// The parent directory is opened once and the checks and the unlink
         /// all go through it, so renaming any ancestor afterwards changes
-        /// nothing. The entry itself can still be swapped inside that
-        /// directory between them, but only by someone who may write the
-        /// directory and could remove the entry anyway; unlinking a name
-        /// never reaches a file through another directory.
+        /// nothing; unlinking a name never reaches a file through another
+        /// directory.
         ///
-        /// For a source named through a link, the entry is followed to the
-        /// file processed and then opened as the link itself, both in the
-        /// directory held, so the link compared is the one unlinked.
+        /// For a source named through a link, the entry is read as itself and
+        /// then followed, two reads rather than one. What can change between
+        /// them while the entry stays that link is only where the link's path
+        /// leads, and the entry unlinked is still the link the source was
+        /// named through, as removing a path removes the name. Putting
+        /// another link there, even one that takes the old link's inode
+        /// number, needs a writer of this directory.
         pub fn remove_if(
             path: &Path,
             expected: FileId,
@@ -435,35 +335,21 @@ mod sys {
             opened: impl FnOnce(),
             between: impl FnOnce(),
         ) -> io::Result<Removal> {
-            let link = match (link, LINK_FLAGS) {
-                (None, _) => None,
-                (Some(link), Some(flags)) => Some((link, flags)),
-                (Some(_), None) => return Ok(Removal::Unconfirmed),
-            };
             let Some((dir, name)) = held(path)? else {
                 return Ok(Removal::Changed);
             };
             opened();
-            let flags = if link.is_some() {
-                PROBE_FLAGS
-            } else {
-                PROBE_FLAGS | NOFOLLOW
+            let entry = stat_at(&dir, &name, false)?;
+            let processed = match link {
+                Some(link) => entry == Some(link) && stat_at(&dir, &name, true)? == Some(expected),
+                None => entry == Some(expected),
             };
-            if probe(&dir, &name, flags)? != Entry::Found(expected) {
+            if !processed {
                 return Ok(Removal::Changed);
-            }
-            if let Some((link, flags)) = link {
-                match probe(&dir, &name, flags)? {
-                    Entry::Found(own) if own == link => {}
-                    // The kernel refused to open the link itself (FreeBSD
-                    // before 14): its identity cannot be read.
-                    Entry::Link => return Ok(Removal::Unconfirmed),
-                    Entry::Found(_) | Entry::Gone => return Ok(Removal::Changed),
-                }
             }
             between();
             // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated.
-            if unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(Removal::Removed)
@@ -472,6 +358,10 @@ mod sys {
 
     pub fn of_path(path: &Path) -> Option<FileId> {
         fs::metadata(path).ok().as_ref().map(of)
+    }
+
+    pub fn of_named(_: &Path, metadata: &fs::Metadata) -> Option<FileId> {
+        Some(of(metadata))
     }
 
     pub fn of_open(_: &File, metadata: &fs::Metadata) -> Option<FileId> {
@@ -514,9 +404,7 @@ mod sys {
     pub const BINDS_REMOVAL: bool = true;
 
     #[cfg(test)]
-    pub fn binds_link_removal(_: &Path) -> bool {
-        false
-    }
+    pub const BINDS_LINK_REMOVAL: bool = false;
 
     /// `FILE_FLAG_BACKUP_SEMANTICS`: lets a directory be opened too, as
     /// `fs::metadata` answers for any path on Unix.
@@ -634,6 +522,10 @@ mod sys {
         of_handle(file.as_raw_handle())
     }
 
+    pub fn of_named(path: &Path, _: &fs::Metadata) -> Option<FileId> {
+        of_path(path)
+    }
+
     pub fn of_open(file: &File, _: &fs::Metadata) -> Option<FileId> {
         of_handle(file.as_raw_handle())
     }
@@ -747,11 +639,13 @@ mod sys {
     pub const BINDS_REMOVAL: bool = false;
 
     #[cfg(test)]
-    pub fn binds_link_removal(_: &Path) -> bool {
-        false
-    }
+    pub const BINDS_LINK_REMOVAL: bool = false;
 
     pub fn of_path(_: &Path) -> Option<FileId> {
+        None
+    }
+
+    pub fn of_named(_: &Path, _: &fs::Metadata) -> Option<FileId> {
         None
     }
 

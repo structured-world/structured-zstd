@@ -7000,7 +7000,8 @@ fn source_at(path: &Path) -> Option<identity::Source> {
 fn open_source(path: &Path) -> (File, identity::Source) {
     let entry = identity::of_entry(path);
     let opened = File::open(path).unwrap();
-    let source = identity::Source::opened(entry, &opened, &opened.metadata().unwrap()).unwrap();
+    let id = identity::of_open(&opened, &opened.metadata().unwrap());
+    let source = identity::Source::opened(entry, id).unwrap();
     (opened, source)
 }
 
@@ -7014,11 +7015,11 @@ fn file_link(target: &Path, link: &Path) {
     std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
-/// Where the platform or the kernel cannot read a link's own identity
-/// through the directory it removes from, `remove_if` removes no source
-/// named through a link; returns whether the caller's test applies.
+/// Where the platform cannot read a link's own identity through the handle
+/// it removes with, `remove_if` removes no source named through a link;
+/// returns whether the caller's test applies.
 fn link_removal_is_bound(path: &Path, source: identity::Source) -> bool {
-    if identity::binds_link_removal(path) {
+    if identity::BINDS_LINK_REMOVAL {
         return true;
     }
     assert_eq!(
@@ -7125,15 +7126,36 @@ fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
     );
 }
 
+/// Whether this kernel opens a directory for search only when asked to:
+/// macOS before 13 (Darwin 22) ignores the `O_EXEC` bit of `O_SEARCH` and
+/// opens it for reading.
+#[cfg(unix)]
+fn opens_directories_for_search_only() -> bool {
+    if !cfg!(target_vendor = "apple") {
+        return true;
+    }
+    let release = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .unwrap();
+    let release = String::from_utf8(release.stdout).unwrap();
+    let darwin: u32 = release.split('.').next().unwrap().trim().parse().unwrap();
+    darwin >= 22
+}
+
 /// Unlinking an entry needs write and search permission on its directory, not
 /// read permission: a source in a directory its owner may write and search
 /// but not list (mode 0300) is removed as a plain unlink removes it. (Root
-/// ignores the mode, so there the test proves less.) OpenBSD and DragonFly
-/// have no search-only open, so there the directory is opened for reading.
+/// ignores the mode, so there the test proves less.) Where the directory is
+/// opened for reading (OpenBSD, DragonFly, macOS before 13) the test does
+/// not apply.
 #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "dragonfly"))))]
 #[test]
 fn rm_removes_a_source_in_a_directory_without_read_permission() {
     use std::os::unix::fs::PermissionsExt;
+    if !opens_directories_for_search_only() {
+        return;
+    }
     let scratch = Scratch::new("rmnoread");
     let dir = scratch.path().join("dir");
     fs::create_dir(&dir).unwrap();
@@ -7177,9 +7199,10 @@ fn rm_reports_a_path_naming_nothing_as_changed() {
     assert!(source.exists());
 }
 
-/// A path that runs through a regular file, or an entry the system refuses
-/// to unlink (a directory, refused even to root), is an error rather than a
-/// silent keep: the caller reports the failed removal.
+/// A path that runs through a regular file, a name longer than the system
+/// takes, or an entry the system refuses to unlink (a directory, refused even
+/// to root), is an error rather than a silent keep: the caller reports the
+/// failed removal.
 #[cfg(unix)]
 #[test]
 fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
@@ -7189,11 +7212,15 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     if !removal_is_bound(&file, processed) {
         return;
     }
-    for through_file in [file.join("x"), file.join("sub").join("x")] {
+    for unresolvable in [
+        file.join("x"),
+        file.join("sub").join("x"),
+        scratch.path().join("x".repeat(300)),
+    ] {
         assert!(
-            identity::remove_if(&through_file, processed, None).is_err(),
+            identity::remove_if(&unresolvable, processed, None).is_err(),
             "{}",
-            through_file.display()
+            unresolvable.display()
         );
     }
 
@@ -7266,7 +7293,8 @@ fn rm_keeps_a_link_put_at_a_plain_source_once_it_is_open() {
     let moved = scratch.path().join("moved.txt");
     fs::rename(&source, &moved).unwrap();
     file_link(&moved, &source);
-    let processed = identity::Source::opened(entry, &opened, &opened.metadata().unwrap()).unwrap();
+    let id = identity::of_open(&opened, &opened.metadata().unwrap());
+    let processed = identity::Source::opened(entry, id).unwrap();
     assert_eq!(processed.link, None, "the path was the file itself");
     if !removal_is_bound(&source, processed.id) {
         return;
@@ -7365,10 +7393,10 @@ fn rm_keeps_another_link_left_in_the_directory_it_holds() {
     );
 }
 
-/// A source of 2 GiB or more is removed like any other: on 32-bit Linux the
-/// probe that reads the entry's identity needs `O_LARGEFILE`, or the open
-/// fails with `EOVERFLOW` and the source is kept with an error. The file is
-/// sparse, so it takes no space.
+/// A source of 2 GiB or more is removed like any other: on 32-bit glibc the
+/// identity is read with the 64-bit `fstatat`, or the call fails with
+/// `EOVERFLOW` and the source is kept with an error. The file is sparse, so
+/// it takes no space.
 #[cfg(unix)]
 #[test]
 fn rm_removes_a_source_of_more_than_2_gib() {
@@ -7405,6 +7433,45 @@ fn a_kept_source_counts_as_processed_and_failed() {
     );
 }
 
+/// A placed output whose source could not be removed is kept as a failure
+/// that still counts its bytes, and one whose source went is plainly done:
+/// a failed removal must not pass for success, nor drop the output's count.
+#[test]
+fn a_failed_removal_keeps_the_source_as_a_failure() {
+    let opts = parse(&["-q", "x"]).unwrap();
+    let processed = || Processed {
+        read: 10,
+        written: 4,
+        passed_through: false,
+    };
+    let failed = placed_outcome(
+        &opts,
+        Path::new("x"),
+        processed(),
+        Err(eyre!("permission denied")),
+    );
+    assert!(matches!(failed, Outcome::SourceKept(_)));
+    let removed = placed_outcome(&opts, Path::new("x"), processed(), Ok(()));
+    assert!(matches!(removed, Outcome::Done(_)));
+}
+
+/// `-` with `-o` compresses standard input into that file through the
+/// single-input path, which has no source to open or remove even under
+/// `--rm`. (Where the test's standard input is a terminal it does not
+/// apply.)
+#[test]
+fn stdin_is_compressed_into_a_named_output() {
+    use std::io::IsTerminal;
+    if io::stdin().is_terminal() {
+        return;
+    }
+    let scratch = Scratch::new("stdin-out");
+    let archive = scratch.path().join("out.zst");
+    let opts = parse(&["-q", "--rm", "-o", archive.to_str().unwrap(), "-"]).unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(decoded(&fs::read(&archive).unwrap()).is_ok());
+}
+
 /// A read-only source is removed as `fs::remove_file` removes it: on Windows
 /// that takes the extended disposition, which ignores the read-only
 /// attribute.
@@ -7425,6 +7492,54 @@ fn rm_removes_a_read_only_source() {
         identity::Removal::Removed
     );
     assert!(!source.exists());
+}
+
+/// A source whose read permission was taken away once it was open is still
+/// removed: unlinking needs no permission on the file itself, and the check
+/// reads only its metadata, as upstream zstd (util.c `UTIL_statInDir`) does.
+/// Opening the entry again to read its identity fails there and keeps the
+/// source with an error. (Root ignores the mode, so there the test proves
+/// less.)
+#[cfg(unix)]
+#[test]
+fn rm_removes_a_source_it_may_no_longer_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("rmunreadable");
+    let source = scratch.file("data.txt", b"payload");
+    let (opened, processed) = open_source(&source);
+    if !removal_is_bound(&source, processed.id) {
+        return;
+    }
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let removal = identity::remove_if(&source, processed.id, processed.link);
+    drop(opened);
+    let kept = source.exists();
+    if kept {
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!(removal.unwrap(), identity::Removal::Removed);
+    assert!(!kept);
+}
+
+/// A source path replaced between its lookup and its open names another
+/// file than the one checked: it is refused rather than read, as upstream
+/// zstd (fileio.c `FIO_openSrcFile`) refuses it "changed while opening".
+/// Reading whatever the open reaches compresses a file that passed none of
+/// the checks made on the path, the dictionary check among them.
+#[test]
+fn a_source_replaced_before_it_is_opened_is_refused() {
+    let scratch = Scratch::new("openswap");
+    let source = scratch.file("data.txt", b"checked content");
+    let other = scratch.file("other.txt", b"unchecked content");
+    let opts = parse(&["-q", "x"]).unwrap();
+
+    let opened = open_input_with(&opts, &source, || fs::rename(&other, &source).unwrap());
+    let err = opened.expect_err("the replaced source is refused");
+    assert!(
+        err.to_string().contains("changed while opening"),
+        "got: {err}"
+    );
 }
 
 /// An input whose output was placed but whose source `--rm` could not remove

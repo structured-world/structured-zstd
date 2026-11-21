@@ -5915,6 +5915,16 @@ fn open_input(
     opts: &Options,
     input: &Path,
 ) -> Result<Option<(File, fs::Metadata, Option<identity::Source>)>> {
+    open_input_with(opts, input, || {})
+}
+
+/// [`open_input`] with `between` run after the path is looked up and before
+/// it is opened, where a concurrent replacement would land.
+fn open_input_with(
+    opts: &Options,
+    input: &Path,
+    between: impl FnOnce(),
+) -> Result<Option<(File, fs::Metadata, Option<identity::Source>)>> {
     // The reference's lines, trailing space included (`fileio.c:555-564`,
     // 2040).
     let named = fs::metadata(input).map_err(|err| {
@@ -5927,11 +5937,12 @@ fn open_input(
     if named.is_dir() {
         bail!("{} is a directory -- ignored ", input.display());
     }
+    let named_id = identity::of_named(input, &named);
     // The file a frame is compressed against is not also its content, as the
     // reference refuses it per input (fileio.c `FIO_compressFilename_srcFile`,
     // compared by file identity like its `UTIL_isSameFileStat`).
     if compresses(opts)
-        && let Some(input_id) = identity::of_path(input)
+        && let Some(input_id) = named_id
         && [&opts.dict, &opts.patch_from]
             .into_iter()
             .flatten()
@@ -5960,14 +5971,24 @@ fn open_input(
     // Read only when it can be used, and before the open: `Source::opened`
     // tells from it whether the open went through a link.
     let entry = removes_sources(opts).then(|| identity::of_entry(input));
+    between();
     let source = File::open(input).wrap_err_with(|| input.display().to_string())?;
     let metadata = source
         .metadata()
         .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+    // The path may have been replaced since it was looked up: the file
+    // opened then passed none of the checks above, so it is not read, as
+    // upstream zstd refuses it (fileio.c `FIO_openSrcFile`).
+    let opened_id = identity::of_open(&source, &metadata);
+    if let (Some(named_id), Some(opened_id)) = (named_id, opened_id)
+        && named_id != opened_id
+    {
+        bail!("{} changed while opening -- ignored", input.display());
+    }
     if metadata.is_dir() || !admissible(&metadata.file_type()) {
         bail!("{} is not a regular file -- ignored ", input.display());
     }
-    let processed = entry.and_then(|entry| identity::Source::opened(entry, &source, &metadata));
+    let processed = entry.and_then(|entry| identity::Source::opened(entry, opened_id));
     Ok(Some((source, metadata, processed)))
 }
 
