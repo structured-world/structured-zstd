@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/structured-world/structured-zstd/compare/v0.4.2...v0.4.3) - 2026-11-21
+
+### Performance
+
+- *(encoding)* fewer memcpy calls on small dictionary frames ([#691](https://github.com/structured-world/structured-zstd/pull/691))
+- *(encoding)* cheaper dictionary frames at negative levels ([#687](https://github.com/structured-world/structured-zstd/pull/687))
+- *(encoding)* optimal-parser workspace in upstream's shape ([#686](https://github.com/structured-world/structured-zstd/pull/686))
+- *(decoding)* sequence loop common path in assembly on x86_64 ([#683](https://github.com/structured-world/structured-zstd/pull/683))
+- *(decoding)* set sequence table counters in one pass ([#682](https://github.com/structured-world/structured-zstd/pull/682))
+- *(decoding)* four-stream literals in a machine word, asm loop on 32-bit x86 ([#681](https://github.com/structured-world/structured-zstd/pull/681))
+- *(decoding)* four-stream literal loop in assembly ([#679](https://github.com/structured-world/structured-zstd/pull/679))
+
 ## [0.4.2](https://github.com/structured-world/structured-zstd/compare/v0.4.1...v0.4.2) - 2026-11-16
 
 ### Performance
