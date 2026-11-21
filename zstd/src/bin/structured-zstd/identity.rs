@@ -109,12 +109,12 @@ pub fn of_path(path: &Path) -> Option<FileId> {
     sys::of_path(path)
 }
 
-/// The file `path` named when it was looked up and reported `metadata`
-/// (`fs::metadata`, following symlinks). Unix reads the identity from
-/// `metadata`, so the lookup is not repeated; Windows looks the path up
-/// again, as `metadata` carries no file ID there.
-pub fn of_named(path: &Path, metadata: &fs::Metadata) -> Option<FileId> {
-    sys::of_named(path, metadata)
+/// The metadata of the file `path` names, following symlinks, and that
+/// file's identity, both from one lookup, so a file put at the path in
+/// between cannot pair one file's metadata with another's identity. The
+/// identity is `None` where the platform reads none.
+pub fn looked_up(path: &Path) -> io::Result<(fs::Metadata, Option<FileId>)> {
+    sys::looked_up(path)
 }
 
 /// The entry `path` names itself, a symbolic link as the link; `None` when
@@ -360,8 +360,10 @@ mod sys {
         fs::metadata(path).ok().as_ref().map(of)
     }
 
-    pub fn of_named(_: &Path, metadata: &fs::Metadata) -> Option<FileId> {
-        Some(of(metadata))
+    pub fn looked_up(path: &Path) -> std::io::Result<(fs::Metadata, Option<FileId>)> {
+        let metadata = fs::metadata(path)?;
+        let id = of(&metadata);
+        Ok((metadata, Some(id)))
     }
 
     pub fn of_open(_: &File, metadata: &fs::Metadata) -> Option<FileId> {
@@ -522,8 +524,14 @@ mod sys {
         of_handle(file.as_raw_handle())
     }
 
-    pub fn of_named(path: &Path, _: &fs::Metadata) -> Option<FileId> {
-        of_path(path)
+    /// Both read from one handle opened as `fs::metadata` opens it, with no
+    /// access asked for, following reparse points.
+    pub fn looked_up(path: &Path) -> io::Result<(fs::Metadata, Option<FileId>)> {
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        Ok((file.metadata()?, of_handle(file.as_raw_handle())))
     }
 
     pub fn of_open(file: &File, _: &fs::Metadata) -> Option<FileId> {
@@ -645,8 +653,8 @@ mod sys {
         None
     }
 
-    pub fn of_named(_: &Path, _: &fs::Metadata) -> Option<FileId> {
-        None
+    pub fn looked_up(path: &Path) -> io::Result<(fs::Metadata, Option<FileId>)> {
+        Ok((fs::metadata(path)?, None))
     }
 
     pub fn of_open(_: &File, _: &fs::Metadata) -> Option<FileId> {

@@ -5927,7 +5927,7 @@ fn open_input_with(
 ) -> Result<Option<(File, fs::Metadata, Option<identity::Source>)>> {
     // The reference's lines, trailing space included (`fileio.c:555-564`,
     // 2040).
-    let named = fs::metadata(input).map_err(|err| {
+    let (named, named_id) = identity::looked_up(input).map_err(|err| {
         eyre!(
             "can't stat {} : {} -- ignored ",
             input.display(),
@@ -5937,7 +5937,6 @@ fn open_input_with(
     if named.is_dir() {
         bail!("{} is a directory -- ignored ", input.display());
     }
-    let named_id = identity::of_named(input, &named);
     // The file a frame is compressed against is not also its content, as the
     // reference refuses it per input (fileio.c `FIO_compressFilename_srcFile`,
     // compared by file identity like its `UTIL_isSameFileStat`).
@@ -5972,7 +5971,20 @@ fn open_input_with(
     // tells from it whether the open went through a link.
     let entry = removes_sources(opts).then(|| identity::of_entry(input));
     between();
-    let source = File::open(input).wrap_err_with(|| input.display().to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A regular file is opened without waiting: a FIFO put in its place then
+    // opens at once, with no writer, and the identity check below refuses it
+    // instead of the run hanging on the open. Reading a regular file ignores
+    // `O_NONBLOCK`.
+    #[cfg(unix)]
+    if named.is_file() {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let source = options
+        .open(input)
+        .wrap_err_with(|| input.display().to_string())?;
     let metadata = source
         .metadata()
         .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;

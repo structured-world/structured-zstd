@@ -7199,10 +7199,10 @@ fn rm_reports_a_path_naming_nothing_as_changed() {
     assert!(source.exists());
 }
 
-/// A path that runs through a regular file, a name longer than the system
-/// takes, or an entry the system refuses to unlink (a directory, refused even
-/// to root), is an error rather than a silent keep: the caller reports the
-/// failed removal.
+/// A path that runs through a regular file or a loop of symbolic links, a
+/// linked source whose link now loops, or an entry the system refuses to
+/// unlink (a directory, refused even to root), is an error rather than a
+/// silent keep: the caller reports the failed removal.
 #[cfg(unix)]
 #[test]
 fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
@@ -7212,10 +7212,12 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
     if !removal_is_bound(&file, processed) {
         return;
     }
+    let looping = scratch.path().join("loop");
+    std::os::unix::fs::symlink(&looping, &looping).unwrap();
     for unresolvable in [
         file.join("x"),
         file.join("sub").join("x"),
-        scratch.path().join("x".repeat(300)),
+        looping.join("x"),
     ] {
         assert!(
             identity::remove_if(&unresolvable, processed, None).is_err(),
@@ -7223,6 +7225,10 @@ fn rm_reports_a_path_it_cannot_resolve_or_unlink_as_an_error() {
             unresolvable.display()
         );
     }
+    // The entry is still the link recorded, but following it loops.
+    let link = identity::of_entry(&looping);
+    assert!(identity::remove_if(&looping, processed, link).is_err());
+    assert!(fs::symlink_metadata(&looping).is_ok(), "the link stays");
 
     let dir = scratch.path().join("dir");
     fs::create_dir(&dir).unwrap();
@@ -7457,19 +7463,39 @@ fn a_failed_removal_keeps_the_source_as_a_failure() {
 
 /// `-` with `-o` compresses standard input into that file through the
 /// single-input path, which has no source to open or remove even under
-/// `--rm`. (Where the test's standard input is a terminal it does not
-/// apply.)
+/// `--rm`. Standard input is a pipe the test fills and closes, so the run
+/// reads a known payload to its end whatever the harness's own input is.
+#[cfg(unix)]
 #[test]
 fn stdin_is_compressed_into_a_named_output() {
-    use std::io::IsTerminal;
-    if io::stdin().is_terminal() {
-        return;
-    }
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let payload = b"standard input payload\n";
+    let mut ends = [0; 2];
+    // SAFETY: `ends` has room for the two descriptors `pipe` returns.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: both were just returned by `pipe` and nothing else owns them.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    let mut writer = File::from(writer);
+    writer.write_all(payload).unwrap();
+    drop(writer);
+    // SAFETY: duplicating descriptors; the original standard input, if the
+    // harness gave one, is kept in `saved` and put back below.
+    let saved = unsafe { libc::dup(0) };
+    let saved = (saved >= 0).then(|| unsafe { OwnedFd::from_raw_fd(saved) });
+    assert_eq!(unsafe { libc::dup2(reader.as_raw_fd(), 0) }, 0);
+
     let scratch = Scratch::new("stdin-out");
     let archive = scratch.path().join("out.zst");
     let opts = parse(&["-q", "--rm", "-o", archive.to_str().unwrap(), "-"]).unwrap();
-    assert_eq!(run(opts).unwrap(), 0);
-    assert!(decoded(&fs::read(&archive).unwrap()).is_ok());
+    let status = run(opts);
+    // SAFETY: as above; with no standard input to begin with, none is left.
+    match &saved {
+        Some(saved) => assert_eq!(unsafe { libc::dup2(saved.as_raw_fd(), 0) }, 0),
+        None => assert_eq!(unsafe { libc::close(0) }, 0),
+    }
+    assert_eq!(status.unwrap(), 0);
+    assert_eq!(decoded(&fs::read(&archive).unwrap()).unwrap(), payload);
 }
 
 /// A read-only source is removed as `fs::remove_file` removes it: on Windows
@@ -7540,6 +7566,37 @@ fn a_source_replaced_before_it_is_opened_is_refused() {
         err.to_string().contains("changed while opening"),
         "got: {err}"
     );
+}
+
+/// A regular source replaced by a FIFO with no writer between its lookup and
+/// its open is refused too, rather than leaving the open waiting for a writer
+/// that never comes, which would hang the run before the identity check.
+#[cfg(unix)]
+#[test]
+fn a_source_replaced_by_a_fifo_before_it_is_opened_is_refused() {
+    let scratch = Scratch::new("openfifo");
+    let source = scratch.file("data.txt", b"checked content");
+    let fifo = scratch.path().join("fifo");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `fifo_name` is NUL-terminated.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let opts = parse(&["-q", "x"]).unwrap();
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let (path, moved) = (source.clone(), fifo.clone());
+    std::thread::spawn(move || {
+        let opened = open_input_with(&opts, &path, || fs::rename(&moved, &path).unwrap());
+        let _ = done.send(opened.err().map(|err| err.to_string()));
+    });
+    let outcome = finished.recv_timeout(std::time::Duration::from_secs(5));
+    if outcome.is_err() {
+        // Release the open still waiting, so the thread ends.
+        drop(fs::OpenOptions::new().write(true).open(&source));
+    }
+    let err = outcome
+        .expect("the open must not wait for a writer")
+        .expect("the replaced source is refused");
+    assert!(err.contains("changed while opening"), "got: {err}");
 }
 
 /// An input whose output was placed but whose source `--rm` could not remove
