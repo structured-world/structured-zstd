@@ -3387,11 +3387,13 @@ fn process_concatenated(
             // the output takes the source's permissions; several inputs share
             // an output that takes none of theirs.
             if let [input] = inputs[..] {
-                let (source, metadata) = if input == Path::new("-") {
-                    (None, None)
+                let (source, metadata, processed_id) = if input == Path::new("-") {
+                    (None, None, None)
                 } else {
                     match open_input(opts, input) {
-                        Ok(Some((source, metadata))) => (Some(source), Some(metadata)),
+                        Ok(Some((source, metadata, processed))) => {
+                            (Some(source), Some(metadata), processed)
+                        }
                         Ok(None) => return Ok(0),
                         Err(err) => {
                             display!(opts.verbosity, 1, "zstd: {err}");
@@ -3404,8 +3406,11 @@ fn process_concatenated(
                 } else {
                     STDIN_MARK.to_string()
                 };
+                // The source stays open until it is removed: an open file
+                // keeps its inode, so no other file can take its number and
+                // pass for it.
                 let written =
-                    write_output_file(opts, output, metadata.as_ref(), |sink| match source {
+                    write_output_file(opts, output, metadata.as_ref(), |sink| match &source {
                         Some(source) => stream_opened(
                             opts,
                             codecs,
@@ -3425,10 +3430,12 @@ fn process_concatenated(
                             &output.display().to_string(),
                             &processed,
                         );
-                        if remove_source && input != Path::new("-") {
-                            remove_source_if_requested(opts, input, placement)?;
-                        }
-                        tally.record(Outcome::Done(processed));
+                        let removed = if remove_source && input != Path::new("-") {
+                            remove_source_if_requested(opts, input, processed_id, placement)
+                        } else {
+                            Ok(())
+                        };
+                        tally.record(placed_outcome(opts, input, processed, removed));
                     }
                     None => tally.record(Outcome::Refused),
                 }
@@ -3597,7 +3604,11 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             } else {
                 match process_file(opts, input, codecs, total) {
                     Ok(outcome) => {
-                        if let (Outcome::Done(_), Some(output)) = (&outcome, &output)
+                        // A source that could not be removed still left its
+                        // output in place, which a later input must not
+                        // overwrite.
+                        if let (Outcome::Done(_) | Outcome::SourceKept(_), Some(output)) =
+                            (&outcome, &output)
                             && let Some(id) = identity::of_path(output)
                         {
                             written.insert(id);
@@ -3659,6 +3670,28 @@ enum Outcome {
     Skipped,
     /// Not processed, and already reported.
     Refused,
+    /// Processed and its output in place, but `--rm` could not remove the
+    /// source, which is reported. A failure, as the reference command exits
+    /// with an error there.
+    SourceKept(Processed),
+}
+
+/// The outcome of an input whose output is in place, given how removing its
+/// source went: a removal error is reported here and counts as a failure,
+/// while the output still counts as written.
+fn placed_outcome(
+    opts: &Options,
+    input: &Path,
+    processed: Processed,
+    removed: Result<()>,
+) -> Outcome {
+    match removed {
+        Ok(()) => Outcome::Done(processed),
+        Err(err) => {
+            report(opts.verbosity, &named(err, &input.display().to_string()));
+            Outcome::SourceKept(processed)
+        }
+    }
 }
 
 /// Bytes an input contributed: read from it, and written for it.
@@ -3689,6 +3722,14 @@ impl Tally {
             }
             Outcome::Skipped => {}
             Outcome::Refused => self.failed += 1,
+            Outcome::SourceKept(processed) => {
+                // Its output is written, so it is one of the files the
+                // summary counts, as the reference counts it before removing.
+                self.processed += 1;
+                self.failed += 1;
+                self.read += processed.read;
+                self.written += processed.written;
+            }
         }
     }
 }
@@ -5718,14 +5759,20 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
 }
 
 /// Remove the source file after a successful (de)compression when `--rm` is set
-/// (and `-k` was not) and a regular file now holds the output (`placement`).
+/// (and `-k` was not), a regular file now holds the output (`placement`), and
+/// `input` still names `processed`, the file that was opened and read.
 /// A no-op otherwise.
-fn remove_source_if_requested(opts: &Options, input: &Path, placement: Placement) -> Result<()> {
+fn remove_source_if_requested(
+    opts: &Options,
+    input: &Path,
+    processed: Option<identity::Source>,
+    placement: Placement,
+) -> Result<()> {
     // Never when the output went to stdout: that may have been a pipe whose
     // reader is gone, a terminal, or anything else we cannot read back, so
     // there is no saved copy to justify deleting the original. Upstream keeps
     // the file for `-c` too.
-    if !opts.remove_source || opts.keep || opts.to_stdout {
+    if !removes_sources(opts) {
         return Ok(());
     }
     // Nor when a device or pipe took the output in place (`-o /dev/null`, a
@@ -5744,8 +5791,43 @@ fn remove_source_if_requested(opts: &Options, input: &Path, placement: Placement
     // delete anything: the output is in place, and the guard would take it
     // along with the source.
     interrupt::clear();
-    fs::remove_file(input).wrap_err("failed to remove source file after success")?;
+    // The path is resolved again to remove it, and a parent directory renamed
+    // meanwhile makes it name another file: only the file that was processed
+    // is removed, as upstream zstd (fileio.c `FIO_removeFile`) checks device
+    // and inode, and the check and the removal go through one handle so the
+    // path cannot change between them. Where no identity can be read the file
+    // stays, since nothing confirms it is the one processed.
+    let removal = match processed {
+        Some(processed) => identity::remove_if(input, processed.id, processed.link)
+            .wrap_err("failed to remove source file after success")?,
+        None => identity::Removal::Unconfirmed,
+    };
+    // A source kept because it cannot be confirmed is a safe refusal, not a
+    // failure: the exit status stays 0, as upstream zstd's `FIO_removeFile`
+    // (fileio.c) returns 0 "on success or safe refusal".
+    match removal {
+        identity::Removal::Removed => {}
+        identity::Removal::Changed => display!(
+            opts.verbosity,
+            1,
+            "zstd: {} changed while processing -- ignored for removal",
+            input.display()
+        ),
+        identity::Removal::Unconfirmed => display!(
+            opts.verbosity,
+            1,
+            "zstd: {}: cannot confirm it is the file processed -- ignored for removal",
+            input.display()
+        ),
+    }
     Ok(())
+}
+
+/// Whether a processed source can be removed at all: `--rm` without `-k`,
+/// and an output that is not stdout (which may be a pipe whose reader is
+/// gone, so nothing would hold the data). Test mode writes nothing.
+fn removes_sources(opts: &Options) -> bool {
+    opts.remove_source && !opts.keep && !opts.to_stdout && opts.mode != Mode::Test
 }
 
 /// Counts what passes through to the writer beneath, so the summary can say
@@ -5827,8 +5909,12 @@ fn is_block_device_type(kind: &fs::FileType) -> bool {
 /// way the reference command refuses them ("-- ignored"); `-f` admits block
 /// devices. The kind and length that matter are those of the OPEN file: a
 /// path is only a name, and can be made to name something else between the
-/// look and the open.
-fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata)>> {
+/// look and the open. Under `--rm` it also returns the file opened as its
+/// removal needs it.
+fn open_input(
+    opts: &Options,
+    input: &Path,
+) -> Result<Option<(File, fs::Metadata, Option<identity::Source>)>> {
     // The reference's lines, trailing space included (`fileio.c:555-564`,
     // 2040).
     let named = fs::metadata(input).map_err(|err| {
@@ -5871,6 +5957,9 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
         );
         return Ok(None);
     }
+    // Read only when it can be used, and before the open: `Source::opened`
+    // tells from it whether the open went through a link.
+    let entry = removes_sources(opts).then(|| identity::of_entry(input));
     let source = File::open(input).wrap_err_with(|| input.display().to_string())?;
     let metadata = source
         .metadata()
@@ -5878,7 +5967,8 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
     if metadata.is_dir() || !admissible(&metadata.file_type()) {
         bail!("{} is not a regular file -- ignored ", input.display());
     }
-    Ok(Some((source, metadata)))
+    let processed = entry.and_then(|entry| identity::Source::opened(entry, &source, &metadata));
+    Ok(Some((source, metadata, processed)))
 }
 
 /// The system's description of `err`, as `strerror` gives it: without the
@@ -5897,7 +5987,7 @@ fn os_error_text(err: &io::Error) -> String {
 fn stream_opened<W: Write>(
     opts: &Options,
     codecs: &mut Codecs,
-    source: File,
+    source: &File,
     metadata: &fs::Metadata,
     sink: W,
 ) -> Result<Processed> {
@@ -6011,9 +6101,9 @@ fn stream_input_to<W: Write>(
         )
     } else {
         match open_input(opts, input) {
-            Ok(Some((source, metadata))) => (
+            Ok(Some((source, metadata, _))) => (
                 input.display().to_string(),
-                stream_opened(opts, codecs, source, &metadata, &mut sink),
+                stream_opened(opts, codecs, &source, &metadata, &mut sink),
             ),
             Ok(None) => return Ok(Outcome::Skipped),
             Err(err) => {
@@ -6237,14 +6327,14 @@ fn process_file(
     codecs: &mut Codecs,
     total: usize,
 ) -> Result<Outcome> {
-    let Some((source, metadata)) = open_input(opts, input)? else {
+    let Some((source, metadata, processed_id)) = open_input(opts, input)? else {
         return Ok(Outcome::Skipped);
     };
     let name = input.display().to_string();
 
     // Test mode: decompress into the void, report what was there.
     if opts.mode == Mode::Test {
-        let processed = stream_opened(opts, codecs, source, &metadata, io::sink())?;
+        let processed = stream_opened(opts, codecs, &source, &metadata, io::sink())?;
         file_summary(opts, total, &name, "", &processed);
         return Ok(Outcome::Done(processed));
     }
@@ -6254,8 +6344,10 @@ fn process_file(
     if let Some(root) = &opts.output_dir_mirror {
         inputs::create_mirrored_dirs(input, root)?;
     }
+    // `source` stays open until it is removed: an open file keeps its inode,
+    // so no other file can take its number and pass for it.
     let Some((processed, placement)) = write_output_file(opts, &output, Some(&metadata), |sink| {
-        stream_opened(opts, codecs, source, &metadata, sink)
+        stream_opened(opts, codecs, &source, &metadata, sink)
     })?
     else {
         return Ok(Outcome::Refused);
@@ -6267,8 +6359,8 @@ fn process_file(
         &output.display().to_string(),
         &processed,
     );
-    remove_source_if_requested(opts, input, placement)?;
-    Ok(Outcome::Done(processed))
+    let removed = remove_source_if_requested(opts, input, processed_id, placement);
+    Ok(placed_outcome(opts, input, processed, removed))
 }
 
 /// Everything the command line says about how one frame is to be built.
