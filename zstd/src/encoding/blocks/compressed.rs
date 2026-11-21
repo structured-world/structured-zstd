@@ -589,36 +589,33 @@ pub(crate) fn compress_block<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     output: &mut Vec<u8>,
 ) -> BlockTables {
-    let mut scratch = core::mem::take(&mut state.block_scratch);
+    // Only the two buffers a block fills are taken out while `state` is lent
+    // whole: they move as a few words, where taking the whole scratch moved
+    // its 320 bytes out and back through three `memcpy` calls a block.
+    let mut parts = core::mem::take(&mut state.block_scratch.parts);
     let tables = if state.literal_compression_disabled {
         // Raw literals go to the output as they are gathered: the section is
         // the runs behind a header, so staging them in the literals buffer
         // first would copy every literal byte twice.
-        let tail = collect_block_sequences::<M, K>(state, &mut scratch.parts);
+        let tail = collect_block_sequences::<M, K>(state, &mut parts);
         write_raw_literals_from_runs::<K>(
             state.matcher.get_last_space(),
-            &scratch.parts.sequences,
+            &parts.sequences,
             tail,
             output,
         );
         let mut writer = BitWriter::from(output);
-        let fse =
-            encode_sequences_section::<M, K>(state, &mut scratch.parts.sequences, &mut writer);
+        let fse = encode_sequences_section::<M, K>(state, &mut parts.sequences, &mut writer);
         writer.flush();
         BlockTables {
             fse,
             huff: HuffOutcome::Keep,
         }
     } else {
-        collect_block_parts::<M, K>(state, &mut scratch.parts);
-        encode_block_parts::<M, K>(
-            state,
-            &scratch.parts.literals,
-            &mut scratch.parts.sequences,
-            output,
-        )
+        collect_block_parts::<M, K>(state, &mut parts);
+        encode_block_parts::<M, K>(state, &parts.literals, &mut parts.sequences, output)
     };
-    state.block_scratch = scratch;
+    state.block_scratch.parts = parts;
     tables
 }
 
@@ -3109,7 +3106,7 @@ fn commit_last_used_table(
 /// `encode_sequences_bmi2`. A macro so each tier's loop is compiled inside its
 /// own function and the bit writer and the FSE lookups inline into it.
 macro_rules! encode_sequences_body {
-    ($sequences:expr, $writer:expr, $modes:expr, $defaults:expr) => {{
+    ($sequences:expr, $writer:expr, $modes:expr, $defaults:expr, $copy:expr) => {{
         let sequences: &[RawSequence] = $sequences;
         let writer: &mut BitWriter<&mut Vec<u8>> = $writer;
         let [ll_mode, ml_mode, of_mode]: [&FseTableMode<'_>; 3] = $modes;
@@ -3162,10 +3159,15 @@ macro_rules! encode_sequences_body {
             // more, +0.4..0.6% instructions at level 1 against the per-block
             // copy this costs.
             let mut view = core::mem::MaybeUninit::uninit();
-            let view = crate::fse::fse_encoder::SequenceStateTables::init(
-                &mut view,
-                [ll_table, ml_table, of_table],
-            );
+            // SAFETY: the tier's copy runs on this CPU (its caller's
+            // `target_feature`) and copies between the tables and the stack.
+            let view = unsafe {
+                crate::fse::fse_encoder::SequenceStateTables::init(
+                    &mut view,
+                    [ll_table, ml_table, of_table],
+                    $copy,
+                )
+            };
             // At most 63 bits a sequence leave as whole bytes, under 8 bytes;
             // 12 a sequence and 64 over covers that and the up to 7 bytes the
             // burst drains from the init-state writes above as it starts,
@@ -3377,14 +3379,22 @@ fn encode_sequences<K: EncodeTier>(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-avx2"
 ))]
-#[target_feature(enable = "bmi2")]
+// AVX2 as well: the tier that runs this has confirmed it, and the state
+// tables are copied into the loop's view with its vectors.
+#[target_feature(enable = "avx2,bmi2")]
 unsafe fn encode_sequences_bmi2(
     sequences: &[RawSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
     modes: [&FseTableMode<'_>; 3],
     defaults: [&FSETable; 3],
 ) {
-    encode_sequences_body!(sequences, writer, modes, defaults)
+    encode_sequences_body!(
+        sequences,
+        writer,
+        modes,
+        defaults,
+        crate::decoding::simd_copy::copy_avx2
+    )
 }
 
 fn encode_sequences_scalar(
@@ -3393,7 +3403,12 @@ fn encode_sequences_scalar(
     modes: [&FseTableMode<'_>; 3],
     defaults: [&FSETable; 3],
 ) {
-    encode_sequences_body!(sequences, writer, modes, defaults)
+    /// The plain copy; the view's lengths need nothing more of it.
+    unsafe fn copy_bytes(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: as `SequenceStateTables::init` requires of its copy.
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, len) }
+    }
+    encode_sequences_body!(sequences, writer, modes, defaults, copy_bytes)
 }
 
 /// RFC 8878 3.1.1.3.1: a first byte below 128 is the count; 128..=254 leads

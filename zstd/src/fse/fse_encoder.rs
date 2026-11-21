@@ -399,21 +399,27 @@ pub(crate) struct SequenceStateTables {
 impl SequenceStateTables {
     /// Build the view in `storage` from the LL / ML / OF tables, `None` for a
     /// stream in RLE mode. Each stream is written once, straight from its
-    /// table, with nothing cleared first.
+    /// table, with nothing cleared first, by `copy`, which takes byte counts
+    /// that are multiples of 32 (see [`Self::write_stream`]).
+    ///
+    /// # Safety
+    /// `copy(src, dst, len)` copies `len` bytes between non-overlapping
+    /// regions and is callable on this CPU.
     #[inline(always)]
-    pub(crate) fn init<'view>(
+    pub(crate) unsafe fn init<'view>(
         storage: &'view mut MaybeUninit<Self>,
         tables: [Option<&FSETable>; 3],
+        copy: unsafe fn(*const u8, *mut u8, usize),
     ) -> &'view Self {
         let view = storage.as_mut_ptr();
         // SAFETY: `view` is the storage's own pointer and the streams are
-        // `0..3`. The three calls write every transform and every size, so
-        // what is left unwritten lies in `next` past each size, which is
-        // `MaybeUninit`.
+        // `0..3`; `copy` as the caller guarantees. The three calls write
+        // every transform and every size, so what is left unwritten lies in
+        // `next` past each size, which is `MaybeUninit`.
         unsafe {
-            Self::write_stream(view, 0, tables[0]);
-            Self::write_stream(view, 1, tables[1]);
-            Self::write_stream(view, 2, tables[2]);
+            Self::write_stream(view, 0, tables[0], copy);
+            Self::write_stream(view, 1, tables[1], copy);
+            Self::write_stream(view, 2, tables[2], copy);
             storage.assume_init_ref()
         }
     }
@@ -421,10 +427,24 @@ impl SequenceStateTables {
     /// Write stream `stream`'s parts from `table`, or an RLE stream's
     /// one-state table for `None`.
     ///
+    /// Both copies are whole 32-byte chunks: the transforms are
+    /// `SEQUENCE_CODE_SYMBOLS` 8-byte entries, and a table holds `1 << log`
+    /// 2-byte states with `log >= 5`, the least Accuracy_Log the format can
+    /// carry (RFC 8878 4.1.1, the low four bits plus 5), so 64 bytes and up.
+    /// That lets a tier copy with its own vectors instead of a libc call per
+    /// copy, which on a libc with a slow small `memcpy` (musl) cost more than
+    /// the block's sequence loop gained from the view.
+    ///
     /// # Safety
-    /// `view` points at storage for a view, valid for writes, and `stream < 3`.
+    /// `view` points at storage for a view, valid for writes, `stream < 3`,
+    /// and `copy` as for [`Self::init`].
     #[inline(always)]
-    unsafe fn write_stream(view: *mut Self, stream: usize, table: Option<&FSETable>) {
+    unsafe fn write_stream(
+        view: *mut Self,
+        stream: usize,
+        table: Option<&FSETable>,
+        copy: unsafe fn(*const u8, *mut u8, usize),
+    ) {
         debug_assert!(stream < 3);
         // SAFETY: the caller's contract puts both rows inside the storage.
         let (tt, next) = unsafe {
@@ -444,13 +464,28 @@ impl SequenceStateTables {
                 let size = table.table_size;
                 let states = &table.state_table_flat[..size];
                 debug_assert!(size <= MAX_FSE_TABLE_SIZE);
+                debug_assert!(
+                    size >= 32 && size.is_power_of_two(),
+                    "an FSE table of {size} states is below the format's least log"
+                );
+                const TRANSFORM_BYTES: usize =
+                    SEQUENCE_CODE_SYMBOLS * core::mem::size_of::<SymbolTT>();
+                const _: () = assert!(TRANSFORM_BYTES.is_multiple_of(32));
                 // SAFETY: a row holds `SEQUENCE_CODE_SYMBOLS` transforms and
                 // `MAX_FSE_TABLE_SIZE >= size` states; the table is a
-                // different allocation.
+                // different allocation. Both lengths are multiples of 32
+                // (above), which `copy` may require.
                 unsafe {
-                    tt.cast::<SymbolTT>()
-                        .copy_from_nonoverlapping(transforms.as_ptr(), SEQUENCE_CODE_SYMBOLS);
-                    next.copy_from_nonoverlapping(states.as_ptr(), size);
+                    copy(
+                        transforms.as_ptr().cast::<u8>(),
+                        tt.cast::<u8>(),
+                        TRANSFORM_BYTES,
+                    );
+                    copy(
+                        states.as_ptr().cast::<u8>(),
+                        next.cast::<u8>(),
+                        size * core::mem::size_of::<u16>(),
+                    );
                 }
                 size
             }

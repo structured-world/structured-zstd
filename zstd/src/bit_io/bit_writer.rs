@@ -188,9 +188,33 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     pub fn flush(&mut self) {
         assert!(self.bits_in_partial.is_multiple_of(8));
         let full_bytes = self.bits_in_partial / 8;
-        self.output
-            .as_mut()
-            .extend_from_slice(&self.partial.to_le_bytes()[..full_bytes]);
+        // Nothing held: no room is asked for, so an output sized exactly to
+        // what it holds is not grown.
+        if full_bytes == 0 {
+            return;
+        }
+        // All eight bytes go into spare room in one store and only the held
+        // ones are kept: a slice of run-time length was a `memcpy` call per
+        // flush, which a libc with a slow small `memcpy` (musl) pays dearly.
+        // Without that room the slice is appended as before, so the output
+        // grows exactly when it did.
+        let output = self.output.as_mut();
+        let len = output.len();
+        if output.capacity() - len >= 8 {
+            // SAFETY: 8 bytes of spare capacity past `len`, checked above;
+            // `full_bytes <= 8` of them are written before the length covers
+            // them.
+            unsafe {
+                output
+                    .as_mut_ptr()
+                    .add(len)
+                    .cast::<[u8; 8]>()
+                    .write_unaligned(self.partial.to_le_bytes());
+                output.set_len(len + full_bytes);
+            }
+        } else {
+            output.extend_from_slice(&self.partial.to_le_bytes()[..full_bytes]);
+        }
         // `full_bytes == 8` (full accumulator) means a raw
         // `partial >>= 64` would be UB on `u64`. This SAFE function is
         // reachable indirectly via `with_aligned_output_mut`,

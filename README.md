@@ -47,9 +47,10 @@ cargo add structured-zstd        # the library
 cargo install structured-zstd    # the `structured-zstd` binary
 ```
 
-It carries no dependencies of its own — argument parsing, progress display and
-error reporting are written against `std` — so depending on the library pulls
-in nothing extra.
+Argument parsing, progress display and error reporting are written against
+`std`. The tool's one dependency is `libc` on Unix, behind the default `cli`
+feature, for the directory-relative file checks `--rm` makes; a library build
+that leaves out default features pulls in none of it.
 
 The binary speaks the upstream `zstd`
 command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
