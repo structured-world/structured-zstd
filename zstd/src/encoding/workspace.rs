@@ -479,7 +479,7 @@ impl Workspace {
                 // it. Writing the zeros first faults each page once, as
                 // upstream does by clearing its tables
                 // (`ZSTD_cwksp_clean_tables`).
-                region.zero();
+                region.populate_or_zero();
                 #[cfg(test)]
                 {
                     self.zero_tables_written += 1;
@@ -814,6 +814,46 @@ impl<T: Copy> Region<T> {
         // SAFETY: the region spans `len` values of `T`, and all-zero bytes
         // are a valid `TableValue` (a plain integer).
         unsafe { core::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+    }
+
+    /// The table of zeros [`Self::zero`] writes, for a region of a zeroed
+    /// allocation on fresh, demand-zero pages, which already holds them: the
+    /// kernel maps every page of it writable in one call instead of one write
+    /// fault per page from the memset. Where the call is refused (a kernel
+    /// before 5.14, a range it will not populate) the memset runs as before.
+    fn populate_or_zero(&mut self)
+    where
+        T: TableValue,
+    {
+        // no-std: the memset below, the only path without an operating system.
+        #[cfg(all(feature = "std", target_os = "linux"))]
+        {
+            unsafe extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            // madvise(2): `MADV_POPULATE_WRITE` (Linux 5.14) populates the
+            // page tables writable as a write to each page would, without
+            // writing: the pages keep the zeros they were mapped with.
+            const MADV_POPULATE_WRITE: i32 = 23;
+            let start = self.ptr.as_ptr() as usize;
+            let end = start + self.len * size_of::<T>();
+            let page_start = start & !(PAGE_BYTES - 1);
+            let page_end = (end + PAGE_BYTES - 1) & !(PAGE_BYTES - 1);
+            // SAFETY: every page in the range holds bytes of this region, in
+            // memory the process has mapped; the call changes no byte of it,
+            // and a page it cannot populate makes it fail without effect.
+            let done = unsafe {
+                madvise(
+                    page_start as *mut core::ffi::c_void,
+                    page_end - page_start,
+                    MADV_POPULATE_WRITE,
+                )
+            } == 0;
+            if done {
+                return;
+            }
+        }
+        self.zero();
     }
 }
 
