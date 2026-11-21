@@ -1996,7 +1996,15 @@ impl Matcher for MatchGeneratorDriver {
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
-                hc.bt.bind_scratch(workspace, block);
+                hc.bt.bind_scratch(
+                    workspace,
+                    block,
+                    matches!(
+                        hc.strategy_tag,
+                        super::strategy::StrategyTag::BtUltra
+                            | super::strategy::StrategyTag::BtUltra2
+                    ),
+                );
                 hc.reset();
             }
         }

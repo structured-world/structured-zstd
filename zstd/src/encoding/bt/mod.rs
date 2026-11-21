@@ -222,8 +222,14 @@ impl BtMatcher {
     /// upstream carves `opt` from the context's (`ZSTD_reset_matchState`).
     /// The price arena keeps its cells only where it continues the last
     /// frame's, together with the stamps they carry; otherwise it starts
-    /// zeroed and the stamps start over.
-    pub(crate) fn bind_scratch(&mut self, workspace: &mut Workspace, block: usize) {
+    /// zeroed and the stamps start over. `accurate_prices` says whether the
+    /// frame's strategy reads the arena at all (the fractional weight).
+    pub(crate) fn bind_scratch(
+        &mut self,
+        workspace: &mut Workspace,
+        block: usize,
+        accurate_prices: bool,
+    ) {
         use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_PRICE_ARENA_LEN};
         use super::hc::HC_OPT_CANDIDATE_CAPACITY;
         self.opt_segment_plan_scratch
@@ -234,12 +240,18 @@ impl BtMatcher {
             .bind_unwritten(workspace, HC_OPT_NODE_LEN);
         self.opt_candidates_scratch
             .bind_unwritten(workspace, HC_OPT_CANDIDATE_CAPACITY);
-        // Indexed by literal and match length codes, so a frame reaches a few
-        // of its pages.
-        if !self
-            .opt_price_arena
-            .bind_sparse(workspace, HC_OPT_PRICE_ARENA_LEN, [0, 0])
-        {
+        // A strategy that reads the arena probes a cell's stamp before it
+        // writes the price, so on fresh pages left demand-zero its one page
+        // would fault twice, a read and then a write: it is written first,
+        // one fault. One that never reads it leaves it untouched.
+        let continued = if accurate_prices {
+            self.opt_price_arena
+                .bind(workspace, HC_OPT_PRICE_ARENA_LEN, [0, 0])
+        } else {
+            self.opt_price_arena
+                .bind_sparse(workspace, HC_OPT_PRICE_ARENA_LEN, [0, 0])
+        };
+        if !continued {
             self.opt_ll_price_stamp = 0;
             self.opt_ml_price_stamp = 0;
         }

@@ -820,9 +820,13 @@ fn heap_size_counts_the_retained_weight_scratch() {
     // repeat, so the block goes out as literals and the entropy path actually
     // builds a Huffman table — which is what leaves the scratch holding its
     // buffers. A periodic fixture would compress to sequences instead and
-    // never reach the table build.
+    // never reach the table build. Several blocks long: a later block's table
+    // replaces the earlier one, which is parked in the scratch. A single block
+    // parks nothing, and the scratch's weight FSE table sits in the workspace
+    // wherever the layout takes fresh pages (a 32-bit target at this size), so
+    // only the parked table holds heap on every target.
     let mut state = 0x2545_F491_4F6C_DD1Du64;
-    let data: Vec<u8> = (0..64 * 1024u32)
+    let data: Vec<u8> = (0..300 * 1024u32)
         .map(|_| {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((state >> 33) % 64) as u8

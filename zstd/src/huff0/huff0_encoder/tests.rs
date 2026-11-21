@@ -105,19 +105,31 @@ fn the_cached_weight_description_counts_as_retained() {
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
-    assert_eq!(table.codes[0], (1, 2));
-    assert_eq!(table.codes[1], (2, 2));
-    assert_eq!(table.codes[2], (3, 2));
-    assert_eq!(table.codes[3], (0, 3));
-    assert_eq!(table.codes[4], (1, 3));
+    assert_eq!(table.code_list(), [(1, 2), (2, 2), (3, 2), (0, 3), (1, 3)]);
 
     let table = HuffmanTable::build_from_weights(&[4, 3, 2, 0, 1, 1]);
-    assert_eq!(table.codes[0], (1, 1));
-    assert_eq!(table.codes[1], (1, 2));
-    assert_eq!(table.codes[2], (1, 3));
-    assert_eq!(table.codes[3], (0, 0));
-    assert_eq!(table.codes[4], (0, 4));
-    assert_eq!(table.codes[5], (1, 4));
+    assert_eq!(
+        table.code_list(),
+        [(1, 1), (1, 2), (1, 3), (0, 0), (0, 4), (1, 4)]
+    );
+}
+
+/// The packed table is the only form of the codes the table keeps, so every
+/// code must read back as the value and length it was packed from, the empty
+/// code included, for every length a table can hold.
+#[test]
+fn every_packed_code_reads_back_as_its_value_and_length() {
+    assert_eq!(unpack_code(0), (0, 0));
+    for nb_bits in 1..=12u8 {
+        for value in [0u32, 1, (1 << nb_bits) - 1, (1 << nb_bits) >> 1] {
+            let packed = crate::huff0::huf_cstream::pack_huf_celt(value, nb_bits);
+            assert_eq!(
+                unpack_code(packed),
+                (value, nb_bits),
+                "{value} in {nb_bits} bits"
+            );
+        }
+    }
 }
 
 // Regression: the non-search literal-table path (fast / negative levels,
@@ -295,7 +307,7 @@ fn weights() {
                 sum
             );
 
-            let codes = HuffmanTable::build_from_weights(&weights).codes;
+            let codes = HuffmanTable::build_from_weights(&weights).code_list();
             for (code, num_bits) in codes.iter().copied() {
                 for (code2, num_bits2) in codes.iter().copied() {
                     if num_bits == 0 || num_bits2 == 0 || (code, num_bits) == (code2, num_bits2) {
@@ -317,7 +329,7 @@ fn weights() {
 #[test]
 fn counts() {
     let counts = &[3, 0, 4, 1, 5];
-    let table = HuffmanTable::build_from_counts(counts).codes;
+    let table = HuffmanTable::build_from_counts(counts).code_list();
 
     assert_eq!(table[1].1, 0);
     assert!(table[3].1 >= table[0].1);
@@ -325,7 +337,7 @@ fn counts() {
     assert!(table[2].1 >= table[4].1);
 
     let counts = &[3, 0, 4, 0, 7, 2, 2, 2, 0, 2, 2, 1, 5];
-    let table = HuffmanTable::build_from_counts(counts).codes;
+    let table = HuffmanTable::build_from_counts(counts).code_list();
 
     assert_eq!(table[1].1, 0);
     assert_eq!(table[3].1, 0);
@@ -344,10 +356,10 @@ fn counts() {
 #[test]
 fn from_data() {
     let counts = &[3, 0, 4, 1, 2];
-    let table = HuffmanTable::build_from_counts(counts).codes;
+    let table = HuffmanTable::build_from_counts(counts).code_list();
 
     let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2];
-    let table2 = HuffmanTable::build_from_data(data).codes;
+    let table2 = HuffmanTable::build_from_data(data).code_list();
 
     assert_eq!(table, table2);
 }
@@ -879,7 +891,7 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
         state ^= state << 17;
         state
     };
-    let mut leaves_scratch = WeightScratch::default();
+    let mut leaves = NodeBuf::new();
     let mut spare_leaves: Option<HuffmanTable> = None;
     let mut spare_weights: Option<HuffmanTable> = None;
     for case in 0..2000 {
@@ -897,19 +909,19 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
             continue;
         }
         let table_log = 5 + (next() % 7) as usize;
-        build_huffman_leaf_depths_into(&counts, &mut leaves_scratch.leaves);
-        if !limit_leaves_in_place(&mut leaves_scratch.leaves, table_log) {
+        build_huffman_leaf_depths_into(&counts, &mut leaves);
+        if !limit_leaves_in_place(&mut leaves, table_log) {
             continue;
         }
         let mut weights = alloc::vec![0usize; alphabet];
-        for leaf in &leaves_scratch.leaves {
+        for leaf in leaves.iter() {
             weights[leaf.symbol as usize] = table_log + 1 - leaf.nb_bits as usize;
         }
         // What the build reports about the code before it lays the table out:
         // the bits the histogram takes, and a weight per symbol below the last.
         let mut shape_seen = None;
         let from_leaves = HuffmanTable::build_from_limited_leaves(
-            &leaves_scratch.leaves,
+            &leaves,
             alphabet,
             table_log,
             &mut spare_leaves,
@@ -925,8 +937,8 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
             payload_bits,
             counts
                 .iter()
-                .zip(&from_weights.codes)
-                .map(|(&count, &(_, nb_bits))| count * nb_bits as usize)
+                .zip(from_weights.code_list())
+                .map(|(&count, (_, nb_bits))| count * nb_bits as usize)
                 .sum::<usize>(),
             "case {case}"
         );
@@ -936,7 +948,11 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
             listed[weight as usize] += 1;
         }
         assert_eq!(weight_counts, listed, "case {case}");
-        assert_eq!(from_leaves.codes, from_weights.codes, "case {case}");
+        assert_eq!(
+            from_leaves.code_list(),
+            from_weights.code_list(),
+            "case {case}"
+        );
         assert_eq!(
             from_leaves.packed_codes, from_weights.packed_codes,
             "case {case}"
@@ -960,8 +976,9 @@ fn build_from_counts_accepts_the_largest_section_the_encoder_can_produce() {
     // gives both a one-bit code whatever their counts. The frequent one taking
     // the shorter code is the tree having been built from these counts rather
     // than from truncated ones.
-    assert!(table.codes[b'a' as usize].1 < table.codes[b'b' as usize].1);
-    assert_eq!(table.codes[b'b' as usize].1, table.codes[b'c' as usize].1);
+    let codes = table.code_list();
+    assert!(codes[b'a' as usize].1 < codes[b'b' as usize].1);
+    assert_eq!(codes[b'b' as usize].1, codes[b'c' as usize].1);
 }
 
 /// Every route of the gated build gives a table that codes its histogram: the
@@ -985,7 +1002,7 @@ fn every_route_of_the_gated_build_codes_its_histogram() {
     }
     let searched = HuffmanTable::build_from_counts_gated(&skewed, true);
     assert!(
-        searched.codes == HuffmanTable::build_from_counts(&skewed).codes,
+        searched.code_list() == HuffmanTable::build_from_counts(&skewed).code_list(),
         "the searched route is the plain build"
     );
     for (name, counts) in [("skewed", &skewed), ("fibonacci", &fibonacci)] {
@@ -1000,8 +1017,8 @@ fn every_route_of_the_gated_build_codes_its_histogram() {
     // One symbol has no Huffman code (the encoder writes such a section as
     // RLE first); the cheap route gives it what the plain builder does.
     assert!(
-        HuffmanTable::build_from_counts_gated(&single, false).codes
-            == HuffmanTable::build_from_counts(&single).codes,
+        HuffmanTable::build_from_counts_gated(&single, false).code_list()
+            == HuffmanTable::build_from_counts(&single).code_list(),
         "the single-symbol route differs from the plain build"
     );
 }
