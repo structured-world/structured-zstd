@@ -25,6 +25,7 @@ use super::match_table::helpers::extend_backwards_shared;
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 use super::simple::fast_kernel::count::count_forward_dict_2segment;
+#[cfg(not(target_pointer_width = "64"))]
 use super::util::hash_top_bits;
 use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
@@ -381,7 +382,18 @@ unsafe fn short_key_at(p: *const u8, avail: usize, mls: usize) -> u64 {
 /// at most 2^30 slots, so the width stays within the helper's 32 bits).
 #[inline(always)]
 fn dfast_slot(mixed: u64, shift: usize) -> usize {
-    hash_top_bits(mixed, (64 - shift) as u32) as usize
+    // On a 64-bit target the shifted product is the index itself: it has at
+    // most 30 bits, so a pass through the helper's `u32` only adds the
+    // zero-extension back to `usize` after every hash.
+    #[cfg(target_pointer_width = "64")]
+    {
+        debug_assert!(shift >= 34, "a dfast table holds at most 2^30 slots");
+        (mixed >> shift) as usize
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        hash_top_bits(mixed, (64 - shift) as u32) as usize
+    }
 }
 
 /// The tag of a hash product whose top bits (above `shift`) form the slot
@@ -3780,7 +3792,10 @@ macro_rules! start_matching_dict_loop_body {
         // The immutable dictionary tables, snapshotted once: nothing mutates
         // them while matching, so unlike the live tables they need no
         // re-snapshot per outer iteration.
-        let (dict_long_ptr, dict_short_ptr, dict_end, dict_long_shift, dict_short_shift) = {
+        // The shifts leave each table's slot index with its tag below it, so a
+        // probe takes both from one shifted product (upstream
+        // `dictHashAndTagL >> ZSTD_SHORT_CACHE_TAG_BITS`, zstd_double_fast.c:391).
+        let (dict_long_ptr, dict_short_ptr, dict_end, dict_long_key_shift, dict_short_key_shift) = {
             let d = $self
                 .dict
                 .table()
@@ -3789,8 +3804,8 @@ macro_rules! start_matching_dict_loop_body {
                 d.long.as_ptr(),
                 d.short.as_ptr(),
                 $self.dict.region_len(),
-                64 - d.long_bits,
-                64 - d.short_bits,
+                dfast_key_shift::<true>(64 - d.long_bits),
+                dfast_key_shift::<true>(64 - d.short_bits),
             )
         };
 
@@ -4024,18 +4039,16 @@ macro_rules! start_matching_dict_loop_body {
                         }
                     }
                     {
-                        let dmix = v8.wrapping_mul(PRIME);
+                        let (dl_slot, dl_tag) =
+                            dfast_slot_and_tag::<true>(v8.wrapping_mul(PRIME), dict_long_key_shift);
                         // SAFETY: the index is below the dict long table's length.
-                        let dl = unsafe { *dict_long_ptr.add((dmix >> dict_long_shift) as usize) };
+                        let dl = unsafe { *dict_long_ptr.add(dl_slot) };
                         // The tag rejects a colliding slot without touching the
                         // dictionary bytes (upstream `ZSTD_comparePackedTags`). An
                         // empty slot whose tag happens to agree decodes to a
                         // position past every byte and fails the bound below, so
                         // no emptiness test is spent on it, as upstream spends none.
-                        if dfast_branch!(
-                            6,
-                            (dl & DFAST_TAG_MASK) == dfast_tag(dmix, dict_long_shift)
-                        ) {
+                        if dfast_branch!(6, (dl & DFAST_TAG_MASK) == dl_tag) {
                             let dp = ((dl >> DFAST_TAG_BITS) as usize).wrapping_sub(1);
                             if dfast_branch!(7, dp < dict_end) {
                                 debug_assert!(dp + HASH_READ_SIZE <= dict_end);
@@ -4083,16 +4096,15 @@ macro_rules! start_matching_dict_loop_body {
                         short_cand_abs = position_base + (idxs as usize) - 1;
                         short_in_dict = false;
                     } else {
-                        let dsmix = short_key::<$mls>(v8).wrapping_mul(PRIME);
+                        let (ds_slot, ds_tag) = dfast_slot_and_tag::<true>(
+                            short_key::<$mls>(v8).wrapping_mul(PRIME),
+                            dict_short_key_shift,
+                        );
                         // SAFETY: the index is below the dict short table's length.
-                        let ds =
-                            unsafe { *dict_short_ptr.add((dsmix >> dict_short_shift) as usize) };
+                        let ds = unsafe { *dict_short_ptr.add(ds_slot) };
                         let mut found = usize::MAX;
                         // An empty slot fails the bound, as for the long probe.
-                        if dfast_branch!(
-                            11,
-                            (ds & DFAST_TAG_MASK) == dfast_tag(dsmix, dict_short_shift)
-                        ) {
+                        if dfast_branch!(11, (ds & DFAST_TAG_MASK) == ds_tag) {
                             let dp = ((ds >> DFAST_TAG_BITS) as usize).wrapping_sub(1);
                             if dfast_branch!(12, dp < dict_end) {
                                 debug_assert!(dp + 4 <= dict_end);
@@ -4192,14 +4204,13 @@ macro_rules! start_matching_dict_loop_body {
                             }
                         }
                         if dfast_branch!(19, !live_hit) {
-                            let dmix1 = v8_1.wrapping_mul(PRIME);
+                            let (dl1_slot, dl1_tag) = dfast_slot_and_tag::<true>(
+                                v8_1.wrapping_mul(PRIME),
+                                dict_long_key_shift,
+                            );
                             // SAFETY: the index is below the dict long table's length.
-                            let dl1 =
-                                unsafe { *dict_long_ptr.add((dmix1 >> dict_long_shift) as usize) };
-                            if dfast_branch!(
-                                20,
-                                (dl1 & DFAST_TAG_MASK) == dfast_tag(dmix1, dict_long_shift)
-                            ) {
+                            let dl1 = unsafe { *dict_long_ptr.add(dl1_slot) };
+                            if dfast_branch!(20, (dl1 & DFAST_TAG_MASK) == dl1_tag) {
                                 let dp1 = ((dl1 >> DFAST_TAG_BITS) as usize).wrapping_sub(1);
                                 if dp1 < dict_end {
                                     debug_assert!(dp1 + HASH_READ_SIZE <= dict_end);
