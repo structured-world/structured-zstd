@@ -5794,9 +5794,11 @@ fn remove_source_if_requested(
     // The path is resolved again to remove it, and a parent directory renamed
     // meanwhile makes it name another file: only the file that was processed
     // is removed, as upstream zstd (fileio.c `FIO_removeFile`) checks device
-    // and inode, and the check and the removal go through one handle so the
-    // path cannot change between them. Where no identity can be read the file
-    // stays, since nothing confirms it is the one processed.
+    // and inode. The check and the removal go through one handle, so renaming
+    // an ancestor between them cannot redirect the removal; the entry itself
+    // can still be replaced inside its directory on Unix (`identity::remove_if`
+    // has the details). Where no identity can be read the file stays, since
+    // nothing confirms it is the one processed.
     let removal = match processed {
         Some(processed) => identity::remove_if(input, processed.id, processed.link)
             .wrap_err("failed to remove source file after success")?,
@@ -5971,20 +5973,8 @@ fn open_input_with(
     // tells from it whether the open went through a link.
     let entry = removes_sources(opts).then(|| identity::of_entry(input));
     between();
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    // A regular file is opened without waiting: a FIFO put in its place then
-    // opens at once, with no writer, and the identity check below refuses it
-    // instead of the run hanging on the open. Reading a regular file ignores
-    // `O_NONBLOCK`.
-    #[cfg(unix)]
-    if named.is_file() {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let source = options
-        .open(input)
-        .wrap_err_with(|| input.display().to_string())?;
+    let source =
+        open_for_reading(input, named.is_file()).wrap_err_with(|| input.display().to_string())?;
     let metadata = source
         .metadata()
         .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
@@ -6002,6 +5992,33 @@ fn open_input_with(
     }
     let processed = entry.and_then(|entry| identity::Source::opened(entry, opened_id));
     Ok(Some((source, metadata, processed)))
+}
+
+/// Opens `input` for reading; `regular` when it was a regular file at lookup.
+///
+/// A regular file is opened without waiting: a FIFO put in its place then
+/// opens at once, with no writer, and the identity check refuses it instead
+/// of the run hanging on the open. Reading a regular file ignores
+/// `O_NONBLOCK`. An open refused because another process holds a lease on
+/// the file (Linux `F_SETLEASE`) has already told the holder to let go, so it
+/// is tried again until the holder does or the kernel breaks the lease after
+/// `lease-break-time`, the wait a blocking open has.
+fn open_for_reading(input: &Path, regular: bool) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    if regular {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    loop {
+        match options.open(input) {
+            Err(err) if regular && err.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            opened => return opened,
+        }
+    }
 }
 
 /// The system's description of `err`, as `strerror` gives it: without the

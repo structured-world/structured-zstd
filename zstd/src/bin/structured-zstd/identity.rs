@@ -14,7 +14,11 @@ pub struct FileId(u64, u128);
 /// What [`remove_if`] did with the path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
-    /// The path named the expected file, and that entry is gone.
+    /// The path named the expected file, and that entry was removed. On
+    /// Windows without POSIX delete semantics (a file system that refuses
+    /// `FILE_DISPOSITION_INFO_EX`) an entry another process still holds open
+    /// stays until that handle closes, as it does after `DeleteFile`; the file
+    /// is then gone as an unlinked file still open elsewhere is on Unix.
     Removed,
     /// The path names another file, or none: nothing was removed.
     Changed,
@@ -599,8 +603,10 @@ mod sys {
             return Ok(Removal::Removed);
         }
         // File systems before NTFS on Windows 10 1709 refuse the extended
-        // class; the plain one marks the same handle, which goes when this,
-        // its last handle, closes. `FILE_DISPOSITION_INFO` is one `BOOLEAN`.
+        // class; the plain one marks the same handle, and the entry goes when
+        // the file's last handle closes, which is this one unless another
+        // process holds it open (see `Removal::Removed`).
+        // `FILE_DISPOSITION_INFO` is one `BOOLEAN`.
         let delete: u8 = 1;
         // SAFETY: as above; `delete` is a readable `FILE_DISPOSITION_INFO`.
         let ok = unsafe {

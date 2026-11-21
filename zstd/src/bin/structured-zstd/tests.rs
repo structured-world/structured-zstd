@@ -7063,7 +7063,10 @@ fn rm_keeps_a_file_the_source_path_names_after_processing() {
     let processed = Some(processed);
     let held = scratch.path().join("held");
     fs::rename(&work, &held).unwrap();
-    std::os::unix::fs::symlink(&protected, &work).unwrap();
+    // Relative to the link's own directory, so it resolves to the sibling
+    // whatever form the scratch path has.
+    std::os::unix::fs::symlink("protected", &work).unwrap();
+    assert_eq!(fs::read(&source).unwrap(), b"protected content");
 
     let opts = parse(&["--rm", "-q", "x"]).unwrap();
     remove_source_if_requested(&opts, &source, processed, Placement::File).unwrap();
@@ -7111,7 +7114,8 @@ fn rm_removes_the_checked_file_when_the_parent_moves_after_the_check() {
 
     let removal = identity::remove_if_racing(&source, processed, || {
         fs::rename(&work, &held).unwrap();
-        std::os::unix::fs::symlink(&protected, &work).unwrap();
+        std::os::unix::fs::symlink("protected", &work).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"protected content");
     })
     .unwrap();
     assert_eq!(
@@ -7479,21 +7483,30 @@ fn stdin_is_compressed_into_a_named_output() {
     let mut writer = File::from(writer);
     writer.write_all(payload).unwrap();
     drop(writer);
-    // SAFETY: duplicating descriptors; the original standard input, if the
-    // harness gave one, is kept in `saved` and put back below.
-    let saved = unsafe { libc::dup(0) };
-    let saved = (saved >= 0).then(|| unsafe { OwnedFd::from_raw_fd(saved) });
-    assert_eq!(unsafe { libc::dup2(reader.as_raw_fd(), 0) }, 0);
-
     let scratch = Scratch::new("stdin-out");
     let archive = scratch.path().join("out.zst");
     let opts = parse(&["-q", "--rm", "-o", archive.to_str().unwrap(), "-"]).unwrap();
-    let status = run(opts);
-    // SAFETY: as above; with no standard input to begin with, none is left.
-    match &saved {
-        Some(saved) => assert_eq!(unsafe { libc::dup2(saved.as_raw_fd(), 0) }, 0),
-        None => assert_eq!(unsafe { libc::close(0) }, 0),
+
+    /// Puts the harness's standard input back when dropped, also when the
+    /// run panics, so no later test reads the fixture pipe.
+    struct Restore(Option<OwnedFd>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: duplicating or closing descriptor 0; with no standard
+            // input to begin with, none is left.
+            match &self.0 {
+                Some(saved) => unsafe { libc::dup2(saved.as_raw_fd(), 0) },
+                None => unsafe { libc::close(0) },
+            };
+        }
     }
+    // SAFETY: duplicating descriptors; the original standard input, if the
+    // harness gave one, is kept for `Restore`.
+    let saved = unsafe { libc::dup(0) };
+    let restore = Restore((saved >= 0).then(|| unsafe { OwnedFd::from_raw_fd(saved) }));
+    assert_eq!(unsafe { libc::dup2(reader.as_raw_fd(), 0) }, 0);
+    let status = run(opts);
+    drop(restore);
     assert_eq!(status.unwrap(), 0);
     assert_eq!(decoded(&fs::read(&archive).unwrap()).unwrap(), payload);
 }
@@ -7590,13 +7603,55 @@ fn a_source_replaced_by_a_fifo_before_it_is_opened_is_refused() {
     });
     let outcome = finished.recv_timeout(std::time::Duration::from_secs(5));
     if outcome.is_err() {
-        // Release the open still waiting, so the thread ends.
-        drop(fs::OpenOptions::new().write(true).open(&source));
+        // Release the open still waiting, so the thread ends. Without waiting
+        // itself: with no reader left the open fails (`ENXIO`) instead of
+        // hanging the test.
+        use std::os::unix::fs::OpenOptionsExt;
+        drop(
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&source),
+        );
     }
     let err = outcome
         .expect("the open must not wait for a writer")
         .expect("the replaced source is refused");
     assert!(err.contains("changed while opening"), "got: {err}");
+}
+
+/// A regular source another process holds a write lease on (`fcntl`
+/// `F_SETLEASE`) is read once the holder lets go, as a blocking open waits
+/// for it: opening without waiting must not turn the lease into a failed
+/// input.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_source_under_a_lease_is_read_once_the_lease_goes() {
+    use std::os::fd::AsRawFd;
+    let scratch = Scratch::new("openlease");
+    let source = scratch.file("data.txt", b"leased content");
+    // The holder is told of the break by `SIGIO`, which would end the test
+    // process; it lets go on its own below.
+    // SAFETY: setting a signal disposition.
+    unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
+    let holder = File::open(&source).unwrap();
+    // SAFETY: `holder` is an open descriptor.
+    if unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
+        // The file system offers no leases.
+        return;
+    }
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(holder);
+    });
+    let opts = parse(&["-q", "x"]).unwrap();
+
+    let opened = open_input(&opts, &source);
+    release.join().unwrap();
+    let (mut file, _, _) = opened.unwrap().expect("the source is read");
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).unwrap();
+    assert_eq!(content, b"leased content");
 }
 
 /// An input whose output was placed but whose source `--rm` could not remove
