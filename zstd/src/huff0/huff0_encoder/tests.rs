@@ -879,7 +879,7 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
         state ^= state << 17;
         state
     };
-    let mut leaves_scratch = WeightScratch::default();
+    let mut leaves = NodeBuf::new();
     let mut spare_leaves: Option<HuffmanTable> = None;
     let mut spare_weights: Option<HuffmanTable> = None;
     for case in 0..2000 {
@@ -897,19 +897,19 @@ fn a_table_read_off_limited_leaves_matches_the_weight_route() {
             continue;
         }
         let table_log = 5 + (next() % 7) as usize;
-        build_huffman_leaf_depths_into(&counts, &mut leaves_scratch.leaves);
-        if !limit_leaves_in_place(&mut leaves_scratch.leaves, table_log) {
+        build_huffman_leaf_depths_into(&counts, &mut leaves);
+        if !limit_leaves_in_place(&mut leaves, table_log) {
             continue;
         }
         let mut weights = alloc::vec![0usize; alphabet];
-        for leaf in &leaves_scratch.leaves {
+        for leaf in leaves.iter() {
             weights[leaf.symbol as usize] = table_log + 1 - leaf.nb_bits as usize;
         }
         // What the build reports about the code before it lays the table out:
         // the bits the histogram takes, and a weight per symbol below the last.
         let mut shape_seen = None;
         let from_leaves = HuffmanTable::build_from_limited_leaves(
-            &leaves_scratch.leaves,
+            &leaves,
             alphabet,
             table_log,
             &mut spare_leaves,

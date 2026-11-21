@@ -1,6 +1,7 @@
-//! Fixed-capacity, allocation-free stand-in for the `Vec` scratch the entropy
-//! table builders keep, selected by the `caller-workspace` feature so the
-//! tables can live in caller-owned memory.
+//! Fixed-capacity, allocation-free stand-in for `Vec` scratch whose size the
+//! format bounds: the Huffman encoder's tree and weights on every build, and the
+//! decoders' entropy tables under the `caller-workspace` feature, so those can
+//! live in caller-owned memory.
 
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -25,6 +26,7 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     }
 
     /// `Vec::with_capacity` signature; the capacity is fixed at `N`.
+    #[cfg(feature = "caller-workspace")]
     pub(crate) const fn with_capacity(_capacity: usize) -> Self {
         Self::new()
     }
@@ -33,6 +35,7 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     ///
     /// # Safety
     /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
     pub(crate) unsafe fn init_in_place(this: *mut Self) {
         // SAFETY: the caller guarantees `this` is writable and aligned; the
         // element array is `MaybeUninit` and needs no initialisation.
@@ -44,6 +47,7 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
         self.len
     }
 
+    #[cfg(any(feature = "caller-workspace", test))]
     #[inline(always)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
@@ -84,6 +88,7 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     }
 
     /// The writable tail past the live prefix.
+    #[cfg(feature = "caller-workspace")]
     #[inline(always)]
     pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
         &mut self.buf[self.len..]
@@ -97,9 +102,23 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
         self.len = new_len;
     }
 
+    #[cfg(any(feature = "caller-workspace", test))]
     #[inline(always)]
     pub(crate) fn as_slice(&self) -> &[T] {
         self
+    }
+
+    /// The whole storage's first element, valid for writes up to `N`
+    /// elements: a pointer taken through the slice would only cover the live
+    /// prefix, which is empty while a caller fills the buffer by hand.
+    #[inline(always)]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
+        self.buf.as_mut_ptr().cast::<T>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
     }
 }
 

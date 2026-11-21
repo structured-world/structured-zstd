@@ -112,6 +112,15 @@ use crate::{
 /// stack instead of being allocated per table.
 const MAX_HUFFMAN_ALPHABET: usize = 256;
 
+/// A tree over the alphabet: at most `2 * 256 - 1` nodes. On the stack of the
+/// build that uses it, as upstream builds its tree in a workspace
+/// (`HUF_buildCTable_wksp`): a context built per frame then allocates nothing
+/// for it, and a kept one reuses nothing it would have to keep.
+type NodeBuf = crate::common::inline_vec::InlineVec<HuffNode, { 2 * MAX_HUFFMAN_ALPHABET }>;
+
+/// A weight per symbol of the alphabet, on the stack like [`NodeBuf`].
+type WeightBuf = crate::common::inline_vec::InlineVec<usize, MAX_HUFFMAN_ALPHABET>;
+
 pub(crate) struct HuffmanEncoder<'output, 'table, V: AsMut<Vec<u8>>> {
     table: &'table HuffmanTable,
     writer: &'output mut BitWriter<V>,
@@ -725,10 +734,11 @@ impl HuffmanTable {
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
             let table_log = cheap_huf_table_log(counts, total);
-            build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
-            if scratch.leaves.len() > 1 && limit_leaves_in_place(&mut scratch.leaves, table_log) {
+            let mut leaves = NodeBuf::new();
+            build_huffman_leaf_depths_into(counts, &mut leaves);
+            if leaves.len() > 1 && limit_leaves_in_place(&mut leaves, table_log) {
                 return Self::build_from_limited_leaves(
-                    &scratch.leaves,
+                    &leaves,
                     counts.len(),
                     table_log,
                     &mut scratch.spare_table,
@@ -737,9 +747,12 @@ impl HuffmanTable {
             }
             // A single symbol, or a code the limiter could not complete, takes
             // the weight route and its fallback.
-            let spare = scratch.spare_table.take();
-            build_limited_weights_into(counts, table_log, scratch);
-            Some(Self::build_from_weights_reusing(&scratch.weights, spare))
+            let mut weights = WeightBuf::new();
+            build_limited_weights_into(counts, table_log, &mut leaves, &mut weights);
+            Some(Self::build_from_weights_reusing(
+                &weights,
+                scratch.spare_table.take(),
+            ))
         }
     }
 
@@ -765,20 +778,14 @@ impl HuffmanTable {
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
         let mut best_size = usize::MAX - 1;
-        // Reused across every `table_log` candidate so the search allocates
-        // nothing per iteration: `work` is the height-limit scratch, `cand`
-        // holds the current candidate's weights, `best` retains the winning
-        // weights — swapped in on a new best, so the loser's buffer recycles
-        // back into `cand` for the next iteration. On a small alphabet
-        // `min_table_log` is low, so the candidate count (and the old
-        // per-candidate `leaves.to_vec()` + weight-`Vec` allocations) was the
-        // dominant small-frame entropy-build cost.
-        // Pre-size the reused scratch to its proven bound (alphabet <= 256, tree
-        // <= 2*256-1 nodes) so the first candidate's resize/extend allocates once
-        // and never reallocates across the table-log search.
-        let mut work: Vec<HuffNode> = Vec::with_capacity(2 * counts.len());
-        let mut cand: Vec<usize> = Vec::with_capacity(counts.len());
-        let mut best: Vec<usize> = Vec::with_capacity(counts.len());
+        // On the stack and shared by every `table_log` candidate, so the search
+        // allocates nothing: `work` is the height-limit scratch, and of the two
+        // weight buffers one holds the current candidate's weights and the
+        // other the best so far. A new best only flips which is which; the
+        // loser's buffer takes the next candidate.
+        let mut work = NodeBuf::new();
+        let mut weight_bufs = [WeightBuf::new(), WeightBuf::new()];
+        let mut cand_slot = 0usize;
         let mut best_found = false;
 
         // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
@@ -799,12 +806,15 @@ impl HuffmanTable {
         // not depend on `table_log`; only the height limiting does. Build the
         // leaves once and reuse them across every candidate `table_log`
         // instead of rebuilding the whole tree per iteration.
-        let leaves = build_huffman_leaf_depths(counts);
+        let mut leaves = NodeBuf::new();
+        build_huffman_leaf_depths_into(counts, &mut leaves);
         for table_log in min_table_log..=11 {
-            if !limited_weights_into(&leaves, counts.len(), table_log, &mut work, &mut cand) {
-                cand = legacy_distributed_weights(counts);
+            let cand = &mut weight_bufs[cand_slot];
+            if !limited_weights_into(&leaves, counts.len(), table_log, &mut work, cand) {
+                cand.clear();
+                cand.extend_from_slice(&legacy_distributed_weights(counts));
             }
-            let weights = &cand;
+            let weights = &weight_bufs[cand_slot];
             if !huffman_weight_sum_is_power_of_two(weights) {
                 continue;
             }
@@ -875,16 +885,15 @@ impl HuffmanTable {
             }
             if new_size < best_size {
                 best_size = new_size;
-                // Keep the winning weights without a clone: swap them into
-                // `best`; the previous best's buffer lands in `cand` and is
-                // recycled (cleared + refilled) by the next candidate.
-                core::mem::swap(&mut best, &mut cand);
+                // The candidate's buffer becomes the best; the previous best's
+                // takes the next candidate.
+                cand_slot ^= 1;
                 best_found = true;
             }
         }
 
         if best_found {
-            Self::build_from_weights(&best)
+            Self::build_from_weights(&weight_bufs[cand_slot ^ 1])
         } else {
             Self::build_from_weights(&build_limited_weights(counts, 11))
         }
@@ -1111,21 +1120,22 @@ impl HuffmanTable {
         scratch: &mut WeightScratch,
     ) -> Self {
         assert_histogram_fits_nodes::<false>(counts);
-        build_limited_weights_into(counts, max_bits, scratch);
+        let mut leaves = NodeBuf::new();
+        let mut weights = WeightBuf::new();
+        build_limited_weights_into(counts, max_bits, &mut leaves, &mut weights);
         // The smallest weight belongs to the longest code. Lowering every
         // weight until it is one keeps each code's length and makes the table
         // log the longest code's.
-        let step = scratch
-            .weights
+        let step = weights
             .iter()
             .copied()
             .filter(|&weight| weight > 0)
             .min()
             .map_or(0, |weight| weight - 1);
-        for weight in scratch.weights.iter_mut().filter(|weight| **weight > 0) {
+        for weight in weights.iter_mut().filter(|weight| **weight > 0) {
             *weight -= step;
         }
-        Self::build_from_weights_reusing(&scratch.weights, scratch.spare_table.take())
+        Self::build_from_weights_reusing(&weights, scratch.spare_table.take())
     }
 
     /// [`Self::build_from_weights`] filling a discarded table's buffers instead
@@ -1533,17 +1543,9 @@ struct HistogramShape {
 /// candidate `table_log` instead of being rebuilt per candidate. The
 /// returned leaves are sorted by (count desc, symbol asc); for <= 1 distinct
 /// symbol the (0 or 1) leaves are returned with `nb_bits == 0` and the caller
-/// assigns the trivial weight.
-fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
-    let mut nodes = Vec::new();
-    build_huffman_leaf_depths_into(counts, &mut nodes);
-    nodes
-}
-
-/// [`build_huffman_leaf_depths`] filling a caller-owned buffer, so a caller
-/// that builds a tree per block reuses one allocation instead of taking a fresh
-/// one every time.
-fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
+/// assigns the trivial weight. The leaves land in `nodes`, which holds the
+/// whole tree while it is built.
+fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut NodeBuf) {
     // Held by construction: both entry points run `assert_histogram_fits_nodes`
     // before anything reads the histogram.
     debug_assert!(
@@ -1580,14 +1582,11 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         bucket_size[bucket_of(count)] += 1;
         leaf_count += usize::from(count > 0);
     }
-    // Pre-size to the final node count (`2 * leaf_count - 1`), or the alphabet
-    // the bucket pass lays out if larger: the tree is written into this room
-    // directly.
+    // The tree is written straight into the buffer's room: the final node
+    // count (`2 * leaf_count - 1`), or the alphabet the bucket pass lays out if
+    // larger, both within its capacity for the asserted alphabet.
     nodes.clear();
-    // Exact, as the buffer is reused: an amortised reserve doubles a buffer
-    // grown block by block past the 512 nodes `WeightScratch::max_heap_size`
-    // budgets.
-    nodes.reserve_exact((2 * leaf_count).max(counts.len()).max(1));
+    nodes.reserve((2 * leaf_count).max(counts.len()).max(1));
 
     if leaf_count == 0 {
         return;
@@ -1762,22 +1761,18 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
 /// the distributed-weight construction). `leaves` must be sorted by count
 /// descending, which `enforce_max_height` relies on.
 /// Height-limit `leaves` to `max_nb_bits` and project onto a per-symbol weight
-/// table, writing into `out` (cleared + sized to `counts_len`). `work` is a
-/// caller-owned scratch buffer for the height-limiting pass; both buffers are
-/// reused across the table-log candidate search so the per-candidate
-/// `leaves.to_vec()` + fresh weight `Vec` allocations are gone. Returns `false`
-/// when the height limiting cannot reach `max_nb_bits` (caller falls back).
+/// table, writing into `out` (cleared + sized to `counts_len`). `work` is the
+/// caller's scratch for the height-limiting pass; both buffers are shared by
+/// every candidate of the table-log search. Returns `false` when the height
+/// limiting cannot reach `max_nb_bits` (caller falls back).
 fn limited_weights_into(
     leaves: &[HuffNode],
     counts_len: usize,
     max_nb_bits: usize,
-    work: &mut Vec<HuffNode>,
-    out: &mut Vec<usize>,
+    work: &mut NodeBuf,
+    out: &mut WeightBuf,
 ) -> bool {
-    // Exact reservations for the reused buffers, as in
-    // `build_huffman_leaf_depths_into`.
     out.clear();
-    out.reserve_exact(counts_len);
     out.resize(counts_len, 0);
     if leaves.len() <= 1 {
         if let Some(leaf) = leaves.first() {
@@ -1787,7 +1782,6 @@ fn limited_weights_into(
     }
 
     work.clear();
-    work.reserve_exact(leaves.len());
     work.extend_from_slice(leaves);
     limited_weights_in_place(work, max_nb_bits, out)
 }
@@ -1858,10 +1852,11 @@ fn cheap_huf_table_log(counts: &[usize], total: usize) -> usize {
     crate::fse::fse_encoder::optimal_table_log(11, total, max_symbol, 1) as usize
 }
 
-fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
-    let mut scratch = WeightScratch::default();
-    build_limited_weights_into(counts, max_nb_bits, &mut scratch);
-    core::mem::take(&mut scratch.weights)
+fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> WeightBuf {
+    let mut leaves = NodeBuf::new();
+    let mut weights = WeightBuf::new();
+    build_limited_weights_into(counts, max_nb_bits, &mut leaves, &mut weights);
+    weights
 }
 
 /// What a length-limited code costs, read off its leaves before any table is
@@ -1909,15 +1904,12 @@ impl CodeShape {
     }
 }
 
-/// The two buffers a weight build needs, owned by the caller so a compressor
-/// that builds a table per block — and, where the block splitter probes, per
-/// split candidate — reuses them instead of taking fresh allocations every
-/// time. The table-log SEARCH path already reused its scratch; this is the
-/// same for the cheap single-build path.
+/// What a table build keeps between builds, owned by the caller so a
+/// compressor that builds a table per block (and, where the block splitter
+/// probes, per split candidate) reuses it. The tree and the weights of a build
+/// sit on its own stack ([`NodeBuf`], [`WeightBuf`]).
 #[derive(Default)]
 pub(crate) struct WeightScratch {
-    leaves: Vec<HuffNode>,
-    weights: Vec<usize>,
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
     spare_table: Option<HuffmanTable>,
@@ -1938,26 +1930,19 @@ impl WeightScratch {
     /// to be told about them.
     ///
     /// A parked table contributes its own heap bytes only: the table object
-    /// sits inline here, as the two buffers' headers do, and none of them
-    /// are an allocation of this scratch's making. The weight FSE table counts
-    /// only when it holds an allocation of its own; room in the workspace is
-    /// counted with the workspace.
+    /// sits inline here and is no allocation of this scratch's making. The
+    /// weight FSE table counts only when it holds an allocation of its own;
+    /// room in the workspace is counted with the workspace.
     pub(crate) fn heap_size(&self) -> usize {
-        self.leaves.capacity() * core::mem::size_of::<HuffNode>()
-            + self.weights.capacity() * core::mem::size_of::<usize>()
-            + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
+        self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
             + self.weight_fse_table.owned_bytes()
     }
 
-    /// The most memory this scratch keeps beyond its buffers' headers: the
-    /// tree over the byte values, at most twice the 256 values, a weight per
-    /// value, a parked table, and the FSE table weight descriptions build into
-    /// (inline, but budgeted here with the rest of the entropy scratch).
+    /// The most memory this scratch keeps: a parked table, and the FSE table
+    /// weight descriptions build into (inline, but budgeted here with the rest
+    /// of the entropy scratch).
     pub(crate) const fn max_heap_size() -> usize {
-        512 * core::mem::size_of::<HuffNode>()
-            + 256 * core::mem::size_of::<usize>()
-            + HuffmanTable::max_heap_size()
-            + core::mem::size_of::<fse_encoder::FSETable>()
+        HuffmanTable::max_heap_size() + core::mem::size_of::<fse_encoder::FSETable>()
     }
 
     /// Park a table the caller is done with, for the next build to fill.
@@ -2014,18 +1999,21 @@ impl WeightScratch {
     }
 }
 
-/// [`build_limited_weights`] filling caller-owned scratch. The weights land in
-/// `scratch.weights`.
-fn build_limited_weights_into(counts: &[usize], max_nb_bits: usize, scratch: &mut WeightScratch) {
-    build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
+/// [`build_limited_weights`] into the caller's buffers: the tree is built in
+/// `leaves` and the weights land in `weights`.
+fn build_limited_weights_into(
+    counts: &[usize],
+    max_nb_bits: usize,
+    leaves: &mut NodeBuf,
+    weights: &mut WeightBuf,
+) {
+    build_huffman_leaf_depths_into(counts, leaves);
     // One table is built from these leaves, so they are limited where they lie
     // rather than copied first, as upstream limits its tree in place
     // (`HUF_setMaxHeight`).
-    let weights = &mut scratch.weights;
     weights.clear();
-    weights.reserve_exact(counts.len());
     weights.resize(counts.len(), 0);
-    let limited = match scratch.leaves.as_mut_slice() {
+    let limited = match &mut leaves[..] {
         [] => true,
         [leaf] => {
             weights[leaf.symbol as usize] = 1;
@@ -2034,9 +2022,10 @@ fn build_limited_weights_into(counts: &[usize], max_nb_bits: usize, scratch: &mu
         leaves => limited_weights_in_place(leaves, max_nb_bits, weights),
     };
     if !limited {
-        // The fallback builds its own; hand its result to the same slot so the
-        // caller reads one place either way.
-        scratch.weights = legacy_distributed_weights(counts);
+        // The fallback builds its own; its result goes to the same buffer so
+        // the caller reads one place either way.
+        weights.clear();
+        weights.extend_from_slice(&legacy_distributed_weights(counts));
     }
 }
 
