@@ -1767,16 +1767,12 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut NodeBuf) {
 }
 
 /// Limit the natural Huffman depths in `leaves` (from
-/// [`build_huffman_leaf_depths`]) to `max_nb_bits` and project them onto a
-/// per-symbol weight table of length `counts_len`. Returns `None` when the
-/// height limiting cannot reach `max_nb_bits` (the caller then falls back to
-/// the distributed-weight construction). `leaves` must be sorted by count
-/// descending, which `enforce_max_height` relies on.
-/// Height-limit `leaves` to `max_nb_bits` and project onto a per-symbol weight
-/// table, writing into `out` (cleared + sized to `counts_len`). `work` is the
-/// caller's scratch for the height-limiting pass; both buffers are shared by
-/// every candidate of the table-log search. Returns `false` when the height
-/// limiting cannot reach `max_nb_bits` (caller falls back).
+/// [`build_huffman_leaf_depths_into`]) to `max_nb_bits` and project them onto a
+/// per-symbol weight table in `out` (cleared and sized to `counts_len`).
+/// `leaves` must be sorted by count descending, which `enforce_max_height`
+/// relies on; `work` is the scratch of the height-limiting pass. Returns `false`
+/// when the height limiting cannot reach `max_nb_bits` (the caller then falls
+/// back to the distributed-weight construction).
 fn limited_weights_into(
     leaves: &[HuffNode],
     counts_len: usize,
