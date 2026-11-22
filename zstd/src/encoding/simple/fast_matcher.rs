@@ -1384,7 +1384,12 @@ impl FastKernelMatcher {
                 block_start,
                 super::fast_kernel::kernel::PrefixBounds {
                     prefix_start_index,
-                    window_low,
+                    window_low: rep_window_low(
+                        window_low,
+                        dict_in_window,
+                        block_start,
+                        advertised_window,
+                    ),
                 },
                 &mut self.hash_table,
                 rep_in,
@@ -1462,7 +1467,7 @@ impl FastKernelMatcher {
             block_start,
             super::fast_kernel::kernel::PrefixBounds {
                 prefix_start_index,
-                window_low,
+                window_low: rep_window_low(window_low, false, block_start, advertised_window),
             },
             &mut self.hash_table,
             rep_in,
@@ -2638,6 +2643,27 @@ fn tagged_positions_fit(max_window_size: usize) -> bool {
         .checked_mul(2)
         .and_then(|band| band.checked_add(crate::common::MAX_BLOCK_SIZE as usize))
         .is_some_and(|len| len <= TAGGED_POSITION_LIMIT)
+}
+
+/// The no-dictionary scan's `window_low`: upstream zstd's `windowLow`, the
+/// window's floor seen from where the block starts
+/// (`ZSTD_getLowestPrefixIndex(ms, curr, windowLog)`, zstd_fast.c), not from
+/// where it ends as the floor for new matches is. A repcode within one window
+/// of the block's start survives into it, and the history keeps a window
+/// before every block, so its source is in place. A dictionary in the window
+/// keeps the floor at its start.
+fn rep_window_low(
+    window_low: u32,
+    dict_in_window: bool,
+    block_start: usize,
+    advertised_window: usize,
+) -> u32 {
+    if dict_in_window {
+        window_low
+    } else {
+        // Before a window of input is in, the floor is the input's start.
+        (block_start.max(advertised_window) - advertised_window) as u32
+    }
 }
 
 /// Run the fast scan over `history`, the block starting at `block_start`.
