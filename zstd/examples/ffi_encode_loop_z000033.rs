@@ -15,6 +15,12 @@
 //! With `ldm` it times the benchmark's `level_<N>_*_ldm` C arm: a fresh
 //! context per frame through `ZSTD_compress2`, long-distance matching on,
 //! content checksum and content size on.
+//!
+//! With `stream` it times the streamed C path, the counterpart of
+//! `encode_loop_z000033` (`FrameCompressor::compress` from a source): one
+//! context, the input fed to `ZSTD_compressStream2` in `ZSTD_CStreamInSize`
+//! pieces as the `zstd` CLI feeds it, so the context copies it into its own
+//! window as ours does.
 
 use std::env;
 use std::fs;
@@ -22,8 +28,10 @@ use std::fs;
 use zstd::zstd_safe::zstd_sys;
 
 fn main() {
-    if env::args().nth(4).as_deref() == Some("ldm") {
-        return ldm_loop();
+    match env::args().nth(4).as_deref() {
+        Some("ldm") => return ldm_loop(),
+        Some("stream") => return stream_loop(),
+        _ => {}
     }
     let level: i32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: usize = env::args()
@@ -95,6 +103,73 @@ fn compress_fresh(input: &[u8], level: i32, out: &mut [u8]) -> usize {
         zstd_sys::ZSTD_freeCCtx(cctx);
         written
     }
+}
+
+fn stream_loop() {
+    use zstd_sys::{ZSTD_EndDirective as E, ZSTD_inBuffer, ZSTD_outBuffer};
+    let level: i32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let iters: usize = env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let corpus_path = env::args().nth(3).expect("corpus path");
+    let bytes = fs::read(&corpus_path).expect("read corpus");
+    let bound = unsafe { zstd_sys::ZSTD_compressBound(bytes.len()) };
+    let mut out = vec![0u8; bound];
+    let piece = unsafe { zstd_sys::ZSTD_CStreamInSize() };
+    let mut sum = 0usize;
+    // SAFETY: one context, created here and freed at the end; every buffer
+    // passed points into `bytes` or `out` with its true length, and errors
+    // are asserted.
+    unsafe {
+        let cctx = zstd_sys::ZSTD_createCCtx();
+        assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+            level,
+        );
+        assert!(zstd_sys::ZSTD_isError(rc) == 0, "setParameter failed");
+        for _ in 0..iters {
+            let mut output = ZSTD_outBuffer {
+                dst: out.as_mut_ptr().cast(),
+                size: out.len(),
+                pos: 0,
+            };
+            for (i, chunk) in bytes.chunks(piece).enumerate() {
+                let last = (i + 1) * piece >= bytes.len();
+                let mut input = ZSTD_inBuffer {
+                    src: chunk.as_ptr().cast(),
+                    size: chunk.len(),
+                    pos: 0,
+                };
+                let mode = if last {
+                    E::ZSTD_e_end
+                } else {
+                    E::ZSTD_e_continue
+                };
+                loop {
+                    let left = zstd_sys::ZSTD_compressStream2(cctx, &mut output, &mut input, mode);
+                    assert!(
+                        zstd_sys::ZSTD_isError(left) == 0,
+                        "ZSTD_compressStream2 failed"
+                    );
+                    if input.pos == input.size && (!last || left == 0) {
+                        break;
+                    }
+                }
+            }
+            sum += output.pos;
+        }
+        zstd_sys::ZSTD_freeCCtx(cctx);
+    }
+    println!(
+        "encoded {} bytes streamed x {} iters at level {}; last-out-sum={}",
+        bytes.len(),
+        iters,
+        level,
+        sum
+    );
 }
 
 fn ldm_loop() {
