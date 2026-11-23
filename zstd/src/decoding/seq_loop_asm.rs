@@ -509,5 +509,5 @@ impl Loop {
     }
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(all(test, feature = "std"))]
+pub(super) mod tests;

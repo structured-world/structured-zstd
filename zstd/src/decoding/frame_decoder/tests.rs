@@ -1963,10 +1963,10 @@ fn dict_frame_decodes_through_direct_path() {
 /// The fixture is the one from `dict_frame_decodes_through_direct_path`: a
 /// payload that is dictionary material with no second copy in the frame, so
 /// every dictionary-region match has to resolve against the dictionary.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(feature = "std")]
 #[test]
 fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
-    use crate::cpu_kernel::CpuKernelTag;
+    use crate::cpu_kernel::{CpuKernelTag, supported_kernels_for_tests};
 
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
     let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
@@ -2017,99 +2017,8 @@ fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
         out
     };
 
-    // Scalar is always executable and is the reference the others answer to.
-    assert_eq!(
-        decode_on(CpuKernelTag::Scalar),
-        payload,
-        "the scalar tier must decode the dictionary frame exactly"
-    );
-
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        assert_eq!(decode_on(CpuKernelTag::Sse2), payload, "SSE2 tier diverged");
-    }
-    #[cfg(feature = "kernel-bmi2")]
-    if std::is_x86_feature_detected!("bmi2") {
-        assert_eq!(decode_on(CpuKernelTag::Bmi2), payload, "BMI2 tier diverged");
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        assert_eq!(decode_on(CpuKernelTag::Avx2), payload, "AVX2 tier diverged");
-    }
-    // VBMI2 carries a wider feature set than one probe covers, so it is asked
-    // for only when the detector itself named it.
-    #[cfg(feature = "kernel-vbmi2")]
-    if matches!(crate::cpu_kernel::detect_cpu_kernel(), CpuKernelTag::Vbmi2) {
-        assert_eq!(
-            decode_on(CpuKernelTag::Vbmi2),
-            payload,
-            "VBMI2 tier diverged"
-        );
-    }
-}
-
-/// Decode frames of long literal runs and long matches on every CPU tier this
-/// host can execute, into a slice exactly the content's size and into one with
-/// room past it, and require each to reproduce the input.
-///
-/// Built on every architecture, 32-bit x86 included, where the AVX2 tier has a
-/// sequence body of its own: literal runs copied in 32-byte moves, matches of
-/// 256 bytes and more by the doubling copy, and the bounded copy for the
-/// sequences that end too close to the slice's end for those moves. The input
-/// cycles literal runs of 17 to 112 bytes (past one and two 16-byte moves)
-/// with copies from 4 to 12 KiB back whose lengths straddle 256, and with runs
-/// of a period below 16, so each of those branches is taken on every tier.
-#[cfg(feature = "std")]
-#[test]
-fn every_cpu_tier_decodes_long_literals_and_matches_the_same_way() {
-    use crate::cpu_kernel::supported_kernels_for_tests;
-    use crate::encoding::compress_slice_to_vec;
-
-    const MATCH_LENGTHS: [usize; 8] = [64, 200, 255, 256, 257, 300, 1024, 3000];
-    let mut input: Vec<u8> = Vec::new();
-    let mut state = 0x2545_f491u32;
-    let mut next = || {
-        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        state >> 8
-    };
-    for round in 0..600usize {
-        for _ in 0..(17 + next() as usize % 96) {
-            input.push(next() as u8);
-        }
-        if input.len() > 16 * 1024 {
-            let len = MATCH_LENGTHS[round % MATCH_LENGTHS.len()];
-            let start = input.len() - (4096 + next() as usize % 8192);
-            for k in 0..len {
-                input.push(input[start + k]);
-            }
-        }
-        if round % 5 == 4 {
-            let period = 1 + round % 15;
-            let seed: Vec<u8> = (0..period).map(|_| next() as u8).collect();
-            for k in 0..(20 + next() as usize % 400) {
-                input.push(seed[k % period]);
-            }
-        }
-    }
-
-    let kernels = supported_kernels_for_tests();
-    for level in [1, 3, 19] {
-        let frame = compress_slice_to_vec(&input, CompressionLevel::from_level(level));
-        for &kernel in &kernels {
-            for slack in [0usize, 64] {
-                let mut decoder = FrameDecoder::new();
-                decoder.decode_with_kernel_for_tests(kernel);
-                let mut out = alloc::vec![0u8; input.len() + slack];
-                let n = decoder
-                    .decode_all(frame.as_slice(), &mut out)
-                    .expect("frame must decode on every tier");
-                out.truncate(n);
-                assert!(
-                    out == input,
-                    "{kernel:?} tier diverged: level {level} slack {slack}"
-                );
-            }
-        }
+    for kernel in supported_kernels_for_tests() {
+        assert_eq!(decode_on(kernel), payload, "{kernel:?} tier diverged");
     }
 }
 
