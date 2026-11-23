@@ -142,9 +142,9 @@ fn shapes() -> Vec<Vec<u8>> {
     alloc::vec![text, short_period, long_runs, boundary, mixed]
 }
 
-/// A frame decoded into a slice on every kernel this CPU runs, each named,
-/// equals the input, as does the same frame streamed through the ring buffer a
-/// piece at a time; with the slice exactly the content's size (the last
+/// A frame decoded on every kernel this CPU runs, each named, equals the
+/// input, both into a slice and streamed through the ring buffer a piece at a
+/// time; with the slice exactly the content's size (the last
 /// sequences in the tight tail) and with room past it. Where the AVX2 kernel's
 /// loop is assembly, the loop must have run for every shape.
 #[test]
@@ -164,12 +164,13 @@ fn every_cpu_tier_decodes_what_the_scalar_tier_decodes() {
                         );
                     }
                 }
+                let mut stream = StreamingDecoder::new(frame.as_slice());
+                stream.decoder.decode_with_kernel_for_tests(kernel);
+                assert!(
+                    stream_decode(stream) == *input,
+                    "{kernel:?} stream decode differs: shape {shape} level {level}"
+                );
             }
-            let streamed = stream_decode(StreamingDecoder::new(frame.as_slice()));
-            assert!(
-                streamed == *input,
-                "stream decode differs: shape {shape} level {level}"
-            );
         }
         if assembly {
             assert_loop_ran_since(before, shape);
@@ -235,15 +236,15 @@ fn every_cpu_tier_decodes_dictionary_frames_as_the_scalar_tier_does() {
                         );
                     }
                 }
+                let mut stream =
+                    StreamingDecoder::new_with_dictionary_handle(frame.as_slice(), &handle)
+                        .unwrap_or_else(|_| panic!("dictionary refused"));
+                stream.decoder.decode_with_kernel_for_tests(kernel);
+                assert!(
+                    stream_decode(stream) == *input,
+                    "{kernel:?} stream decode differs: shape {shape} level {level}"
+                );
             }
-            let streamed = stream_decode(
-                StreamingDecoder::new_with_dictionary_handle(frame.as_slice(), &handle)
-                    .unwrap_or_else(|_| panic!("dictionary refused")),
-            );
-            assert!(
-                streamed == *input,
-                "stream decode differs: shape {shape} level {level}"
-            );
         }
         if assembly {
             assert_loop_ran_since(before, shape);
