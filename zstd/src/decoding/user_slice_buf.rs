@@ -309,13 +309,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // only has to stay inside the slice, as upstream bounds it by the
         // destination's capacity. When either does not hold, take the
         // exact (non-overshooting) copy. Only the trailing sequence(s) of
-        // a slice without room past the data hit this.
-        if new_tail
-            > cap.min(
-                self.inline_overshoot_end()
-                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
-            )
-        {
+        // a slice without room past the data hit this. Two comparisons, not a
+        // clamped bound: the common sequence falls through both. The sum
+        // cannot wrap (both lengths are a block's, `new_tail` a slice's), and
+        // `new_tail >= 1` (a match is at least one byte), so this rejects
+        // exactly what `new_tail > min(cap, end - overshoot)` rejected.
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above), so the exact
             // copies stay in-bounds; `offset <= tail + lit_length`
@@ -418,12 +417,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
 
         // Tight-tail bounded copy; see the x86 arm for the rationale.
-        if new_tail
-            > cap.min(
-                self.inline_overshoot_end()
-                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
-            )
-        {
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above) bounds the
             // exact copies; `offset <= tail + lit_length` keeps the
@@ -501,12 +495,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
 
         // Tight-tail bounded copy; see the x86_64 arm for the rationale.
-        if new_tail
-            > cap.min(
-                self.inline_overshoot_end()
-                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
-            )
-        {
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: as in `exec_sequence_inline`.
             unsafe { self.exec_sequence_bounded(lit_src, lit_length, offset, match_length) };
