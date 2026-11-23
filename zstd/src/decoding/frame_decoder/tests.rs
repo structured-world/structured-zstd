@@ -2048,6 +2048,71 @@ fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
     }
 }
 
+/// Decode frames of long literal runs and long matches on every CPU tier this
+/// host can execute, into a slice exactly the content's size and into one with
+/// room past it, and require each to reproduce the input.
+///
+/// Built on every architecture, 32-bit x86 included, where the AVX2 tier has a
+/// sequence body of its own: literal runs copied in 32-byte moves, matches of
+/// 256 bytes and more by the doubling copy, and the bounded copy for the
+/// sequences that end too close to the slice's end for those moves. The input
+/// cycles literal runs of 17 to 112 bytes (past one and two 16-byte moves)
+/// with copies from 4 to 12 KiB back whose lengths straddle 256, and with runs
+/// of a period below 16, so each of those branches is taken on every tier.
+#[cfg(feature = "std")]
+#[test]
+fn every_cpu_tier_decodes_long_literals_and_matches_the_same_way() {
+    use crate::cpu_kernel::supported_kernels_for_tests;
+    use crate::encoding::compress_slice_to_vec;
+
+    const MATCH_LENGTHS: [usize; 8] = [64, 200, 255, 256, 257, 300, 1024, 3000];
+    let mut input: Vec<u8> = Vec::new();
+    let mut state = 0x2545_f491u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        state >> 8
+    };
+    for round in 0..600usize {
+        for _ in 0..(17 + next() as usize % 96) {
+            input.push(next() as u8);
+        }
+        if input.len() > 16 * 1024 {
+            let len = MATCH_LENGTHS[round % MATCH_LENGTHS.len()];
+            let start = input.len() - (4096 + next() as usize % 8192);
+            for k in 0..len {
+                input.push(input[start + k]);
+            }
+        }
+        if round % 5 == 4 {
+            let period = 1 + round % 15;
+            let seed: Vec<u8> = (0..period).map(|_| next() as u8).collect();
+            for k in 0..(20 + next() as usize % 400) {
+                input.push(seed[k % period]);
+            }
+        }
+    }
+
+    let kernels = supported_kernels_for_tests();
+    for level in [1, 3, 19] {
+        let frame = compress_slice_to_vec(&input, CompressionLevel::from_level(level));
+        for &kernel in &kernels {
+            for slack in [0usize, 64] {
+                let mut decoder = FrameDecoder::new();
+                decoder.decode_with_kernel_for_tests(kernel);
+                let mut out = alloc::vec![0u8; input.len() + slack];
+                let n = decoder
+                    .decode_all(frame.as_slice(), &mut out)
+                    .expect("frame must decode on every tier");
+                out.truncate(n);
+                assert!(
+                    out == input,
+                    "{kernel:?} tier diverged: level {level} slack {slack}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn implausible_content_size_skips_eager_alloc_direct_path() {
     // Adversarial frame: a 1 KiB window (small ring) but a declared
