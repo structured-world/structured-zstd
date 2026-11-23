@@ -926,7 +926,15 @@ pub(crate) mod portable {
                 _mm_loadu_si128(src.cast::<__m128i>()),
             );
         }
-        #[cfg(not(all(target_arch = "x86", target_feature = "sse2")))]
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            use core::arch::aarch64::{vld1q_u8, vst1q_u8};
+            vst1q_u8(dst, vld1q_u8(src));
+        }
+        #[cfg(not(any(
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "aarch64", target_feature = "neon")
+        )))]
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, 16);
         }
