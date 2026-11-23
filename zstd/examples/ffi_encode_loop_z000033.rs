@@ -117,6 +117,12 @@ fn stream_loop() {
     let bound = unsafe { zstd_sys::ZSTD_compressBound(bytes.len()) };
     let mut out = vec![0u8; bound];
     let piece = unsafe { zstd_sys::ZSTD_CStreamInSize() };
+    // An empty input is one empty piece, so `ZSTD_e_end` still ends a frame.
+    let pieces: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[]]
+    } else {
+        bytes.chunks(piece).collect()
+    };
     let mut sum = 0usize;
     // SAFETY: one context, created here and freed at the end; every buffer
     // passed points into `bytes` or `out` with its true length, and errors
@@ -136,8 +142,8 @@ fn stream_loop() {
                 size: out.len(),
                 pos: 0,
             };
-            for (i, chunk) in bytes.chunks(piece).enumerate() {
-                let last = (i + 1) * piece >= bytes.len();
+            for (i, chunk) in pieces.iter().enumerate() {
+                let last = i + 1 == pieces.len();
                 let mut input = ZSTD_inBuffer {
                     src: chunk.as_ptr().cast(),
                     size: chunk.len(),
