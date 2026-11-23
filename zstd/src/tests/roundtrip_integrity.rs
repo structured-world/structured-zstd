@@ -1301,3 +1301,38 @@ fn decode_all_repeats_long_matches_of_every_period() {
         }
     }
 }
+
+/// Level 1 over input repeating at a period between the window less a block
+/// and the window (512 KiB window, 128 KiB blocks): a repcode at that period
+/// is within the window from every position of the next block, so it must
+/// survive the block's start and the input after the first period compress to
+/// almost nothing. Dropping it at each block's start, by measuring the window
+/// from the block's end, left the head of every block to be found again:
+/// 1.95 MB here instead of one period. Both the one-shot scan of the slice and
+/// the streamed scan of the copy a source fills are checked. The bound allows
+/// the first repeat being found only in its block's tail (a new match reaches
+/// a window from the block's end), under a fifth of a period, but not a block
+/// left to literals, which is close to a third.
+#[test]
+fn level_1_keeps_a_repcode_within_the_window_across_blocks() {
+    const PERIOD: usize = 441_226;
+    let tile = generate_data(697, PERIOD);
+    let data: Vec<u8> = tile.iter().copied().cycle().take(4 << 20).collect();
+    let one_shot = compress_slice_to_vec(&data, CompressionLevel::Level(1));
+    let mut streamed = Vec::new();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(1));
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut streamed);
+    compressor.compress();
+    for (path, frame) in [("one-shot", &one_shot), ("streamed", &streamed)] {
+        assert!(
+            frame.len() < PERIOD * 5 / 4,
+            "{path}: {} bytes for a {PERIOD}-byte period",
+            frame.len(),
+        );
+        let mut decoder = StreamingDecoder::new(frame.as_slice());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert!(decoded == data, "{path}: round trip differs");
+    }
+}

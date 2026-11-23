@@ -2234,33 +2234,42 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
     // optimiser would not keep the array in registers across that. A local copy
     // written back once is the same three words, moved once.
     let mut hist = *offset_hist;
-    for seq in raw_sequences.iter_mut() {
-        let off_base = if OFFSETS_CODED {
-            seq.off_base
-        } else {
-            let off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
-            seq.off_base = off_base;
-            off_base
-        };
-        let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
-        let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
-        let (of_code, _, _) = encode_offset(off_base);
-        seq.set_codes(ll_code, ll_bits, ml_code, ml_bits);
-        debug_assert!(
-            usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
-            "the code functions stay inside their alphabets",
-        );
-        // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under the
-        // histogram's `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in release
-        // because `encode_literal_length` and `encode_match_len` assert the
-        // length below 2^17 before deriving a code from its high bit, so a larger
-        // code panics there before reaching this write; the OF code is `ilog2`
-        // of a `u32`. Those asserts must stay.
+    // Every other sequence counts into a second set of histograms, summed in
+    // at the end. A common code repeats from one sequence to the next, and
+    // with one set each increment of its slot waited on the store of the one
+    // before; two sets halve that chain, as upstream's
+    // `HIST_count_parallel_wksp` spreads its counts over four tables.
+    let mut odd: [SequenceHistogram; 3] = [[0; SEQUENCE_CODE_SLOTS]; 3];
+    let (pairs, remainder) = raw_sequences.as_chunks_mut::<2>();
+    for pair in pairs.iter_mut() {
+        let (ll, ml, of) = code_sequence::<OFFSETS_CODED>(&mut pair[0], &mut hist);
+        // SAFETY: the codes are inside the histograms; see `code_sequence`.
         unsafe {
-            *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
-            *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
-            *of_counts.get_unchecked_mut(usize::from(of_code)) += 1;
+            *ll_counts.get_unchecked_mut(ll) += 1;
+            *ml_counts.get_unchecked_mut(ml) += 1;
+            *of_counts.get_unchecked_mut(of) += 1;
         }
+        let (ll, ml, of) = code_sequence::<OFFSETS_CODED>(&mut pair[1], &mut hist);
+        // SAFETY: as above.
+        unsafe {
+            *odd[0].get_unchecked_mut(ll) += 1;
+            *odd[1].get_unchecked_mut(ml) += 1;
+            *odd[2].get_unchecked_mut(of) += 1;
+        }
+    }
+    for seq in remainder.iter_mut() {
+        let (ll, ml, of) = code_sequence::<OFFSETS_CODED>(seq, &mut hist);
+        // SAFETY: as above.
+        unsafe {
+            *ll_counts.get_unchecked_mut(ll) += 1;
+            *ml_counts.get_unchecked_mut(ml) += 1;
+            *of_counts.get_unchecked_mut(of) += 1;
+        }
+    }
+    for slot in 0..SEQUENCE_CODE_SLOTS {
+        ll_counts[slot] += odd[0][slot];
+        ml_counts[slot] += odd[1][slot];
+        of_counts[slot] += odd[2][slot];
     }
     if !OFFSETS_CODED {
         *offset_hist = hist;
@@ -2289,6 +2298,41 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
         highest_used_code(ll_counts, MAX_LITERAL_LENGTH_CODE as usize),
         highest_used_code(ml_counts, MAX_MATCH_LENGTH_CODE as usize),
         highest_used_code(of_counts, MAX_OFFSET_CODE as usize),
+    )
+}
+
+/// Fill one sequence's wire offset code (unless `OFFSETS_CODED`) and its
+/// length codes, and return its three codes as histogram slots.
+///
+/// The codes are at most 35 (LL), 52 (ML) and 31 (OF), under
+/// `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in release because
+/// `encode_literal_length` and `encode_match_len` assert the length below 2^17
+/// before deriving a code from its high bit, so a larger code panics there;
+/// the OF code is `ilog2` of a `u32`. Those asserts must stay.
+#[inline(always)]
+fn code_sequence<const OFFSETS_CODED: bool>(
+    seq: &mut RawSequence,
+    hist: &mut [u32; 3],
+) -> (usize, usize, usize) {
+    let off_base = if OFFSETS_CODED {
+        seq.off_base
+    } else {
+        let off_base = encode_offset_with_history(seq.off_base, seq.ll, hist);
+        seq.off_base = off_base;
+        off_base
+    };
+    let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
+    let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
+    let (of_code, _, _) = encode_offset(off_base);
+    seq.set_codes(ll_code, ll_bits, ml_code, ml_bits);
+    debug_assert!(
+        usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
+        "the code functions stay inside their alphabets",
+    );
+    (
+        usize::from(ll_code),
+        usize::from(ml_code),
+        usize::from(of_code),
     )
 }
 

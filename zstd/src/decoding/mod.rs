@@ -752,6 +752,8 @@ mod seq_loop_asm;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
+#[cfg(all(test, feature = "std"))]
+mod tier_tests;
 /// Diagnostic-only re-export of the copy-shape histogram counters. Public
 /// only when the `copy-shape-stats` feature is on (off in shipping builds).
 #[cfg(feature = "copy-shape-stats")]

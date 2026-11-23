@@ -1963,10 +1963,10 @@ fn dict_frame_decodes_through_direct_path() {
 /// The fixture is the one from `dict_frame_decodes_through_direct_path`: a
 /// payload that is dictionary material with no second copy in the frame, so
 /// every dictionary-region match has to resolve against the dictionary.
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(feature = "std")]
 #[test]
 fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
-    use crate::cpu_kernel::CpuKernelTag;
+    use crate::cpu_kernel::{CpuKernelTag, supported_kernels_for_tests};
 
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
     let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
@@ -2017,34 +2017,8 @@ fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
         out
     };
 
-    // Scalar is always executable and is the reference the others answer to.
-    assert_eq!(
-        decode_on(CpuKernelTag::Scalar),
-        payload,
-        "the scalar tier must decode the dictionary frame exactly"
-    );
-
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        assert_eq!(decode_on(CpuKernelTag::Sse2), payload, "SSE2 tier diverged");
-    }
-    #[cfg(feature = "kernel-bmi2")]
-    if std::is_x86_feature_detected!("bmi2") {
-        assert_eq!(decode_on(CpuKernelTag::Bmi2), payload, "BMI2 tier diverged");
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        assert_eq!(decode_on(CpuKernelTag::Avx2), payload, "AVX2 tier diverged");
-    }
-    // VBMI2 carries a wider feature set than one probe covers, so it is asked
-    // for only when the detector itself named it.
-    #[cfg(feature = "kernel-vbmi2")]
-    if matches!(crate::cpu_kernel::detect_cpu_kernel(), CpuKernelTag::Vbmi2) {
-        assert_eq!(
-            decode_on(CpuKernelTag::Vbmi2),
-            payload,
-            "VBMI2 tier diverged"
-        );
+    for kernel in supported_kernels_for_tests() {
+        assert_eq!(decode_on(kernel), payload, "{kernel:?} tier diverged");
     }
 }
 

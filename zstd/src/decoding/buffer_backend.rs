@@ -243,6 +243,23 @@ pub(crate) trait BufferBackend: Sized {
         );
     }
 
+    /// [`Self::exec_sequence_inline`] under the kernel tier `K` the sequence
+    /// loop runs, for a backend whose copies widen with the tier.
+    ///
+    /// # Safety
+    /// As [`Self::exec_sequence_inline`]; the running CPU supports `K`'s tier.
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_tier<K: CpuKernel>(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        // SAFETY: the caller's contract.
+        unsafe { self.exec_sequence_inline(lit_src, lit_length, offset, match_length) }
+    }
+
     /// Dictionary-source variant of [`Self::exec_sequence_inline`], for a
     /// match lying wholly inside dictionary content as selected by
     /// `DecodeBuffer::dict_match_source`. Upstream keeps this case inline

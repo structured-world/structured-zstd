@@ -74,9 +74,44 @@ impl<'t> FSEDecoderImpl<'t, SeqSymbol, 512> {
 
 impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
     /// Returns the byte associated with the symbol the internal cursor is pointing at.
+    // The weight decode reads the symbol off its state word; this reader is
+    // left to the test/fuzz `round_trip` helper, as `update_state` is.
+    #[cfg(any(test, feature = "fuzz-exports"))]
     pub fn decode_symbol(&self) -> u8 {
         self.state.symbol
     }
+
+    /// The current state as one word: `new_state` in bits 0-15, the symbol in
+    /// 16-23, `num_bits` in 24-31, the entry's layout in memory.
+    #[inline(always)]
+    pub(crate) fn state_word(&self) -> u32 {
+        entry_word(self.state)
+    }
+
+    /// [`Self::update_state_fast`] on a state held as a word by the caller:
+    /// the word after `word`'s transition. A loop that keeps its states in
+    /// locals keeps them in registers; through `self.state` the compiler kept
+    /// them in the stack and every transition waited on a store and a load.
+    ///
+    /// Same preconditions as [`Self::update_state_fast`], for the decoder
+    /// whose state `word` is.
+    #[inline(always)]
+    pub(crate) fn next_state_word<K: CpuKernel>(
+        &self,
+        word: u32,
+        bits: &mut BitReaderReversed<'_, K>,
+    ) -> u32 {
+        let add = bits.get_bits_unchecked((word >> 24) as u8);
+        // SAFETY: as in `update_state_fast`: `new_state + add` stays below the
+        // table's length by its construction.
+        entry_word(self.read_entry((word & 0xFFFF) as usize + add as usize))
+    }
+}
+
+/// An [`Entry`] as the word [`FSEDecoderImpl::state_word`] describes.
+#[inline(always)]
+fn entry_word(entry: Entry) -> u32 {
+    u32::from(entry.new_state) | (u32::from(entry.symbol) << 16) | (u32::from(entry.num_bits) << 24)
 }
 
 impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {

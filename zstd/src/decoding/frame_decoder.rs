@@ -1412,8 +1412,8 @@ impl FrameDecoder {
     /// execute: the monoliths carry `target_feature`, and asking for one the
     /// machine lacks is undefined behaviour rather than an error.
     #[cfg(test)]
-    // Its consumer is the per-tier agreement test, and the tiers worth
-    // disagreeing are the x86 ones, so on other architectures nothing calls it.
+    // Its consumers, the per-tier agreement tests, need `std` to detect the
+    // tiers; a test build without it has none.
     #[allow(dead_code)]
     pub(crate) fn decode_with_kernel_for_tests(&mut self, kernel: crate::cpu_kernel::CpuKernelTag) {
         self.kernel = kernel;

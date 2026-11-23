@@ -493,24 +493,28 @@ impl HuffmanTable {
                 const WEIGHTS_REFILL_BUDGET: u8 = 12;
 
                 // The two decoders take turns decoding a single symbol and updating their state.
+                // The states live in locals as words (symbol in bits 16-23),
+                // so the two transition chains stay in registers.
+                let mut s1 = dec1.state_word();
+                let mut s2 = dec2.state_word();
                 loop {
                     br.ensure_bits(WEIGHTS_REFILL_BUDGET);
 
-                    push_weight!(dec1.decode_symbol());
-                    dec1.update_state_fast(&mut br);
+                    push_weight!((s1 >> 16) as u8);
+                    s1 = dec1.next_state_word(s1, &mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
-                        push_weight!(dec2.decode_symbol());
+                        push_weight!((s2 >> 16) as u8);
                         break;
                     }
 
-                    push_weight!(dec2.decode_symbol());
-                    dec2.update_state_fast(&mut br);
+                    push_weight!((s2 >> 16) as u8);
+                    s2 = dec2.next_state_word(s2, &mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
-                        push_weight!(dec1.decode_symbol());
+                        push_weight!((s1 >> 16) as u8);
                         break;
                     }
                 }

@@ -1250,6 +1250,44 @@ fn copied_dictionary_frames(
     (owned_frame, [first, second])
 }
 
+/// Level 1 with a copied dictionary over input repeating at a period between
+/// the window less a block and the window: both scans keep a repcode within
+/// the window of the block's start, so the frame read in place is the owned
+/// frame, about one period long. The in-place scan took that floor from the
+/// block's end (1.82 MB), and the owned scan, once the dictionary's budget
+/// retired, trimmed its history to a window counting the block it was about
+/// to scan, losing the repcode's source for that block (573 KB).
+#[test]
+fn a_copied_dictionary_frame_keeps_a_repcode_across_blocks_as_the_owned_frame() {
+    let dict = include_bytes!("../../../dict_tests/dictionary");
+    let mut seed = 0x0697_0697u32;
+    let tile: Vec<u8> = (0..441_226)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let payload: Vec<u8> = tile.iter().copied().cycle().take(4 << 20).collect();
+    let level = super::CompressionLevel::Level(1);
+    let (owned, in_place) = copied_dictionary_frames(level, None, dict, &payload);
+    assert!(
+        owned.len() < tile.len() * 3 / 2,
+        "{} bytes for a {}-byte period",
+        owned.len(),
+        tile.len()
+    );
+    for (round, frame) in in_place.iter().enumerate() {
+        assert!(
+            *frame == owned,
+            "frame {round}: {} bytes in place, {} owned",
+            frame.len(),
+            owned.len()
+        );
+    }
+}
+
 /// A first block written out unsearched (here RLE) still indexes the seven
 /// dictionary positions whose hashed bytes run on into the input, as the owned
 /// path does, so a later match across the dictionary/input seam is found: the

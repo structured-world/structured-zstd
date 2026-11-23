@@ -309,13 +309,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // only has to stay inside the slice, as upstream bounds it by the
         // destination's capacity. When either does not hold, take the
         // exact (non-overshooting) copy. Only the trailing sequence(s) of
-        // a slice without room past the data hit this.
-        if new_tail
-            > cap.min(
-                self.inline_overshoot_end()
-                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
-            )
-        {
+        // a slice without room past the data hit this. Two comparisons, not a
+        // clamped bound: the common sequence falls through both. The sum
+        // cannot wrap (both lengths are a block's, `new_tail` a slice's), and
+        // `new_tail >= 1` (a match is at least one byte), so this rejects
+        // exactly what `new_tail > min(cap, end - overshoot)` rejected.
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above), so the exact
             // copies stay in-bounds; `offset <= tail + lit_length`
@@ -418,12 +417,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
 
         // Tight-tail bounded copy; see the x86 arm for the rationale.
-        if new_tail
-            > cap.min(
-                self.inline_overshoot_end()
-                    .saturating_sub(MAX_WILDCOPY_OVERSHOOT),
-            )
-        {
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
             sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above) bounds the
             // exact copies; `offset <= tail + lit_length` keeps the
@@ -452,6 +446,91 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             let match_src = base.cast_const().add(self.tail + lit_length - offset);
 
             if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    /// The 32-bit AVX2 tier: [`Self::exec_sequence_inline`] with a long match
+    /// copied as the x86_64 AVX2 tier copies it, in 32-byte moves from
+    /// doubling distances, where 16-byte moves from a fixed distance lose to
+    /// libc memcpy.
+    #[cfg(all(target_arch = "x86", target_feature = "sse2", feature = "kernel-avx2"))]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_tier<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        // Only the AVX2 kernel copies 32 bytes at a time on 32-bit x86.
+        if K::COPY_CHUNK != 32 {
+            // SAFETY: the caller's contract.
+            return unsafe { self.exec_sequence_inline(lit_src, lit_length, offset, match_length) };
+        }
+        use super::buffer_backend::sequence_output_fits;
+        use super::exec_sequence_inline::portable::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        // The long-match copy writes up to 31 bytes past the match.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let cap = self.sequence_cap;
+        debug_assert!(self.tail <= cap);
+        let total = lit_length + match_length;
+        let new_tail = self.tail + total;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        debug_assert!(
+            (self.tail - self.head)
+                .checked_add(lit_length)
+                .is_some_and(|end| offset <= end)
+        );
+
+        // Tight-tail bounded copy; see the x86_64 arm for the rationale.
+        if new_tail > cap || new_tail + MAX_WILDCOPY_OVERSHOOT > self.inline_overshoot_end() {
+            sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
+            // SAFETY: as in `exec_sequence_inline`.
+            unsafe { self.exec_sequence_bounded(lit_src, lit_length, offset, match_length) };
+            return Ok(());
+        }
+
+        // SAFETY: as in `exec_sequence_inline`, with room for a 31-byte
+        // overshoot; `K` is the AVX2 kernel, chosen only on a CPU with AVX2.
+        unsafe {
+            let base = self.slice.as_mut_ptr();
+            let op_lit = base.add(self.tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                // 32-byte moves: the literals carry 32 readable bytes past
+                // their end and the gate leaves room for a 31-byte overshoot.
+                super::exec_sequence_inline::x86::wildcopy_no_overlap_avx2(
+                    op_lit.add(16),
+                    lit_src.add(16),
+                    lit_length - 16,
+                );
+            }
+
+            let op_match = base.add(self.tail + lit_length);
+            let match_src = base.cast_const().add(self.tail + lit_length - offset);
+
+            // Split where the x86_64 AVX2 tier splits, at upstream's
+            // `WILDCOPY_VECLEN` boundary for long matches.
+            if match_length >= 256 {
+                super::exec_sequence_inline::x86::match_copy_doubling_avx2(
+                    op_match,
+                    offset,
+                    match_length,
+                    false,
+                );
+            } else if offset >= 16 {
                 wildcopy_no_overlap(op_match, match_src, match_length);
             } else {
                 let (op2, ip2) = overlap_copy8(op_match, match_src, offset);

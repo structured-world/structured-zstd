@@ -1384,7 +1384,12 @@ impl FastKernelMatcher {
                 block_start,
                 super::fast_kernel::kernel::PrefixBounds {
                     prefix_start_index,
-                    window_low,
+                    window_low: rep_window_low(
+                        window_low,
+                        dict_in_window,
+                        block_start,
+                        advertised_window,
+                    ),
                 },
                 &mut self.hash_table,
                 rep_in,
@@ -1462,7 +1467,7 @@ impl FastKernelMatcher {
             block_start,
             super::fast_kernel::kernel::PrefixBounds {
                 prefix_start_index,
-                window_low,
+                window_low: rep_window_low(window_low, false, block_start, advertised_window),
             },
             &mut self.hash_table,
             rep_in,
@@ -1501,14 +1506,23 @@ impl FastKernelMatcher {
         self.table_pos_high_water = self.table_pos_high_water.max(joined_end);
         // The owned path's floors (`start_matching`) over the joined length.
         let advertised_window = 1usize << self.window_log;
-        let window_low = if joined_end <= advertised_window + dict_end {
+        let dict_in_window = joined_end <= advertised_window + dict_end;
+        let window_low = if dict_in_window {
             0
         } else {
             (joined_end - advertised_window) as u32
         };
+        // The repcode's floor is the window seen from the block's start, as on
+        // the owned path, in the same joined positions.
+        let rep_low = rep_window_low(
+            window_low,
+            dict_in_window,
+            dict_end + block_start,
+            advertised_window,
+        );
         let bounds = super::fast_kernel::kernel::PrefixBounds {
             prefix_start_index: window_low.max(self.prefix_start_index),
-            window_low,
+            window_low: rep_low,
         };
         // SAFETY: `block_end` is within the registered buffer (asserted by the
         // caller), which `set_borrowed_window`'s contract keeps live. The
@@ -1519,13 +1533,14 @@ impl FastKernelMatcher {
         let input: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
         let padded: &[u8] =
             unsafe { core::slice::from_raw_parts(self.history.as_ptr(), self.history.len()) };
-        // Once the block ends past a window beyond the dictionary, the window
-        // floor lies past it and no candidate can reach it: the input is
-        // scanned alone, at the positions it holds behind the dictionary
+        // Once the block starts past a window beyond the dictionary, the
+        // repcode's floor, the lowest a read can reach, lies past it: the input
+        // is scanned alone, at the positions it holds behind the dictionary
         // (upstream zstd `ZSTD_checkDictValidity`, `blockEndIdx > maxDist +
         // loadedDictEnd`, after which `ZSTD_compressBlock_fast` runs in place
-        // of the extDict kernel).
-        let copied = (window_low as usize <= dict_end).then_some((padded, dict_end));
+        // of the extDict kernel). Until then a repcode may still reach into the
+        // dictionary, so both buffers are scanned.
+        let copied = (rep_low as usize <= dict_end).then_some((padded, dict_end));
         self.rep = run_fast_kernel_block(
             copied,
             dict_end,
@@ -2073,17 +2088,27 @@ impl FastKernelMatcher {
         self.rep = [offset_hist[0], offset_hist[1]];
     }
 
-    /// Drop history bytes past `max_window_size` via
+    /// Drop history bytes past `max_window_size` before the staged block via
     /// [`Self::drain_real_prefix`] (resets `prefix_start_index` to
     /// `INITIAL_PREFIX_START_INDEX` = 1, the sentinel-0 floor, and slides
     /// the table's stored positions down by the evicted count). Returns
-    /// evicted byte count; idempotent when `real_len <= max_window_size`.
+    /// evicted byte count; idempotent when the bytes before the staged block
+    /// fit `max_window_size`.
+    ///
+    /// A block committed but not yet scanned keeps a whole window before it,
+    /// as [`Self::commit_block`]'s eviction keeps one: a repcode within the
+    /// window of the block's start reads that far back. The scan's floors
+    /// come from the advertised window, not from what the history holds, so
+    /// the retained bytes admit no offset past it.
     pub(crate) fn trim_to_window(&mut self) -> usize {
         let real_len = self.committed_len().saturating_sub(HISTORY_DRAIN_BASE);
-        if real_len <= self.max_window_size {
+        let staged = self.staged_block.unwrap_or(0);
+        // The staged block is the history's tail, so it is within its length.
+        let before_block = real_len - staged;
+        if before_block <= self.max_window_size {
             return 0;
         }
-        let drop_n = real_len - self.max_window_size;
+        let drop_n = before_block - self.max_window_size;
         // Front-drain bookkeeping shared with `commit_block`'s
         // eager-eviction branch — see `drain_real_prefix` for the
         // full invariant list. Keeping the two sites in lockstep
@@ -2638,6 +2663,27 @@ fn tagged_positions_fit(max_window_size: usize) -> bool {
         .checked_mul(2)
         .and_then(|band| band.checked_add(crate::common::MAX_BLOCK_SIZE as usize))
         .is_some_and(|len| len <= TAGGED_POSITION_LIMIT)
+}
+
+/// The no-dictionary scan's `window_low`: upstream zstd's `windowLow`, the
+/// window's floor seen from where the block starts
+/// (`ZSTD_getLowestPrefixIndex(ms, curr, windowLog)`, zstd_fast.c), not from
+/// where it ends as the floor for new matches is. A repcode within one window
+/// of the block's start survives into it, and the history keeps a window
+/// before every block, so its source is in place. A dictionary in the window
+/// keeps the floor at its start.
+fn rep_window_low(
+    window_low: u32,
+    dict_in_window: bool,
+    block_start: usize,
+    advertised_window: usize,
+) -> u32 {
+    if dict_in_window {
+        window_low
+    } else {
+        // Before a window of input is in, the floor is the input's start.
+        (block_start.max(advertised_window) - advertised_window) as u32
+    }
 }
 
 /// Run the fast scan over `history`, the block starting at `block_start`.
