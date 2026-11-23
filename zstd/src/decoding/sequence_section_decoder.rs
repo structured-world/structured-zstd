@@ -667,7 +667,7 @@ pub(crate) fn execute_one_sequence_pipelined<
         unsafe {
             buffer
                 .buffer_mut()
-                .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
+                .exec_sequence_inline_tier::<K>(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
         // The inline path advances the backend's `tail` directly, bypassing the

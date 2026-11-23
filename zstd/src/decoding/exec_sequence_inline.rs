@@ -397,15 +397,23 @@ macro_rules! exec_sequence_avx2_dict_inline_at {
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_dict_inline_at;
 
-// x86_64 only: SSE2 is the architectural baseline there (every x86_64
-// CPU has SSE2 by definition). 32-bit `x86` is excluded because the
-// SSE2 intrinsics here are emitted without a `#[target_feature]`
-// gate, and 32-bit i386 / i486 / i586 targets do not always have
-// SSE2 in their baseline. The dispatch site
-// (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC`) mirrors this cfg
-// so the legacy chain handles non-x86_64 targets.
-#[cfg(target_arch = "x86_64")]
+// The SSE2 intrinsics here are emitted without a `#[target_feature]` gate,
+// so the module exists where SSE2 is in the build's baseline: every x86_64
+// target, and the 32-bit targets that enable it (i686, not i386 / i586).
+// 32-bit x86 takes only the AVX2 long-match copies from it; its sequence
+// executor otherwise uses the `portable` helpers.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", target_feature = "sse2")
+))]
+#[cfg_attr(target_arch = "x86", allow(dead_code))]
 pub(crate) mod x86 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
+        _mm256_storeu_si256,
+    };
+    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{
         __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
         _mm256_storeu_si256,
@@ -657,14 +665,29 @@ pub(crate) mod x86 {
     #[inline(always)]
     unsafe fn rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
         // SAFETY: the caller's contract; the direction flag is clear at every
-        // call boundary (System V and Windows x64), so the move runs forward,
-        // and it touches no flags.
+        // call boundary (System V, Windows x64 and the 32-bit ABIs), so the
+        // move runs forward, and it touches no flags.
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 "rep movsb",
                 inout("rcx") n => _,
                 inout("rdi") dst => _,
                 inout("rsi") src => _,
+                options(nostack, preserves_flags),
+            );
+        }
+        // `esi` may be LLVM's base pointer on 32-bit x86 and cannot be an
+        // operand, so the source is swapped into it and `esi` restored after.
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            core::arch::asm!(
+                "xchg esi, {src}",
+                "rep movsb",
+                "mov esi, {src}",
+                src = inout(reg) src => _,
+                inout("ecx") n => _,
+                inout("edi") dst => _,
                 options(nostack, preserves_flags),
             );
         }
@@ -892,6 +915,18 @@ pub(crate) mod portable {
     /// `dst` / `src` valid for 16 bytes; regions non-overlapping.
     #[inline(always)]
     pub(crate) unsafe fn copy16(dst: *mut u8, src: *const u8) {
+        // A load and a store, not a 16-byte `memcpy`: LLVM folds a loop of
+        // fixed-size `memcpy`s (the wildcopy below) into one call to libc
+        // `memcpy`, paid on every sequence with literals over 16 bytes.
+        #[cfg(all(target_arch = "x86", target_feature = "sse2"))]
+        unsafe {
+            use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+            _mm_storeu_si128(
+                dst.cast::<__m128i>(),
+                _mm_loadu_si128(src.cast::<__m128i>()),
+            );
+        }
+        #[cfg(not(all(target_arch = "x86", target_feature = "sse2")))]
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, 16);
         }
