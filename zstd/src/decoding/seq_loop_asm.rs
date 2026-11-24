@@ -25,7 +25,7 @@ use crate::fse::{SeqFSEDecoder, SeqSymbol};
 /// from the container and `$e` moves to `$slot`'s table at `new_state`
 /// (bytes 0-1) plus those bits.
 ///
-/// The loop holds its three entries in one of two forms (see [`Form`]):
+/// The loop holds its three entries in one of two forms (see [`Loop`]):
 /// `pointers`, where `$e` points at the entry and every field loads straight
 /// from it, as upstream zstd reads `ZSTD_seqSymbol`, and a state advance ends
 /// in a `lea` into the table; or `words`, where `$e` holds the entry itself,
