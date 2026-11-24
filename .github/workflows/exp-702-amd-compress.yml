@@ -19,11 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - id: fast-neg
-            levels: level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast,level_-2_fast
-          - id: fast-dfast
-            levels: level_-1_fast,level_1_fast,level_2_fast,level_3_dfast,level_4_dfast,level_5_greedy
-        draw: [1, 2, 3, 4, 5, 6, 7, 8]
+          - id: btopt
+            levels: level_16_btopt,level_17_btopt,level_1_fast_ldm,level_22_btultra2_ldm,level_1_fast_ldm_dict,level_22_btultra2_ldm_dict
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
