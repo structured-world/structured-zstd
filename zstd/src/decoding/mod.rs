@@ -569,7 +569,7 @@ pub struct FrameHeaderInfo {
 /// (`zstd_decompress.c:416-429`), without looking at the descriptor's other
 /// bits, so a header this library refuses to decode is still measured. With
 /// the `legacy` feature a v0.5-v0.7 header is measured by its own format's
-/// size fields, as [`LegacyVersion::header_size`] does.
+/// size fields, as `LegacyVersion::header_size` does.
 ///
 /// # Errors
 /// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src` is shorter

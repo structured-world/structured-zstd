@@ -149,7 +149,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm,caller-workspace
+          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm,caller-workspace,legacy
           cargo doc -p structured-zstd --no-deps --document-private-items --features std,hash,ldm,dict-builder,lsm,caller-workspace
           cargo doc -p structured-zstd-c -p structured-zstd-wasm --no-deps --document-private-items
       - name: Gate — compare_ffi/memory must not pull bench-internals

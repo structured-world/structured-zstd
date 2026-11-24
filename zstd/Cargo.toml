@@ -71,7 +71,7 @@ required-features = ["cli"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "ldm", "dict-builder", "lsm", "caller-workspace"]
+features = ["std", "hash", "ldm", "dict-builder", "lsm", "caller-workspace", "legacy"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
