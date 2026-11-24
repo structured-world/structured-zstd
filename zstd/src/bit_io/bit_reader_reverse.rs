@@ -254,7 +254,9 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// chain. The extra shift by one keeps `n == 0` at zero.
     ///
     /// Same precondition as `get_bits_unchecked`, and fewer than 64 bits
-    /// consumed before the call.
+    /// consumed before the call. Only where the container is one register:
+    /// with a 32-bit word the masked read is cheaper.
+    #[cfg(target_pointer_width = "64")]
     #[inline(always)]
     pub(crate) fn get_bits_by_shifts(&mut self, n: u8) -> u64 {
         debug_assert!(self.bits_consumed < 64 && n <= 56);

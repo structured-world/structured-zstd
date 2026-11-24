@@ -111,7 +111,9 @@ impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
     /// [`Self::next_state_word`] reading its bits by shifts
     /// ([`BitReaderReversed::get_bits_by_shifts`]), for a loop whose time is
     /// the transition chain. Same preconditions, and fewer than 64 bits
-    /// consumed before the call.
+    /// consumed before the call. Only where the container is one register
+    /// (see `get_bits_by_shifts`).
+    #[cfg(target_pointer_width = "64")]
     #[inline(always)]
     pub(crate) fn next_state_word_by_shifts<K: CpuKernel>(
         &self,
