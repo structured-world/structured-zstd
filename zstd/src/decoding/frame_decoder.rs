@@ -5024,9 +5024,15 @@ impl FrameDecoder {
         // The scratch's buffer took the string-move answer when it was built;
         // this frame's buffer over the caller's slice copies it from there.
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        let far_copy_by_string_moves = match &state.decoder_scratch {
-            DecoderScratchKind::Flat(s) => s.buffer.far_copy_by_string_moves(),
-            DecoderScratchKind::Ring(s) => s.buffer.far_copy_by_string_moves(),
+        let (far_copy_by_string_moves, seq_entries_as_words) = match &state.decoder_scratch {
+            DecoderScratchKind::Flat(s) => (
+                s.buffer.far_copy_by_string_moves(),
+                s.buffer.seq_entries_as_words(),
+            ),
+            DecoderScratchKind::Ring(s) => (
+                s.buffer.far_copy_by_string_moves(),
+                s.buffer.seq_entries_as_words(),
+            ),
         };
         let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
@@ -5052,6 +5058,8 @@ impl FrameDecoder {
         buffer.set_block_limit(block_limit);
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         buffer.set_far_copy_by_string_moves(far_copy_by_string_moves);
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        buffer.set_seq_entries_as_words(seq_entries_as_words);
         let mut direct = DirectScratch {
             huf,
             fse,

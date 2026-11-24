@@ -249,6 +249,21 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         value
     }
 
+    /// [`Self::get_bits_unchecked`] by shifts alone, as upstream zstd's
+    /// `BIT_lookBitsFast`: no mask, so no table load on a loop's dependency
+    /// chain. The extra shift by one keeps `n == 0` at zero.
+    ///
+    /// Same precondition as `get_bits_unchecked`, and fewer than 64 bits
+    /// consumed before the call.
+    #[inline(always)]
+    pub(crate) fn get_bits_by_shifts(&mut self, n: u8) -> u64 {
+        debug_assert!(self.bits_consumed < 64 && n <= 56);
+        debug_assert!(self.bits_consumed + n <= 64);
+        let value = ((self.bit_container << self.bits_consumed) >> 1) >> (63 - n);
+        self.consume(n);
+        value
+    }
+
     /// Get the next `n` bits from the source without consuming them.
     /// Caller is responsible for making sure that `n` many bits have been refilled.
     ///

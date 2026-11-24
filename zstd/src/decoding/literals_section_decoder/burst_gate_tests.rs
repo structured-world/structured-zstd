@@ -229,18 +229,20 @@ fn geometric_literals(alphabet: usize, ratio: f64, scale: f64, seed: u64) -> Vec
     data
 }
 
-/// Every CPU tier decodes 4-stream literal sections with 10- and 11-bit
-/// tables, the widths the x86_64 assembly loop takes, to the same bytes as
-/// the scalar tier. Each section is long enough for many iterations of the
-/// loop in every stream.
+/// Every CPU tier decodes 4-stream literal sections with 7- to 11-bit
+/// tables to the same bytes as the scalar tier: 10 and 11 bits through the
+/// x86_64 assembly loop at five symbols per stream an iteration, 7 to 9
+/// through the Rust loop at six or seven. Each section is long enough for
+/// many iterations of the loop in every stream.
 #[cfg(feature = "std")]
 #[test]
-fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
+fn every_cpu_tier_decodes_7_to_11_bit_literals_the_same_way() {
     use crate::cpu_kernel::CpuKernelTag;
 
+    const WIDTHS: [u8; 5] = [7, 8, 9, 10, 11];
     // One fixture per table width, picked from the geometric family.
-    let mut fixtures: [Option<Vec<u8>>; 2] = [None, None];
-    'search: for alphabet in [120usize, 160, 200, 250] {
+    let mut fixtures: [Option<Vec<u8>>; 5] = Default::default();
+    'search: for alphabet in [60usize, 90, 120, 160, 200, 250] {
         for step in 0..40u32 {
             let ratio = 0.99 - 0.005 * f64::from(step);
             let data = geometric_literals(alphabet, ratio, 600.0, 0x5eed + u64::from(step));
@@ -260,10 +262,8 @@ fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
             )
             .expect("the scalar tier decodes the fixture");
             assert_eq!(target, data, "the scalar tier must decode exactly");
-            let slot = match scratch.table.max_num_bits {
-                10 => 0,
-                11 => 1,
-                _ => continue,
+            let Some(slot) = WIDTHS.iter().position(|&w| w == scratch.table.max_num_bits) else {
+                continue;
             };
             fixtures[slot].get_or_insert(data);
             if fixtures.iter().all(Option::is_some) {
@@ -272,7 +272,7 @@ fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
         }
     }
 
-    for (width, data) in [10u8, 11].into_iter().zip(fixtures) {
+    for (width, data) in WIDTHS.into_iter().zip(fixtures) {
         let data = data.unwrap_or_else(|| panic!("no fixture with a {width}-bit table"));
         let (section, source) = build_huf4x_block(&data);
         let decode_on = |kernel: CpuKernelTag| {

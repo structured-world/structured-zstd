@@ -226,9 +226,10 @@ impl Decoder {
     fn load_parsed(&mut self, dict: &crate::decoding::Dictionary) -> Result<(), Error> {
         let bad = |_| Error::DictionaryCorrupted;
         let huf_table = &dict.huf.table;
+        let mut lengths = [0u8; 256];
         self.huf
             .table
-            .fill_from_code_lengths(huf_table.code_lengths(), huf_table.max_num_bits)
+            .fill_from_code_lengths(huf_table.code_lengths(&mut lengths), huf_table.max_num_bits)
             .map_err(bad)?;
         self.huf.set = true;
         let load = |slot: &mut Slot<FseTable>,

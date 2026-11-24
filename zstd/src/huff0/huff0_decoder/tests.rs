@@ -15,7 +15,6 @@ fn test_table() -> HuffmanTable {
         weights: SymbolBuf::new(),
         max_num_bits: 2,
         state_mask: 0b11,
-        bits: SymbolBuf::new(),
         bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
         weight_sum: 0,
         weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],

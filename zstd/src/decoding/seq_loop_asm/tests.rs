@@ -8,6 +8,28 @@ std::thread_local! {
     /// Passes of the loop on this thread that ended `Done`, `Boundary` and
     /// `Pending`.
     static EXITS: core::cell::Cell<[u64; 3]> = const { core::cell::Cell::new([0; 3]) };
+    /// The entry form the loop takes on this thread in place of the CPU's
+    /// (`true` for the words).
+    static FORM: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
+/// The entry form a test forced on this thread, if any (`true` for words).
+pub(in crate::decoding) fn forced_words() -> Option<bool> {
+    FORM.with(core::cell::Cell::get)
+}
+
+/// Runs `f` once per entry form for the AVX2 kernel, the one whose loop has
+/// both, with the loop forced to it (named in `f`'s argument); once for any
+/// other kernel. Whichever form the CPU would choose, both are decoded.
+pub(in crate::decoding) fn for_each_entry_form(kernel: CpuKernelTag, mut f: impl FnMut(&str)) {
+    if kernel != CpuKernelTag::Avx2 {
+        return f("-");
+    }
+    for (form, name) in [(false, "pointers"), (true, "words")] {
+        FORM.with(|c| c.set(Some(form)));
+        f(name);
+    }
+    FORM.with(|c| c.set(None));
 }
 
 /// Counts one pass by the assembly's status (0 done, 1 boundary, 2 pending).

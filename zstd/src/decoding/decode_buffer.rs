@@ -69,6 +69,11 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// match path, so it is never a live value in the sequence loop.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     far_copy_by_string_moves: bool,
+    /// Whether the AVX2 sequence loop holds its entries as words, see
+    /// [`crate::cpu_kernel::detect_seq_entries_as_words`]. Set and kept like
+    /// `far_copy_by_string_moves`; read once per block.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    seq_entries_as_words: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -136,6 +141,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             delivered: 0,
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
             far_copy_by_string_moves: false,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            seq_entries_as_words: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -169,6 +176,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             delivered: 0,
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
             far_copy_by_string_moves: false,
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            seq_entries_as_words: false,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -261,6 +270,21 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline]
     pub(crate) fn far_copy_by_string_moves(&self) -> bool {
         self.far_copy_by_string_moves
+    }
+
+    /// Apply the decoder's answer to
+    /// [`crate::cpu_kernel::detect_seq_entries_as_words`].
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn set_seq_entries_as_words(&mut self, words: bool) {
+        self.seq_entries_as_words = words;
+    }
+
+    /// Whether the AVX2 sequence loop holds its entries as words.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[inline]
+    pub(crate) fn seq_entries_as_words(&self) -> bool {
+        self.seq_entries_as_words
     }
 
     /// What the frame says it will produce in total, when it says so. The

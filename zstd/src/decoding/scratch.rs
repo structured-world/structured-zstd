@@ -231,6 +231,8 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // resets: a frame pays nothing for it.
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         buffer.set_far_copy_by_string_moves(crate::cpu_kernel::detect_far_copy_by_string_moves());
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        buffer.set_seq_entries_as_words(crate::cpu_kernel::detect_seq_entries_as_words());
         DecoderScratch {
             #[cfg(not(feature = "caller-workspace"))]
             huf: HuffmanScratch {
