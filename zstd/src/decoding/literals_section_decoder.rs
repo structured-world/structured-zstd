@@ -601,7 +601,6 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         // reloaded the bit reader on EVERY symbol, so each trailing symbol near
         // a stream end paid `refill_slow` — the dominant drain cost on a
         // literal-heavy frame.
-        let group_bits = 4 * max_num_bits;
         for i in 0..4 {
             // SAFETY: `[cursors[i], ends[i])` lies in the reserved allocation
             // (see above) and is this stream's own segment.
@@ -612,7 +611,6 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
                     target_ptr,
                     cursors[i],
                     ends[i],
-                    group_bits,
                 )
             };
             // The bits left past this stream's own start: the reader also
@@ -782,6 +780,8 @@ fn burst_state(state: BurstWord) -> u64 {
 ///
 /// # Safety
 /// `[cursor, end)` lies inside the allocation `target_ptr` points into.
+/// `decoder`'s table is built and its state is one of the table's states
+/// (the decoder was initialised on this stream).
 #[inline(always)]
 unsafe fn drain_stream<K: CpuKernel>(
     br: &mut BitReaderReversed<'_, K>,
@@ -789,10 +789,9 @@ unsafe fn drain_stream<K: CpuKernel>(
     target_ptr: *mut u8,
     cursor: usize,
     end: usize,
-    group_bits: u8,
 ) -> usize {
-    // SAFETY: the caller's range.
-    unsafe { decoder.decode_tail_into(br, target_ptr, cursor, end, group_bits) }
+    // SAFETY: the caller's range, table and state.
+    unsafe { decoder.decode_tail_into(br, target_ptr, cursor, end) }
 }
 
 /// Loop-invariant constants for [`run_4stream_burst_loop`]. Derived

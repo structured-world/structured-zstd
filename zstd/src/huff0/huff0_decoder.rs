@@ -128,8 +128,9 @@ impl<'t> HuffmanDecoder<'t> {
     /// Decodes this stream's symbols into `target[cursor..end]` and returns
     /// `end`: groups of four with one reload each while four remain (upstream
     /// zstd `HUF_decodeStreamX1`, `p < pEnd - 3`, so a group never reads into
-    /// the padding), then the last few after one more reload. `group_bits`
-    /// is four symbols' worth, so one reload covers either.
+    /// the padding), then the last few after one more reload. Each reload
+    /// asks four symbols' worth of bits at the table's width, so it covers
+    /// either.
     ///
     /// The table's entries and mask, the state, and the reader's container
     /// and bit count are locals here, written back to the reader only around
@@ -138,7 +139,9 @@ impl<'t> HuffmanDecoder<'t> {
     /// and every symbol reloaded them and stored the bit count back.
     ///
     /// # Safety
-    /// `[cursor, end)` lies inside the allocation `target` points into.
+    /// `[cursor, end)` lies inside the allocation `target` points into. The
+    /// table is built (`1 << max_num_bits` entries) and the state is one of
+    /// its states, as [`HuffmanDecoder::init_state`] leaves it.
     #[inline(always)]
     pub(crate) unsafe fn decode_tail_into<K: crate::cpu_kernel::CpuKernel>(
         &mut self,
@@ -146,8 +149,8 @@ impl<'t> HuffmanDecoder<'t> {
         target: *mut u8,
         mut cursor: usize,
         end: usize,
-        group_bits: u8,
     ) -> usize {
+        let group_bits = 4 * self.table.max_num_bits;
         let packed = self.table.packed_decode.as_ptr();
         let mask = self.table.state_mask;
         let mut state = self.state;

@@ -315,8 +315,10 @@ impl<const WORDS: bool> Loop<WORDS> {
         let [ll, ml, of] = if self.at[0].is_null() {
             [self.ll_e, self.ml_e, self.of_e]
         } else {
-            // SAFETY: entries of the three tables, readable eight-byte words.
-            unsafe { self.at.map(|p| p.read()) }
+            // SAFETY: entries of the three tables, readable eight-byte words;
+            // `SeqSymbol` aligns to four bytes only, so the read is unaligned
+            // (one `mov` on x86, as the loop's own loads).
+            unsafe { self.at.map(|p| p.read_unaligned()) }
         };
         ll_dec.state = SeqSymbol::from_word(ll);
         ml_dec.state = SeqSymbol::from_word(ml);

@@ -66,7 +66,8 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
 impl<'t> FSEDecoderImpl<'t, SeqSymbol, 512> {
     /// The table's first entry, each entry read as the eight-byte word
     /// [`SeqSymbol::to_word`] gives. Only the `1 << accuracy_log` entries the
-    /// build wrote may be read through it.
+    /// build wrote may be read through it, and only unaligned: an entry is
+    /// aligned to four bytes.
     pub(crate) fn entry_words(&self) -> *const u64 {
         self.table.decode.as_ptr().cast()
     }

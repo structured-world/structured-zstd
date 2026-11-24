@@ -288,56 +288,15 @@ fn every_cpu_tier_decodes_7_to_11_bit_literals_the_same_way() {
         };
         let reference = decode_on(CpuKernelTag::Scalar);
         assert_eq!(reference.1, data);
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-sse"
-        ))]
-        if std::is_x86_feature_detected!("sse2") {
+        // Every tier this build has and this CPU runs, the detected one
+        // (VBMI2, SVE) included.
+        for kernel in crate::cpu_kernel::supported_kernels_for_tests() {
             assert_eq!(
-                decode_on(CpuKernelTag::Sse2),
+                decode_on(kernel),
                 reference,
-                "SSE2 tier, {width} bits"
+                "{kernel:?} tier, {width} bits"
             );
         }
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-bmi2"
-        ))]
-        if std::is_x86_feature_detected!("bmi2") {
-            assert_eq!(
-                decode_on(CpuKernelTag::Bmi2),
-                reference,
-                "BMI2 tier, {width} bits"
-            );
-        }
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-avx2"
-        ))]
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-            assert_eq!(
-                decode_on(CpuKernelTag::Avx2),
-                reference,
-                "AVX2 tier, {width} bits"
-            );
-        }
-        // VBMI2 needs more than one probe covers; asked for only when the
-        // detector named it.
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
-        if matches!(crate::cpu_kernel::detect_cpu_kernel(), CpuKernelTag::Vbmi2) {
-            assert_eq!(
-                decode_on(CpuKernelTag::Vbmi2),
-                reference,
-                "VBMI2 tier, {width} bits"
-            );
-        }
-        // The aarch64 tiers take the Rust loop, held to the scalar tier too.
-        #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-        assert_eq!(
-            decode_on(CpuKernelTag::Neon),
-            reference,
-            "NEON tier, {width} bits"
-        );
     }
 }
 
