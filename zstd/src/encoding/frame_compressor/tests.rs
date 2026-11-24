@@ -4396,13 +4396,6 @@ fn dict_compress_bt_level_tiny_source_round_trips_through_prime_dms_bt() {
     // compress a tiny source with a small raw-content dictionary at level 19
     // (BtUltra2) and round-trip it. This drives the BT dict-prime + dict-match
     // search path that non-BT levels (Fast/Dfast/Lazy) never reach.
-    //
-    // The `prime_dms_bt` dms-table sizing previously used
-    // `ceil_log2(region).clamp(10, hash_log)`, which panicked ("min > max") when
-    // the matcher's `hash_log` adjusted below the 10 floor — the exact bound
-    // arithmetic is pinned directly by `storage::dms_hash_log_tests`. On this
-    // build the window-log floor keeps `hash_log >= 10` so this end-to-end path
-    // stays above the boundary; the unit test exercises `hash_log < 10`.
     let raw_dict: Vec<u8> = (0..100u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
         .collect();

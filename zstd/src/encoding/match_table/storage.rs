@@ -107,9 +107,6 @@ mod bt_pair_index_wrap_tests;
 #[cfg(test)]
 mod stream_abs_headroom_tests;
 
-#[cfg(test)]
-mod dms_hash_log_tests;
-
 /// Knuth-style 3-byte hash multiplier. Upstream zstd parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
 /// by the HC3 short-match side table and by the 3-byte branch of the
@@ -291,6 +288,11 @@ pub(crate) struct MatchTable {
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
     pub(crate) dms: DictAttach<DmsDictTables>,
+    /// `hashLog` of the attached dictionary's own cParams (the CDict's), the
+    /// width [`Self::prime_dms_bt`] hashes the dictionary tree at, as upstream
+    /// walks `dms->hashTable` at the dictionary's cParams. Set by the frame's
+    /// reset; `0` without a dictionary.
+    pub(crate) dict_table_hash_log: usize,
     /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
     /// [`Self::reset`], which would otherwise read the floor off a history
     /// already cut down to what it keeps.
@@ -346,6 +348,7 @@ impl Clone for MatchTable {
             // when the copy parses a block.
             block_live: (core::ptr::null(), 0),
             dms: self.dms.clone(),
+            dict_table_hash_log: self.dict_table_hash_log,
             retired: self.retired,
             // A copy reads no caller's input; the floor it advances past
             // travels with it.
@@ -363,6 +366,7 @@ impl Clone for MatchTable {
         self.tables.clone_from(&source.tables);
         self.dms.clone_from(&source.dms);
         // Scalars / Copy fields.
+        self.dict_table_hash_log = source.dict_table_hash_log;
         self.max_window_size = source.max_window_size;
         self.window_size = source.window_size;
         // Describes the buffer just overwritten above, so it travels with it:
@@ -400,27 +404,10 @@ impl Clone for MatchTable {
     }
 }
 
-/// Hash-log for a dictionary-match-state table: `ceil_log2(region)` (a table
-/// sized to the dict region), with a 10-bit minimum but never wider than the
-/// matcher's own `hash_log` (the dms table need not exceed the live table).
-///
-/// A tiny source makes `ZSTD_adjustCParams` legitimately shrink the matcher's
-/// `hash_log` below 10 (a BT strategy, level >= 13, with a dictionary). The
-/// minimum is therefore `min(10, hash_log)`, not a fixed 10: when `hash_log`
-/// is already below 10 the 10-bit floor would invert the clamp bounds
-/// (`min > max`) and panic. Collapsing the floor to `hash_log` keeps the clamp
-/// valid and sizes the dms table to the (small) live-table width — matching
-/// what upstream's dict cParams `hashLog` yields for the same small dictionary.
-pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
-    debug_assert!(region >= 1, "dms_hash_log called with empty region");
-    let hash_log = hash_log as u32;
-    (usize::BITS - (region - 1).leading_zeros()).clamp(10.min(hash_log), hash_log) as usize
-}
-
 /// Scaffold of the dictionary-match-state builder.
 ///
 /// Resolves the dict `region` (capped to the live history), bails on an
-/// undersized dict, derives the dict-sized hash log, short-circuits when a
+/// undersized dict, takes the CDict's hash log, short-circuits when a
 /// same-shape table is already primed, recycles the prior tables' capacity,
 /// runs `$build` over the dict bytes at the front of the live history, then
 /// publishes the tables and marks the cache primed. `$build` sees `concat`
@@ -438,10 +425,16 @@ macro_rules! build_dms {
             $self.dms.invalidate();
             return;
         }
-        // Dict-sized hash log: ceil-log2(region), bounded to the matcher's
-        // `hash_log`. See [`dms_hash_log`] for the bound rationale.
-        let dms_hash_log =
-            $crate::encoding::match_table::storage::dms_hash_log(region, $self.hash_log);
+        // The dictionary's own `hashLog` (upstream `dmsHashLog`, the CDict's
+        // cParams), set by the frame's reset. A width sized from the
+        // dictionary's length instead ran one bit under it on a small
+        // dictionary, and the denser buckets made the search's empty-bucket
+        // test mispredict twice as often (level 11, 1280-byte dictionary).
+        let dms_hash_log = $self.dict_table_hash_log;
+        debug_assert!(
+            dms_hash_log != 0,
+            "an attached dictionary carries its cParams"
+        );
         // CDict cache: the tables depend only on the dict bytes (re-committed
         // identically to the front of history every frame) and the
         // (region, mls, hash_log, compare budget) shape, so a primed
@@ -530,6 +523,7 @@ impl MatchTable {
             block_coords: BtCoords::default(),
             block_live: (core::ptr::null(), 0),
             dms: DictAttach::new(),
+            dict_table_hash_log: 0,
             retired: None,
             borrowed_input: None,
             borrowed_end: 0,

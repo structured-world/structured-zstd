@@ -1971,6 +1971,9 @@ impl Matcher for MatchGeneratorDriver {
                 // from the CDict's cParams for a dictionary frame).
                 let hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
                 hc.configure(hc_cfg, strategy_tag, params.window_log);
+                // The attached dictionary tree takes the CDict's `hashLog`, as
+                // the Fast and Dfast attached tables do.
+                hc.table.dict_table_hash_log = dict_tables.map_or(0, |cd| cd.hash_log as usize);
                 // A copy-mode frame merges the dictionary into the live tables,
                 // so the previous attach frame's dms must not be re-borrowed
                 // under it (the same decision the prime makes, taken here
