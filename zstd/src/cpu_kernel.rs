@@ -1079,6 +1079,63 @@ pub(crate) fn detect_far_copy_by_string_moves() -> bool {
     cfg!(target_feature = "ermsb") && string_moves_win_far_copies()
 }
 
+/// Whether the AVX2 sequence loop holds its FSE entries as words, their
+/// fields taken out by shifts, rather than as pointers into the tables with
+/// the fields loaded from memory: on Intel's Golden Cove line of P-cores.
+/// Answered when a decoder is built and kept in it, as the far-copy choice is.
+///
+/// Decoding z000033 at level 19, the whole decode against libzstd, from the
+/// same binary on the same host: the pointers ran 0.92-0.93 against 0.98 for
+/// the words on Zen 3, 0.95-0.96 against 0.99-1.01 on Zen 4, and gained 3.5%
+/// of cycles over the words on Broadwell; on Emerald Rapids the words ran
+/// 0.997-1.002 against 1.012-1.015, on Granite Rapids 0.983-0.985 against
+/// 1.007-1.008. Ice Lake gained with the pointers. The other cores of the
+/// line (Alder and Raptor Lake, Sapphire Rapids, Meteor Lake) share the core
+/// and take the words with it; later cores take the pointers until measured.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", feature = "std"))]
+pub(crate) fn detect_seq_entries_as_words() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(seq_entries_as_words)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2", not(feature = "std")))]
+pub(crate) fn detect_seq_entries_as_words() -> bool {
+    seq_entries_as_words()
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn seq_entries_as_words() -> bool {
+    let [eax, ..] = cpuid(1);
+    seq_entries_as_words_on(cpu_vendor(), display_family(eax), display_model(eax))
+}
+
+/// [`detect_seq_entries_as_words`] for a given vendor, display family and
+/// display model.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn seq_entries_as_words_on(vendor: CpuVendor, family: u32, model: u32) -> bool {
+    /// Family 6 models of Golden Cove and its successors up to Redwood Cove:
+    /// Alder Lake (0x97, 0x9A), Raptor Lake (0xB7, 0xBA, 0xBF), Sapphire
+    /// Rapids (0x8F), Emerald Rapids (0xCF), Meteor Lake (0xAA, 0xAC), Granite
+    /// Rapids (0xAD, 0xAE).
+    const GOLDEN_COVE_LINE: [u32; 11] = [
+        0x97, 0x9a, 0xb7, 0xba, 0xbf, 0x8f, 0xcf, 0xaa, 0xac, 0xad, 0xae,
+    ];
+    vendor == CpuVendor::Intel && family == 6 && GOLDEN_COVE_LINE.contains(&model)
+}
+
+/// The display model in CPUID leaf 1 EAX: the base model, with the extended
+/// model above it for families 6 and 0xF.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+fn display_model(eax: u32) -> u32 {
+    let base = (eax >> 4) & 0xf;
+    let family = (eax >> 8) & 0xf;
+    if family == 6 || family == 0xf {
+        base | (((eax >> 16) & 0xf) << 4)
+    } else {
+        base
+    }
+}
+
 /// The CPU's vendor, from the CPUID leaf 0 vendor string.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

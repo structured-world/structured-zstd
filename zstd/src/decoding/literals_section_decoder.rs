@@ -369,6 +369,8 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         let jump2 = jump1 + source[2] as usize + ((source[3] as usize) << 8);
         let jump3 = jump2 + source[4] as usize + ((source[5] as usize) << 8);
         bytes_read += 6;
+        // The jump table and the four streams, upstream's `istart`.
+        let section = source;
         let source = &source[6..];
 
         if source.len() < jump3 {
@@ -378,13 +380,41 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
             });
         }
 
-        //decode 4 streams with interleaved operations to hide memory latency
-        let streams: [&[u8]; 4] = [
-            &source[..jump1],
-            &source[jump1..jump2],
-            &source[jump2..jump3],
-            &source[jump3..],
-        ];
+        // Each stream's reader reads the section from its start up to the
+        // stream's end, so a window near a stream's start may take bytes
+        // below it, as upstream's readers all start at `ilowest` (the
+        // section's start): the four-stream loop can then run until stream 0
+        // nears the section's start, where a reader confined to its own
+        // stream would stop when the shortest stream nears its own. The bits
+        // below a stream are never consumed from a valid stream; they only
+        // fill the state's lookahead, which a prefix code does not read.
+        // Upstream reads this way only when every stream holds eight bytes
+        // (`HUF_DecompressFastArgs_init`); a shorter one is read within its
+        // own bounds, as its fallback does. `stream_offsets[i]` is where the
+        // bytes of reader `i`'s source start before stream `i`.
+        let wide =
+            jump1 >= 8 && jump2 - jump1 >= 8 && jump3 - jump2 >= 8 && source.len() - jump3 >= 8;
+        let (streams, stream_offsets): ([&[u8]; 4], [usize; 4]) = if wide {
+            (
+                [
+                    &section[..6 + jump1],
+                    &section[..6 + jump2],
+                    &section[..6 + jump3],
+                    section,
+                ],
+                [6, 6 + jump1, 6 + jump2, 6 + jump3],
+            )
+        } else {
+            (
+                [
+                    &source[..jump1],
+                    &source[jump1..jump2],
+                    &source[jump2..jump3],
+                    &source[jump3..],
+                ],
+                [0; 4],
+            )
+        };
 
         let mut decoders: [HuffmanDecoder<'_>; 4] = [
             HuffmanDecoder::new(table),
@@ -474,6 +504,11 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         // the surrounding generic parameter `K: CpuKernel`.)
         // A 64-bit word takes 5 symbols at max=10 or 11 and 6 at max=8; a
         // 32-bit word takes 2 at max=8 to 11, as upstream's 32-bit loop does.
+        // As many symbols per stream an iteration as the word holds: five at
+        // 10 and 11 bits, where the assembly loop runs, six or seven on the
+        // Rust loop below 10. Upstream widens a narrower table to 11 bits and
+        // runs its loop at five; taking narrower tables into the assembly
+        // loop at five measured 0.5-1.5% slower on Zen 3 and Zen 5.
         let symbols_per_burst: usize = (BURST_WORD_BITS as usize - 9) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
         let table_shift = BURST_WORD_BITS - u32::from(max_num_bits);
@@ -503,7 +538,10 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         // segment; the drain phase outside `run_4stream_burst_loop`
         // handles the small-`min_seg_len` case via single-symbol
         // per-stream decode.
-        let burst_eligible = symbols_per_burst >= 1 && min_seg_len >= symbols_per_burst;
+        // The loop's input bound is stream 0's distance to the section's
+        // start, which holds only with every reader on the section (`wide`);
+        // with a stream under eight bytes upstream skips its fast loop too.
+        let burst_eligible = wide && symbols_per_burst >= 1 && min_seg_len >= symbols_per_burst;
         let cursor_burst_ceil = (starts[0] + min_seg_len).saturating_sub(symbols_per_burst);
 
         let bounds = LoopBounds {
@@ -563,44 +601,24 @@ fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
         // reloaded the bit reader on EVERY symbol, so each trailing symbol near
         // a stream end paid `refill_slow` — the dominant drain cost on a
         // literal-heavy frame.
-        let group_bits = 4 * max_num_bits;
         for i in 0..4 {
-            // Phase 1 (upstream `HUF_decodeStreamX1` lines 551-557): decode in
-            // groups of four with a SINGLE reload per group. Output-based bound
-            // (`cursors[i] + 4 <= ends[i]`), like upstream's `p < pEnd-3`, so a
-            // group only runs while four whole symbols remain — it never reads
-            // past the last symbol into the zero padding.
-            while cursors[i] + 4 <= ends[i] {
-                brs[i].ensure_bits(group_bits);
-                for _ in 0..4 {
-                    let byte = decoders[i].decode_symbol_and_advance_no_refill(&mut brs[i]);
-                    unsafe {
-                        target_ptr.add(cursors[i]).write(byte);
-                    }
-                    cursors[i] += 1;
-                }
-            }
-            // Phase 2 (upstream `HUF_decodeStreamX1` line 568 `while (p < pEnd)`):
-            // the final < 4 symbols. ONE reload covers them (<= 3 * max_num_bits
-            // bits), then NO per-symbol reload — so the trailing symbols at the
-            // stream end never pay the cold `refill_slow` each. `bits_remaining`
-            // is reload-timing-independent (the padding lands in either
-            // `extra_bits` or `bits_consumed`, and `(64 - bits_consumed) -
-            // extra_bits` is identical), so the end-of-stream check below still
-            // holds exactly.
-            if cursors[i] < ends[i] {
-                brs[i].ensure_bits(group_bits);
-                while cursors[i] < ends[i] {
-                    let byte = decoders[i].decode_symbol_and_advance_no_refill(&mut brs[i]);
-                    unsafe {
-                        target_ptr.add(cursors[i]).write(byte);
-                    }
-                    cursors[i] += 1;
-                }
-            }
-            if brs[i].bits_remaining() != -max_bits {
+            // SAFETY: `[cursors[i], ends[i])` lies in the reserved allocation
+            // (see above) and is this stream's own segment.
+            cursors[i] = unsafe {
+                drain_stream(
+                    &mut brs[i],
+                    &mut decoders[i],
+                    target_ptr,
+                    cursors[i],
+                    ends[i],
+                )
+            };
+            // The bits left past this stream's own start: the reader also
+            // holds the section's bytes below it.
+            let read_til = brs[i].bits_remaining() - 8 * stream_offsets[i] as isize;
+            if read_til != -max_bits {
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
-                    read_til: brs[i].bits_remaining(),
+                    read_til,
                     expected: -max_bits,
                 });
             }
@@ -754,6 +772,26 @@ fn burst_state(state: BurstWord) -> u64 {
 #[inline(always)]
 fn burst_state(state: BurstWord) -> u64 {
     u64::from(state)
+}
+
+/// Decodes the rest of one stream into `target_ptr[cursor..end]` after the
+/// four-stream loop, returning the cursor at `end`
+/// ([`HuffmanDecoder::decode_tail_into`]).
+///
+/// # Safety
+/// `[cursor, end)` lies inside the allocation `target_ptr` points into.
+/// `decoder`'s table is built and its state is one of the table's states
+/// (the decoder was initialised on this stream).
+#[inline(always)]
+unsafe fn drain_stream<K: CpuKernel>(
+    br: &mut BitReaderReversed<'_, K>,
+    decoder: &mut HuffmanDecoder<'_>,
+    target_ptr: *mut u8,
+    cursor: usize,
+    end: usize,
+) -> usize {
+    // SAFETY: the caller's range, table and state.
+    unsafe { decoder.decode_tail_into(br, target_ptr, cursor, end) }
 }
 
 /// Loop-invariant constants for [`run_4stream_burst_loop`]. Derived
@@ -1021,15 +1059,22 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     // `floor(ctz_max / 8)` where `ctz_max = pad_max + burst_bits`; taking
     // `pad_max = 8` covers the first iter (sentinel at padding_skip ∈ [1,8])
     // and subsequent iters (nb_bits ∈ [0,7]). An iteration may start while
-    // every stream's index is at least `bytes_per_iter_upper`, which keeps its
-    // `ip -= nb_bytes` and 8-byte window read inside the stream.
+    // stream 0's index (from the section's start, where every reader's
+    // source starts) is at least `bytes_per_iter_upper` and no stream lies
+    // below stream 0, which keeps every `ip -= nb_bytes` and 8-byte window
+    // read inside the section.
     //
     // `ip + 8 <= source.end`: `BitReaderReversed::new()` starts with
     // `bits_consumed = 64`, so the first `get_bits(1)` of the padding skip
-    // refills. For `source.len() >= 8` that leaves `index = source.len() - 8`,
-    // and `init_state` stays inside that window. The `refill_slow` path of a
-    // shorter stream leaves `index = 0`, so no iteration runs. Inside the
-    // loop `ip` only decreases.
+    // refills. Every stream holds eight bytes here (the caller's `wide`), so
+    // that leaves `index = source.len() - 8`, and `init_state` stays inside
+    // that window. Inside the loop `ip` only decreases.
+    debug_assert!(
+        src1.as_ptr() == src0.as_ptr()
+            && src2.as_ptr() == src0.as_ptr()
+            && src3.as_ptr() == src0.as_ptr(),
+        "every reader starts at the section's start"
+    );
     let bytes_per_iter_upper = (8 + burst_bits as usize) / 8;
     let ceil = unsafe { target_ptr.add(cursor_burst_ceil) };
     // Iterations a stream can still start under the budget at worst-case
@@ -1058,12 +1103,14 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     while op0 <= ceil {
         // SAFETY: both point into the target allocation and `op0 <= ceil`.
         let output_iters = unsafe { ceil.offset_from(op0) } as usize / symbols_per_burst + 1;
-        let iters = output_iters
-            .min(input_iters(ip0, src0))
-            .min(input_iters(ip1, src1))
-            .min(input_iters(ip2, src2))
-            .min(input_iters(ip3, src3));
-        if iters == 0 {
+        // Every reader starts at the section's start (the caller's `wide`),
+        // stream 0 lowest, so stream 0's distance to it bounds all four while
+        // no stream lies below the one before it, upstream's `iiters` on
+        // `ip[0] - ilowest` and its `ip[s] < ip[s - 1]` exit. A valid stream
+        // never crosses below the one before it; one that does is corrupt,
+        // and leaving here hands it to the drain's end-of-stream check.
+        let iters = output_iters.min(input_iters(ip0, src0));
+        if iters == 0 || ip1 < ip0 || ip2 < ip1 || ip3 < ip2 {
             break;
         }
         any_iter = true;
@@ -1071,6 +1118,9 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
         // past `ceil`, inside the allocation.
         let olimit = unsafe { op0.add(iters * symbols_per_burst) };
 
+        // Narrower tables keep the Rust loop: the assembly loop at five symbols
+        // an iteration measured 0.5-1.5% slower on Zen 3 and Zen 5, and at
+        // their own six or seven level with it.
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         if K::HAS_BMI2 && (TABLE_BITS == 10 || TABLE_BITS == 11) {
             // SAFETY: the kernel guarantees BMI2; both widths take five
@@ -1213,7 +1263,37 @@ macro_rules! huf_x1_round {
     };
 }
 
-/// Reload a stream whose input pointer lives at `[r14 + $slot]`
+/// The loop copies its slots to its own stack and addresses them through
+/// `rsp`, as upstream's loop does, where Zen's memory renaming applies to the
+/// pointers' store and reload every iteration; at `r14`, in the caller's
+/// frame, the loop measured 1-2.4% slower on Zen 5.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! huf_slots_in {
+    () => {
+        concat!(
+            "sub rsp, 40\n",
+            "mov rcx, qword ptr [r14]\nmov qword ptr [rsp], rcx\n",
+            "mov rcx, qword ptr [r14 + 8]\nmov qword ptr [rsp + 8], rcx\n",
+            "mov rcx, qword ptr [r14 + 16]\nmov qword ptr [rsp + 16], rcx\n",
+            "mov rcx, qword ptr [r14 + 24]\nmov qword ptr [rsp + 24], rcx\n",
+            "mov rcx, qword ptr [r14 + 32]\nmov qword ptr [rsp + 32], rcx",
+        )
+    };
+}
+/// The pointers back to the caller's slots, the stack given back.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! huf_slots_out {
+    () => {
+        concat!(
+            "mov rcx, qword ptr [rsp]\nmov qword ptr [r14], rcx\n",
+            "mov rcx, qword ptr [rsp + 8]\nmov qword ptr [r14 + 8], rcx\n",
+            "mov rcx, qword ptr [rsp + 16]\nmov qword ptr [r14 + 16], rcx\n",
+            "add rsp, 40",
+        )
+    };
+}
+
+/// Reload a stream whose input pointer lives in slot `$slot`
 /// (upstream zstd `HUF_4X1_RELOAD_STREAM`): step back over the whole bytes
 /// consumed, read eight, set the sentinel and skip the sub-byte phase. The
 /// pointer is read into `r15` ahead of the bit count and stepped there, and
@@ -1223,7 +1303,7 @@ macro_rules! huf_x1_round {
 macro_rules! huf_x1_reload_mem {
     ($b:literal, $slot:literal) => {
         concat!(
-            "mov r15, qword ptr [r14 + ",
+            "mov r15, qword ptr [rsp + ",
             $slot,
             "]\n",
             "bsf ",
@@ -1240,7 +1320,7 @@ macro_rules! huf_x1_reload_mem {
             "sub r15, ",
             $b,
             "\n",
-            "mov qword ptr [r14 + ",
+            "mov qword ptr [rsp + ",
             $slot,
             "], r15\n",
             "mov ",
@@ -1271,10 +1351,10 @@ macro_rules! huf_x1_reload_mem {
 /// Rust loop. The symbol store writes a high byte register, which an
 /// instruction with a REX prefix cannot address, so the four output pointers
 /// sit in registers without one (`rsi`, `rdi`, `rdx`, `rax`) and the entry in
-/// `rcx`; streams 1-3 keep their input pointers in memory and touch them once
-/// an iteration, as upstream does. The slots are addressed as eight-byte words,
-/// so the loop exists only where pointers are eight bytes: the x32 ABI is
-/// `x86_64` with four-byte pointers and takes the Rust loop.
+/// `rcx`; streams 1-3 keep their input pointers on the stack and touch them
+/// once an iteration, as upstream does. The slots are addressed as
+/// eight-byte words, so the loop exists only where pointers are eight bytes:
+/// the x32 ABI is `x86_64` with four-byte pointers and takes the Rust loop.
 ///
 /// # Safety
 /// The CPU has BMI2. `packed` holds `1 << (64 - table_shift)` entries and
@@ -1296,8 +1376,8 @@ unsafe fn burst_batch_asm(
     let [ip0, ip1, ip2, ip3] = ip;
     let [op0, op1, op2, op3] = op;
     // Streams 1-3's input pointers, the loop bound and the table shift,
-    // addressed through r14. The reloads borrow r15 and take the shift back
-    // from its slot.
+    // handed over through r14 and copied below `rsp` for the loop. The
+    // reloads borrow r15 and take the shift back from its slot.
     let mut slots: [*const u8; 5] = [
         *ip1,
         *ip2,
@@ -1306,9 +1386,12 @@ unsafe fn burst_batch_asm(
         core::ptr::without_provenance(table_shift as usize),
     ];
     // SAFETY: the caller's contract; the asm reads the table and the input
-    // windows and writes the output segments named there, and the slots.
+    // windows and writes the output segments named there, the slots, and its
+    // own 40 bytes below `rsp`, taken and given back inside the block (so no
+    // `nostack`).
     unsafe {
         core::arch::asm!(
+            huf_slots_in!(),
             "2:",
             huf_x1_round!("0"),
             huf_x1_round!("1"),
@@ -1326,13 +1409,14 @@ unsafe fn burst_batch_asm(
             huf_x1_reload_mem!("r9", "0"),
             huf_x1_reload_mem!("r10", "8"),
             huf_x1_reload_mem!("r11", "16"),
-            "mov r15, qword ptr [r14 + 32]",
+            "mov r15, qword ptr [rsp + 32]",
             "add rsi, 5",
             "add rdi, 5",
             "add rdx, 5",
             "add rax, 5",
-            "cmp rsi, qword ptr [r14 + 24]",
+            "cmp rsi, qword ptr [rsp + 24]",
             "jb 2b",
+            huf_slots_out!(),
             inout("r8") *b0,
             inout("r9") *b1,
             inout("r10") *b2,
@@ -1346,7 +1430,6 @@ unsafe fn burst_batch_asm(
             in("r14") slots.as_mut_ptr(),
             inout("r15") u64::from(table_shift) => _,
             out("rcx") _,
-            options(nostack),
         );
     }
     *ip1 = slots[0];

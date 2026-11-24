@@ -66,7 +66,8 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
 impl<'t> FSEDecoderImpl<'t, SeqSymbol, 512> {
     /// The table's first entry, each entry read as the eight-byte word
     /// [`SeqSymbol::to_word`] gives. Only the `1 << accuracy_log` entries the
-    /// build wrote may be read through it.
+    /// build wrote may be read through it, and only unaligned: an entry is
+    /// aligned to four bytes.
     pub(crate) fn entry_words(&self) -> *const u64 {
         self.table.decode.as_ptr().cast()
     }
@@ -104,6 +105,23 @@ impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
         let add = bits.get_bits_unchecked((word >> 24) as u8);
         // SAFETY: as in `update_state_fast`: `new_state + add` stays below the
         // table's length by its construction.
+        entry_word(self.read_entry((word & 0xFFFF) as usize + add as usize))
+    }
+
+    /// [`Self::next_state_word`] reading its bits by shifts
+    /// ([`BitReaderReversed::get_bits_by_shifts`]), for a loop whose time is
+    /// the transition chain. Same preconditions, and fewer than 64 bits
+    /// consumed before the call. Only where the container is one register
+    /// (see `get_bits_by_shifts`).
+    #[cfg(target_pointer_width = "64")]
+    #[inline(always)]
+    pub(crate) fn next_state_word_by_shifts<K: CpuKernel>(
+        &self,
+        word: u32,
+        bits: &mut BitReaderReversed<'_, K>,
+    ) -> u32 {
+        let add = bits.get_bits_by_shifts((word >> 24) as u8);
+        // SAFETY: as in `next_state_word`.
         entry_word(self.read_entry((word & 0xFFFF) as usize + add as usize))
     }
 }
@@ -1013,10 +1031,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
             debug_assert!(n <= 32);
             let byte = bit_pos >> 3;
-            let remaining = &source[byte..];
-            let window = if let Some(bytes) = remaining.first_chunk::<8>() {
-                u64::from_le_bytes(*bytes)
+            // Eight bytes in the source: one unaligned load with no slice
+            // check, as upstream's `MEM_readLE32` on its fast path; only the
+            // last few bytes take the padded copy.
+            let window = if byte + 8 <= source.len() {
+                // SAFETY: `byte + 8 <= source.len()`.
+                u64::from_le(unsafe { source.as_ptr().add(byte).cast::<u64>().read_unaligned() })
             } else {
+                let remaining = &source[byte..];
                 let mut window = [0u8; 8];
                 window[..remaining.len()].copy_from_slice(remaining);
                 u64::from_le_bytes(window)
@@ -1057,14 +1079,68 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             return Err(FSETableError::AccLogIsZero);
         }
 
-        let probability_sum = 1 << self.accuracy_log;
-        let mut probability_counter = 0;
+        let probability_sum: u32 = 1 << self.accuracy_log;
 
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
+        // The probabilities go straight into the buffer's room and the length
+        // is committed once, on every way out: one store per symbol and a
+        // zero run written in one go, as upstream fills its zeroed
+        // `normalizedCounter`, instead of a push or a resize per field.
+        let max_symbols = self.max_symbol as usize + 1;
+        debug_assert!(max_symbols <= MAX_PROBABILITIES);
+        self.symbol_probabilities.reserve(max_symbols);
+        let probs = self
+            .symbol_probabilities
+            .spare_capacity_mut()
+            .as_mut_ptr()
+            .cast::<i32>();
+        let mut len = 0usize;
+        macro_rules! fail {
+            ($e:expr) => {{
+                // SAFETY: every slot below `len` was written.
+                unsafe { self.symbol_probabilities.set_len(len) };
+                return Err($e);
+            }};
+        }
+
+        // `read_bits!` with the failure committing the probabilities read so
+        // far. With eight bytes from the field's byte in the source at least
+        // 57 bits remain, more than a field takes, so the remaining-bits
+        // check (and the source's length in bits) is needed only on the last
+        // bytes, as upstream's fast `ip <= iend - 7` path needs none.
+        macro_rules! read_field {
+            ($n:expr) => {{
+                let n: usize = $n;
+                let byte = bit_pos >> 3;
+                let window = if byte + 8 <= source.len() {
+                    // SAFETY: `byte + 8 <= source.len()`.
+                    u64::from_le(unsafe {
+                        source.as_ptr().add(byte).cast::<u64>().read_unaligned()
+                    }) >> (bit_pos & 7)
+                } else {
+                    if total_bits - bit_pos < n {
+                        fail!(FSETableError::GetBitsError(
+                            crate::bit_io::GetBitsError::NotEnoughRemainingBits {
+                                requested: n,
+                                remaining: total_bits - bit_pos,
+                            },
+                        ));
+                    }
+                    field_at(source, bit_pos, n)
+                };
+                bit_pos += n;
+                window & ((1u64 << n) - 1)
+            }};
+        }
+
+        // Upstream's `remaining`: the probability still to hand out plus one,
+        // one value where a counter and the sum were two, so the loop keeps
+        // its state in registers. Above 1 while the counter is below the sum.
+        let mut remaining = probability_sum as i32 + 1;
+        while remaining > 1 {
+            let max_remaining_value = remaining as u32;
             let bits_to_read = highest_bit_set(max_remaining_value);
 
-            let unchecked_value = read_bits!(bits_to_read as usize) as u32;
+            let unchecked_value = read_field!(bits_to_read as usize) as u32;
 
             let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
             let mask = (1 << (bits_to_read - 1)) - 1;
@@ -1078,45 +1154,78 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             } else {
                 unchecked_value
             };
-            //println!("{}, {}, {}", self.symbol_probablilities.len(), unchecked_value, value);
-
             let prob = (value as i32) - 1;
 
             // Stop as soon as the list outgrows the alphabet, as upstream's
             // `FSE_readNCount` stops at `charnum > maxSV1`, instead of letting
             // a malformed run of zero probabilities grow it without bound.
-            let max_symbols = self.max_symbol as usize + 1;
-            if self.symbol_probabilities.len() >= max_symbols {
-                return Err(FSETableError::TooManySymbols {
-                    got: self.symbol_probabilities.len() + 1,
-                });
+            if len >= max_symbols {
+                fail!(FSETableError::TooManySymbols { got: len + 1 });
             }
-            self.symbol_probabilities.push(prob);
+            // SAFETY: `len < max_symbols`, within the room reserved above.
+            unsafe { probs.add(len).write(prob) };
+            len += 1;
             if prob != 0 {
                 if prob > 0 {
-                    probability_counter += prob as u32;
+                    remaining -= prob;
                 } else {
-                    // probability -1 counts as 1
-                    assert!(prob == -1);
-                    probability_counter += 1;
+                    // probability -1 counts as 1; `value >= 0`, so it is -1.
+                    debug_assert!(prob == -1);
+                    remaining -= 1;
                 }
             } else {
-                //fast skip further zero probabilities
+                // A zero probability is followed by 2-bit repeat fields, each
+                // adding that many zeros, a field of 3 meaning another follows.
+                // Up to 16 fields are read at once and the run of 3s counted
+                // from the trailing ones, as upstream's `FSE_readNCount` does;
+                // the result, the error and its fields are those of reading
+                // them one by one.
                 loop {
-                    let skip_amount = read_bits!(2) as usize;
-
-                    let new_len = self.symbol_probabilities.len() + skip_amount;
-                    if new_len > max_symbols {
-                        return Err(FSETableError::TooManySymbols { got: new_len });
+                    let avail = total_bits - bit_pos;
+                    if avail < 2 {
+                        fail!(FSETableError::GetBitsError(
+                            crate::bit_io::GetBitsError::NotEnoughRemainingBits {
+                                requested: 2,
+                                remaining: avail,
+                            },
+                        ));
                     }
-                    self.symbol_probabilities.resize(new_len, 0);
-                    if skip_amount != 3 {
-                        break;
+                    let fields = (avail / 2).min(16);
+                    let window = field_at(source, bit_pos, 2 * fields);
+                    let threes =
+                        (((!window) | (1u64 << (2 * fields))).trailing_zeros() / 2) as usize;
+                    if threes > 0 {
+                        let run_end = len + 3 * threes;
+                        if run_end > max_symbols {
+                            // The first field that passed the alphabet.
+                            let got = len + 3 * ((max_symbols - len) / 3 + 1);
+                            fail!(FSETableError::TooManySymbols { got });
+                        }
+                        // SAFETY: `run_end <= max_symbols`, within the room.
+                        unsafe { core::ptr::write_bytes(probs.add(len), 0, run_end - len) };
+                        len = run_end;
+                        bit_pos += 2 * threes;
                     }
+                    if threes == fields {
+                        continue;
+                    }
+                    let last = ((window >> (2 * threes)) & 3) as usize;
+                    bit_pos += 2;
+                    let run_end = len + last;
+                    if run_end > max_symbols {
+                        fail!(FSETableError::TooManySymbols { got: run_end });
+                    }
+                    // SAFETY: as above.
+                    unsafe { core::ptr::write_bytes(probs.add(len), 0, last) };
+                    len = run_end;
+                    break;
                 }
             }
         }
 
+        // SAFETY: every slot below `len` was written.
+        unsafe { self.symbol_probabilities.set_len(len) };
+        let probability_counter = (probability_sum as i32 + 1 - remaining) as u32;
         if probability_counter != probability_sum {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_counter,
@@ -1124,8 +1233,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 symbol_probabilities: mismatch_diagnostic(&self.symbol_probabilities),
             });
         }
-        // Held inside the loop, before every append.
-        debug_assert!(self.symbol_probabilities.len() <= self.max_symbol as usize + 1);
 
         let bytes_read = if bit_pos.is_multiple_of(8) {
             bit_pos / 8

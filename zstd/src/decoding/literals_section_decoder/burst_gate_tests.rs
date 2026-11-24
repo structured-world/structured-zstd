@@ -229,18 +229,20 @@ fn geometric_literals(alphabet: usize, ratio: f64, scale: f64, seed: u64) -> Vec
     data
 }
 
-/// Every CPU tier decodes 4-stream literal sections with 10- and 11-bit
-/// tables, the widths the x86_64 assembly loop takes, to the same bytes as
-/// the scalar tier. Each section is long enough for many iterations of the
-/// loop in every stream.
+/// Every CPU tier decodes 4-stream literal sections with 7- to 11-bit
+/// tables to the same bytes as the scalar tier: 10 and 11 bits through the
+/// x86_64 assembly loop at five symbols per stream an iteration, 7 to 9
+/// through the Rust loop at six or seven. Each section is long enough for
+/// many iterations of the loop in every stream.
 #[cfg(feature = "std")]
 #[test]
-fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
+fn every_cpu_tier_decodes_7_to_11_bit_literals_the_same_way() {
     use crate::cpu_kernel::CpuKernelTag;
 
+    const WIDTHS: [u8; 5] = [7, 8, 9, 10, 11];
     // One fixture per table width, picked from the geometric family.
-    let mut fixtures: [Option<Vec<u8>>; 2] = [None, None];
-    'search: for alphabet in [120usize, 160, 200, 250] {
+    let mut fixtures: [Option<Vec<u8>>; 5] = Default::default();
+    'search: for alphabet in [60usize, 90, 120, 160, 200, 250] {
         for step in 0..40u32 {
             let ratio = 0.99 - 0.005 * f64::from(step);
             let data = geometric_literals(alphabet, ratio, 600.0, 0x5eed + u64::from(step));
@@ -260,10 +262,8 @@ fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
             )
             .expect("the scalar tier decodes the fixture");
             assert_eq!(target, data, "the scalar tier must decode exactly");
-            let slot = match scratch.table.max_num_bits {
-                10 => 0,
-                11 => 1,
-                _ => continue,
+            let Some(slot) = WIDTHS.iter().position(|&w| w == scratch.table.max_num_bits) else {
+                continue;
             };
             fixtures[slot].get_or_insert(data);
             if fixtures.iter().all(Option::is_some) {
@@ -272,7 +272,7 @@ fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
         }
     }
 
-    for (width, data) in [10u8, 11].into_iter().zip(fixtures) {
+    for (width, data) in WIDTHS.into_iter().zip(fixtures) {
         let data = data.unwrap_or_else(|| panic!("no fixture with a {width}-bit table"));
         let (section, source) = build_huf4x_block(&data);
         let decode_on = |kernel: CpuKernelTag| {
@@ -288,56 +288,15 @@ fn every_cpu_tier_decodes_10_and_11_bit_literals_the_same_way() {
         };
         let reference = decode_on(CpuKernelTag::Scalar);
         assert_eq!(reference.1, data);
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-sse"
-        ))]
-        if std::is_x86_feature_detected!("sse2") {
+        // Every tier this build has and this CPU runs, the detected one
+        // (VBMI2, SVE) included.
+        for kernel in crate::cpu_kernel::supported_kernels_for_tests() {
             assert_eq!(
-                decode_on(CpuKernelTag::Sse2),
+                decode_on(kernel),
                 reference,
-                "SSE2 tier, {width} bits"
+                "{kernel:?} tier, {width} bits"
             );
         }
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-bmi2"
-        ))]
-        if std::is_x86_feature_detected!("bmi2") {
-            assert_eq!(
-                decode_on(CpuKernelTag::Bmi2),
-                reference,
-                "BMI2 tier, {width} bits"
-            );
-        }
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-avx2"
-        ))]
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-            assert_eq!(
-                decode_on(CpuKernelTag::Avx2),
-                reference,
-                "AVX2 tier, {width} bits"
-            );
-        }
-        // VBMI2 needs more than one probe covers; asked for only when the
-        // detector named it.
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
-        if matches!(crate::cpu_kernel::detect_cpu_kernel(), CpuKernelTag::Vbmi2) {
-            assert_eq!(
-                decode_on(CpuKernelTag::Vbmi2),
-                reference,
-                "VBMI2 tier, {width} bits"
-            );
-        }
-        // The aarch64 tiers take the Rust loop, held to the scalar tier too.
-        #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-        assert_eq!(
-            decode_on(CpuKernelTag::Neon),
-            reference,
-            "NEON tier, {width} bits"
-        );
     }
 }
 

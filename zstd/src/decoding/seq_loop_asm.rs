@@ -21,22 +21,58 @@ use crate::bit_io::BitReaderReversed;
 use crate::cpu_kernel::Avx2Kernel;
 use crate::fse::{SeqFSEDecoder, SeqSymbol};
 
-/// One FSE state advance: the entry in `$e` reads its `num_bits` (bits 16-23)
-/// from the container and the next entry is `$slot`'s table at `new_state`
-/// (bits 0-15, `$ew`) plus those bits.
+/// One FSE state advance: the entry in `$e` reads its `num_bits` (byte 2)
+/// from the container and `$e` moves to `$slot`'s table at `new_state`
+/// (bytes 0-1) plus those bits.
+///
+/// The loop holds its three entries in one of two forms (see [`Loop`]):
+/// `pointers`, where `$e` points at the entry and every field loads straight
+/// from it, as upstream zstd reads `ZSTD_seqSymbol`, and a state advance ends
+/// in a `lea` into the table; or `words`, where `$e` holds the entry itself,
+/// its fields are taken out by shifts, and an advance ends in a load of the
+/// next entry (`$ew` is the low 16 bits of `$e`).
+///
+/// Every read of `n` bits at position `r9` here is
+/// `((container << r9) >> 1) >> (63 ^ n)` (upstream zstd's
+/// `BIT_lookBitsFast` shape, 0 for `n == 0`): the first two shifts need only
+/// the old position, so after `n` is known only the `xor` and the last shift
+/// stand between it and the bits, two fewer than `64 - (r9 + n)` with a
+/// `bzhi`. `r9 + n <= 64` at every read, so `r9 == 64` only with `n == 0`.
 macro_rules! seq_state_update {
-    ($e:literal, $ew:literal, $slot:literal) => {
+    (pointers, $e:literal, $ew:literal, $slot:literal) => {
+        concat!(
+            "movzx edx, byte ptr [",
+            $e,
+            " + 2]\n",
+            "shlx rax, r8, r9\n",
+            "add r9, rdx\n",
+            "shr rax, 1\n",
+            "xor edx, 63\n",
+            "shrx rax, rax, rdx\n",
+            "movzx edx, word ptr [",
+            $e,
+            "]\n",
+            "add rax, rdx\n",
+            "mov rdx, qword ptr [rsi + ",
+            $slot,
+            "]\n",
+            "lea ",
+            $e,
+            ", [rdx + rax*8]\n",
+        )
+    };
+    (words, $e:literal, $ew:literal, $slot:literal) => {
         concat!(
             "mov rax, ",
             $e,
             "\n",
             "shr eax, 16\n",
             "movzx edx, al\n",
+            "shlx rax, r8, r9\n",
             "add r9, rdx\n",
-            "mov eax, 64\n",
-            "sub rax, r9\n",
-            "shrx rax, r8, rax\n",
-            "bzhi rax, rax, rdx\n",
+            "shr rax, 1\n",
+            "xor edx, 63\n",
+            "shrx rax, rax, rdx\n",
             "movzx edx, ",
             $ew,
             "\n",
@@ -48,6 +84,27 @@ macro_rules! seq_state_update {
             $e,
             ", qword ptr [rdx + rax*8]\n",
         )
+    };
+}
+/// `$dst` takes the extra-bit count (byte 3) of the entry in `$e` (through
+/// `rax` in the `words` form).
+macro_rules! entry_extra {
+    (pointers, $dst:literal, $e:literal) => {
+        concat!("movzx ", $dst, ", byte ptr [", $e, " + 3]")
+    };
+    (words, $dst:literal, $e:literal) => {
+        concat!("mov rax, ", $e, "\nshr rax, 24\nmovzx ", $dst, ", al")
+    };
+}
+
+/// `$dst` (a 64-bit register, `$dst32` its low half) takes the base value
+/// (bytes 4-7) of the entry in `$e`.
+macro_rules! entry_base {
+    (pointers, $dst:literal, $dst32:literal, $e:literal) => {
+        concat!("mov ", $dst32, ", dword ptr [", $e, " + 4]")
+    };
+    (words, $dst:literal, $dst32:literal, $e:literal) => {
+        concat!("mov ", $dst, ", ", $e, "\nshr ", $dst, ", 32")
     };
 }
 
@@ -103,6 +160,10 @@ struct Slots {
     /// Dictionary content length (120) and the address one past its end (128).
     dict_len: usize,
     dict_end: usize,
+    /// The LL, ML and OF entries at the start of a pass (136, 144, 152): the
+    /// assembly holds pointers to entries, and these are where they point
+    /// until the first state advance moves them into the tables.
+    entries: [u64; 3],
 }
 
 /// Why the loop stopped.
@@ -134,7 +195,15 @@ pub(super) struct Out {
 /// pending exit hands back only the output and literal positions, the only
 /// things the caller's execution of that sequence moves. [`Loop::finish`]
 /// returns the rest to the owners.
-pub(super) struct Loop {
+///
+/// `WORDS` is how the assembly holds its three FSE entries, both forms
+/// decoding the same: as words, their fields taken out by shifts, or as
+/// pointers into the tables with the fields loaded from memory. The pointers
+/// shorten the chain from one sequence's entries to the next's and win on
+/// most cores; the words win on Intel's Golden Cove line (see
+/// [`crate::cpu_kernel::detect_seq_entries_as_words`]). Chosen once per block
+/// above the loop, so a pass carries no test of it.
+pub(super) struct Loop<const WORDS: bool> {
     slots: Slots,
     container: u64,
     consumed: u64,
@@ -142,12 +211,16 @@ pub(super) struct Loop {
     ll_e: u64,
     ml_e: u64,
     of_e: u64,
+    /// The LL, ML and OF entries in their tables once a pass has advanced
+    /// the states, null before: later passes start from them, so no pass
+    /// but the first reads its entries back from a store just made.
+    at: [*const u64; 3],
     source: *const u8,
     base: usize,
     literals: usize,
 }
 
-impl Loop {
+impl<const WORDS: bool> Loop<WORDS> {
     /// Takes the block's reader, states and history, to run `left`
     /// sequences, each advancing the states.
     ///
@@ -158,7 +231,9 @@ impl Loop {
     /// entries, and are left untouched until [`Loop::finish`]. `out` describes
     /// a linear output writable through `cap_w + 31`, and the window holds
     /// `dict_content` for a match whose literals end below `dict_end`.
-    /// `literals` is readable `lit_len + 32` bytes from its start.
+    /// `literals` is readable `lit_len + 32` bytes from its start. The loop
+    /// pays to enter ([`pays_to_enter`]), so the first pass decodes a
+    /// sequence before it can stop.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub(super) unsafe fn new(
@@ -174,6 +249,7 @@ impl Loop {
         left: usize,
     ) -> Self {
         debug_assert!(br.bits_consumed < 8);
+        debug_assert!(pays_to_enter(br, left));
         let source = br.source.as_ptr();
         let base = out.base as usize;
         Self {
@@ -199,6 +275,7 @@ impl Loop {
                 dict_limit: base.saturating_add(out.dict_end),
                 dict_len: dict_content.len(),
                 dict_end: dict_content.as_ptr() as usize + dict_content.len(),
+                entries: [0; 3],
             },
             container: br.bit_container,
             consumed: u64::from(br.bits_consumed),
@@ -206,6 +283,7 @@ impl Loop {
             ll_e: ll_dec.state.to_word(),
             ml_e: ml_dec.state.to_word(),
             of_e: of_dec.state.to_word(),
+            at: [core::ptr::null(); 3],
             source,
             base,
             literals: literals as usize,
@@ -237,9 +315,17 @@ impl Loop {
         br.bit_container = self.container;
         br.bits_consumed = self.consumed as u8;
         br.index = self.ip as usize - self.source as usize;
-        ll_dec.state = SeqSymbol::from_word(self.ll_e);
-        ml_dec.state = SeqSymbol::from_word(self.ml_e);
-        of_dec.state = SeqSymbol::from_word(self.of_e);
+        let [ll, ml, of] = if self.at[0].is_null() {
+            [self.ll_e, self.ml_e, self.of_e]
+        } else {
+            // SAFETY: entries of the three tables, readable eight-byte words;
+            // `SeqSymbol` aligns to four bytes only, so the read is unaligned
+            // (one `mov` on x86, as the loop's own loads).
+            unsafe { self.at.map(|p| p.read_unaligned()) }
+        };
+        ll_dec.state = SeqSymbol::from_word(ll);
+        ml_dec.state = SeqSymbol::from_word(ml);
+        of_dec.state = SeqSymbol::from_word(of);
         // Every offset is below 2^32: a new one is `base + bits - 3` with
         // `bits < base <= 2^31`, a repeat is one of these or one less, modular.
         *hist = self.slots.hist.map(|h| h as u32);
@@ -258,34 +344,30 @@ impl Loop {
         let mut container = self.container;
         let mut consumed = self.consumed;
         let mut ip = self.ip;
-        let mut ll_e = self.ll_e;
-        let mut ml_e = self.ml_e;
-        let mut of_e = self.of_e;
+        let slots = &raw mut self.slots;
+        // SAFETY: a field address inside `self.slots`, which outlives the
+        // assembly.
+        let entries = unsafe { (&raw mut (*slots).entries).cast::<u64>().cast_const() };
         let mut op = self.base + *op_pos;
         let mut lit = self.literals + *lit_cur;
-        let slots = &raw mut self.slots;
         let status: u64;
-        // SAFETY: the caller's contract. The assembly reads the tables, the input
-        // window, the literals and the output it has written, writes the output
-        // within `out_end + 31` and the slots, and reads no input below the
-        // floor's eight-byte window. Every field read is a plain integer.
-        unsafe {
+        // The loop in the entry form `$form`, with the entries in `$ll_e`,
+        // `$ml_e` and `$of_e` (pointers or words).
+        macro_rules! seq_pass_asm {
+            ($form:tt, $ll_e:ident, $ml_e:ident, $of_e:ident) => {
             core::arch::asm!(
                 "2:",
                 "cmp r10, qword ptr [rsi + 48]",
                 "jb 90f",
                 // Offset: a new one (more than one extra bit), or a repeat.
-                "mov rax, r13",
-                "shr rax, 24",
-                "movzx edx, al",
+                entry_extra!($form, "edx", "r13"),
                 "cmp edx, 1",
                 "jbe 50f",
                 "shlx rax, r8, r9",
                 "add r9, rdx",
                 "neg edx",
                 "shrx rax, rax, rdx",
-                "mov rcx, r13",
-                "shr rcx, 32",
+                entry_base!($form, "rcx", "ecx", "r13"),
                 "lea rcx, [rcx + rax - 3]",
                 "mov rax, qword ptr [rsi + 8]",
                 "mov qword ptr [rsi + 16], rax",
@@ -294,22 +376,17 @@ impl Loop {
                 "mov qword ptr [rsi], rcx",
                 // Match length.
                 "20:",
-                "mov rax, r12",
-                "shr rax, 24",
-                "movzx edi, al",
+                entry_extra!($form, "edi", "r12"),
+                "shlx rax, r8, r9",
                 "add r9, rdi",
-                "mov eax, 64",
-                "sub rax, r9",
-                "shrx rax, r8, rax",
-                "bzhi rdi, rax, rdi",
-                "mov rax, r12",
-                "shr rax, 32",
+                "shr rax, 1",
+                "xor edi, 63",
+                "shrx rdi, rax, rdi",
+                entry_base!($form, "rax", "eax", "r12"),
                 "add rdi, rax",
                 // Literal length, after a refill when its bits and the three state
                 // updates would run past the container.
-                "mov rax, r11",
-                "shr rax, 24",
-                "movzx edx, al",
+                entry_extra!($form, "edx", "r11"),
                 "lea rax, [r9 + rdx + 26]",
                 "cmp rax, 64",
                 "jbe 21f",
@@ -319,19 +396,18 @@ impl Loop {
                 "and r9d, 7",
                 "mov r8, qword ptr [r10]",
                 "21:",
+                "shlx rax, r8, r9",
                 "add r9, rdx",
-                "mov eax, 64",
-                "sub rax, r9",
-                "shrx rax, r8, rax",
-                "bzhi rdx, rax, rdx",
-                "mov rax, r11",
-                "shr rax, 32",
+                "shr rax, 1",
+                "xor edx, 63",
+                "shrx rdx, rax, rdx",
+                entry_base!($form, "rax", "eax", "r11"),
                 "add rdx, rax",
                 "mov qword ptr [rsi + 88], rdx",
                 // The three states, LL, ML, OF.
-                seq_state_update!("r11", "r11w", "24"),
-                seq_state_update!("r12", "r12w", "32"),
-                seq_state_update!("r13", "r13w", "40"),
+                seq_state_update!($form, "r11", "r11w", "24"),
+                seq_state_update!($form, "r12", "r12w", "32"),
+                seq_state_update!($form, "r13", "r13w", "40"),
                 "mov rax, r9",
                 "shr rax, 3",
                 "sub r10, rax",
@@ -381,8 +457,7 @@ impl Loop {
                 "je 52f",
                 "mov rax, qword ptr [rsi]",
                 "mov rdi, qword ptr [rsi + 8]",
-                "mov rcx, r11",
-                "shr rcx, 32",
+                entry_base!($form, "rcx", "ecx", "r11"),
                 "test ecx, ecx",
                 "mov rcx, rax",
                 "cmovz rcx, rdi",
@@ -396,8 +471,7 @@ impl Loop {
                 "shlx rax, r8, r9",
                 "shr rax, 63",
                 "inc r9",
-                "mov rdi, r11",
-                "shr rdi, 32",
+                entry_base!($form, "rdi", "edi", "r11"),
                 "cmp edi, 1",
                 "adc rax, 1",
                 "cmp rax, 3",
@@ -473,9 +547,9 @@ impl Loop {
                 inout("r8") container,
                 inout("r9") consumed,
                 inout("r10") ip,
-                inout("r11") ll_e,
-                inout("r12") ml_e,
-                inout("r13") of_e,
+                inout("r11") $ll_e,
+                inout("r12") $ml_e,
+                inout("r13") $of_e,
                 inout("r14") op,
                 inout("r15") lit,
                 in("rsi") slots,
@@ -485,14 +559,40 @@ impl Loop {
                 out("rdi") _,
                 out("xmm0") _,
                 options(nostack),
-            );
+            )
+            };
+        }
+        // A constant of the monomorph: the other body is not compiled into it.
+        match WORDS {
+            false => {
+                if self.at[0].is_null() {
+                    self.slots.entries = [self.ll_e, self.ml_e, self.of_e];
+                    self.at = [entries, entries.wrapping_add(1), entries.wrapping_add(2)];
+                }
+                let [mut ll_e, mut ml_e, mut of_e] = self.at;
+                // SAFETY: the caller's contract. The assembly reads the
+                // tables, the input window, the literals and the output it has
+                // written, writes the output within `out_end + 31` and the
+                // slots, and reads no input below the floor's eight-byte
+                // window. Every field read is a plain integer.
+                unsafe { seq_pass_asm!(pointers, ll_e, ml_e, of_e) };
+                // The first pass decodes a sequence before it can stop (see
+                // [`Loop::new`]) and the states advance together, so all
+                // three pointers are in the tables now, none at the slots
+                // (which would not follow a move of `self`).
+                debug_assert_ne!(ll_e, entries);
+                self.at = [ll_e, ml_e, of_e];
+            }
+            true => {
+                let [mut ll_e, mut ml_e, mut of_e] = [self.ll_e, self.ml_e, self.of_e];
+                // SAFETY: as for the pointer form.
+                unsafe { seq_pass_asm!(words, ll_e, ml_e, of_e) };
+                [self.ll_e, self.ml_e, self.of_e] = [ll_e, ml_e, of_e];
+            }
         }
         self.container = container;
         self.consumed = consumed;
         self.ip = ip;
-        self.ll_e = ll_e;
-        self.ml_e = ml_e;
-        self.of_e = of_e;
         *op_pos = op - self.base;
         *lit_cur = lit - self.literals;
         #[cfg(all(test, feature = "std"))]

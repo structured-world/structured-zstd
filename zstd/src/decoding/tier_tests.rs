@@ -17,7 +17,9 @@ use alloc::vec::Vec;
     feature = "kernel-avx2",
     not(feature = "fuzz-exports")
 ))]
-use super::seq_loop_asm::tests::{assembly_runs, assert_loop_ran_since, exits};
+use super::seq_loop_asm::tests::{
+    assembly_runs, assert_loop_ran_since, exits, for_each_entry_form,
+};
 
 /// Without the assembly loop there is nothing to count.
 #[cfg(not(all(
@@ -34,6 +36,9 @@ mod no_assembly {
         [0; 3]
     }
     pub(super) fn assert_loop_ran_since(_: [u64; 3], _: usize) {}
+    pub(super) fn for_each_entry_form(_: super::CpuKernelTag, mut f: impl FnMut(&str)) {
+        f("-")
+    }
 }
 #[cfg(not(all(
     target_arch = "x86_64",
@@ -41,7 +46,7 @@ mod no_assembly {
     feature = "kernel-avx2",
     not(feature = "fuzz-exports")
 )))]
-use no_assembly::{assembly_runs, assert_loop_ran_since, exits};
+use no_assembly::{assembly_runs, assert_loop_ran_since, exits, for_each_entry_form};
 
 /// Decodes `frame` into a slice of `len + slack` bytes on the named tier, and
 /// with a dictionary a second time on the same decoder. A dictionary is cold
@@ -156,20 +161,23 @@ fn every_cpu_tier_decodes_what_the_scalar_tier_decodes() {
         for level in [1, 3, 9, 16, 19] {
             let frame = compress_slice_to_vec(input, CompressionLevel::from_level(level));
             for &kernel in &kernels {
-                for slack in [0usize, 64] {
-                    for decoded in slice_decodes(&frame, input.len(), slack, kernel, None) {
-                        assert!(
-                            decoded == *input,
-                            "{kernel:?} slice decode differs: shape {shape} level {level} slack {slack}"
-                        );
+                for_each_entry_form(kernel, |form| {
+                    for slack in [0usize, 64] {
+                        for decoded in slice_decodes(&frame, input.len(), slack, kernel, None) {
+                            assert!(
+                                decoded == *input,
+                                "{kernel:?} ({form}) slice decode differs: \
+                                 shape {shape} level {level} slack {slack}"
+                            );
+                        }
                     }
-                }
-                let mut stream = StreamingDecoder::new(frame.as_slice());
-                stream.decoder.decode_with_kernel_for_tests(kernel);
-                assert!(
-                    stream_decode(stream) == *input,
-                    "{kernel:?} stream decode differs: shape {shape} level {level}"
-                );
+                    let mut stream = StreamingDecoder::new(frame.as_slice());
+                    stream.decoder.decode_with_kernel_for_tests(kernel);
+                    assert!(
+                        stream_decode(stream) == *input,
+                        "{kernel:?} ({form}) stream decode differs: shape {shape} level {level}"
+                    );
+                });
             }
         }
         if assembly {
@@ -226,24 +234,27 @@ fn every_cpu_tier_decodes_dictionary_frames_as_the_scalar_tier_does() {
                 .expect("attach dictionary");
             let frame = compressor.compress_independent_frame(input);
             for &kernel in &kernels {
-                for slack in [0usize, 64] {
-                    let decodes = slice_decodes(&frame, input.len(), slack, kernel, Some(&handle));
-                    for (round, decoded) in decodes.iter().enumerate() {
-                        assert!(
-                            *decoded == *input,
-                            "{kernel:?} slice decode {round} differs: \
-                             shape {shape} level {level} slack {slack}"
-                        );
+                for_each_entry_form(kernel, |form| {
+                    for slack in [0usize, 64] {
+                        let decodes =
+                            slice_decodes(&frame, input.len(), slack, kernel, Some(&handle));
+                        for (round, decoded) in decodes.iter().enumerate() {
+                            assert!(
+                                *decoded == *input,
+                                "{kernel:?} ({form}) slice decode {round} differs: \
+                                 shape {shape} level {level} slack {slack}"
+                            );
+                        }
                     }
-                }
-                let mut stream =
-                    StreamingDecoder::new_with_dictionary_handle(frame.as_slice(), &handle)
-                        .unwrap_or_else(|_| panic!("dictionary refused"));
-                stream.decoder.decode_with_kernel_for_tests(kernel);
-                assert!(
-                    stream_decode(stream) == *input,
-                    "{kernel:?} stream decode differs: shape {shape} level {level}"
-                );
+                    let mut stream =
+                        StreamingDecoder::new_with_dictionary_handle(frame.as_slice(), &handle)
+                            .unwrap_or_else(|_| panic!("dictionary refused"));
+                    stream.decoder.decode_with_kernel_for_tests(kernel);
+                    assert!(
+                        stream_decode(stream) == *input,
+                        "{kernel:?} ({form}) stream decode differs: shape {shape} level {level}"
+                    );
+                });
             }
         }
         if assembly {

@@ -437,6 +437,46 @@ fn string_moves_win_on_intel_and_amd_from_zen5() {
     }
 }
 
+/// The display model joins the extended model above the base one for
+/// families 6 and 0xF, and the sequence loop takes the words on the Golden
+/// Cove line only: Emerald and Granite Rapids (measured) and Sapphire Rapids
+/// do, Broadwell, Ice Lake and the Zen cores do not, nor a later Intel core or
+/// another vendor with a listed model number.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[test]
+fn seq_entries_are_words_on_the_golden_cove_line_only() {
+    for (eax, vendor, model, words, host) in [
+        (0x0004_06f1, CpuVendor::Intel, 0x4f, false, "Broadwell"),
+        (0x0006_06a6, CpuVendor::Intel, 0x6a, false, "Ice Lake"),
+        (0x0008_06f8, CpuVendor::Intel, 0x8f, true, "Sapphire Rapids"),
+        (
+            0x000c_06f2,
+            CpuVendor::Intel,
+            0xcf,
+            true,
+            "Emerald Rapids 8573C",
+        ),
+        (
+            0x000a_06d1,
+            CpuVendor::Intel,
+            0xad,
+            true,
+            "Granite Rapids 6975P",
+        ),
+        (0x000c_06c1, CpuVendor::Intel, 0xcc, false, "Panther Lake"),
+        (0x00a0_0f11, CpuVendor::Amd, 0x01, false, "Zen 3 EPYC 7763"),
+        (0x00a1_0f11, CpuVendor::Amd, 0x11, false, "Zen 4 EPYC 9V74"),
+        (0x0008_06f8, CpuVendor::Other, 0x8f, false, "other vendor"),
+    ] {
+        assert_eq!(display_model(eax), model, "{host}");
+        assert_eq!(
+            seq_entries_as_words_on(vendor, display_family(eax), model),
+            words,
+            "{host}"
+        );
+    }
+}
+
 /// The CPUID read returns the registers in place: leaf 0 reports at least leaf
 /// 1, and its EBX, EDX, ECX spell a vendor string of twelve printable bytes,
 /// spaces included (Zhaoxin's is "  Shanghai  ").

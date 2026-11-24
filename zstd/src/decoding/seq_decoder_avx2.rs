@@ -468,6 +468,7 @@ macro_rules! execute_one_body {
 /// returns how many of them are still to run, decoded from the reader's
 /// position (the loop stopped near the start of the bit stream). Out of line,
 /// so the monolith around the Rust loop keeps its own register allocation.
+/// One monomorph per entry form (`WORDS`, see [`Loop`]), picked by the caller.
 ///
 /// # Safety
 /// The CPU has BMI2 and AVX2. The reader was refilled after its last read and
@@ -478,7 +479,7 @@ macro_rules! execute_one_body {
 #[target_feature(enable = "bmi2,avx2")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_short_arm_asm<B: BufferBackend>(
+unsafe fn run_short_arm_asm<B: BufferBackend, const WORDS: bool>(
     buffer: &mut DecodeBuffer<B>,
     cur: &mut OutCursor,
     br: &mut BitReaderReversed<'_, Avx2Kernel>,
@@ -503,7 +504,7 @@ unsafe fn run_short_arm_asm<B: BufferBackend>(
     // SAFETY: the caller's contract; the reader, states and history stay
     // with the loop until `finish` below.
     let mut asm_loop = unsafe {
-        Loop::new(
+        Loop::<WORDS>::new(
             br,
             ll_dec,
             ml_dec,
@@ -839,23 +840,37 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 // writable through `cap_w + 31` with its live bytes written,
                 // and the literals carry their 32 bytes of read slack (the
                 // assertion at the top of this function).
+                // The entry form is the decoder's kept answer for this CPU,
+                // taken once per block; each form is its own monomorph.
+                let words = buffer.seq_entries_as_words();
+                #[cfg(all(test, feature = "std"))]
+                let words = super::seq_loop_asm::tests::forced_words().unwrap_or(words);
+                macro_rules! run_form {
+                    ($words:literal) => {
+                        run_short_arm_asm::<B, $words>(
+                            buffer,
+                            &mut cur,
+                            &mut br,
+                            &mut ll_dec,
+                            &mut ml_dec,
+                            &mut of_dec,
+                            &mut shadow_hist,
+                            dict,
+                            dict_content,
+                            literals_buffer,
+                            literals_buffer_len,
+                            &mut lit_cur,
+                            &mut seq_sum,
+                            rust_steps,
+                        )
+                    };
+                }
                 let r = unsafe {
-                    run_short_arm_asm(
-                        buffer,
-                        &mut cur,
-                        &mut br,
-                        &mut ll_dec,
-                        &mut ml_dec,
-                        &mut of_dec,
-                        &mut shadow_hist,
-                        dict,
-                        dict_content,
-                        literals_buffer,
-                        literals_buffer_len,
-                        &mut lit_cur,
-                        &mut seq_sum,
-                        rust_steps,
-                    )
+                    if words {
+                        run_form!(true)
+                    } else {
+                        run_form!(false)
+                    }
                 };
                 match r {
                     Ok(left) => rust_steps = left,
