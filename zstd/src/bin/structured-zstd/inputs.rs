@@ -305,7 +305,10 @@ fn parse_filelist(file: impl std::io::Read, limit: u64, list: &Path) -> Result<V
         if line.last() == Some(&b'\n') {
             line.pop();
         }
-        if line.last() == Some(&b'\r') {
+        // CRLF ends a line on native Windows only; elsewhere a CR is a valid
+        // character of the name, which the reference command keeps from 1.6.0
+        // on (`tests/playTests.sh`).
+        if cfg!(windows) && line.last() == Some(&b'\r') {
             line.pop();
         }
         if line.is_empty() {
