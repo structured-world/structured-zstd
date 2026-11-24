@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/structured-world/structured-zstd/compare/v0.4.3...v0.4.4) - 2026-11-24
+
+### Performance
+
+- *(decoding)* z000033 decode ahead of libzstd on AMD and Intel ([#699](https://github.com/structured-world/structured-zstd/pull/699))
+- *(decoding)* i686 decode without libc copies, fast repcode across blocks ([#698](https://github.com/structured-world/structured-zstd/pull/698))
+- *(encoding)* fresh-context and dictionary frames at or above libzstd ([#695](https://github.com/structured-world/structured-zstd/pull/695))
+
 ## [0.4.3](https://github.com/structured-world/structured-zstd/compare/v0.4.2...v0.4.3) - 2026-11-21
 
 ### Performance
