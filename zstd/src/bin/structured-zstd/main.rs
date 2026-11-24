@@ -156,11 +156,11 @@ const ZSTD_SUFFIX: &str = ".zst";
 const DECOMPRESS_SUFFIXES: [(&str, &str); 3] = [("zst", ""), ("zstd", ""), ("tzst", "tar")];
 
 /// The reference command version whose command line this tool follows.
-const UPSTREAM_VERSION: &str = "1.5.7";
+const UPSTREAM_VERSION: &str = "1.6.0";
 
 /// [`UPSTREAM_VERSION`] as `ZSTD_VERSION_NUMBER` spells it
 /// (`major * 10000 + minor * 100 + release`), the version a trace line carries.
-const UPSTREAM_VERSION_NUMBER: u32 = 10507;
+const UPSTREAM_VERSION_NUMBER: u32 = 10600;
 
 /// How the reference command names stdout in a summary line.
 const STDOUT_MARK: &str = "/*stdout*\\";

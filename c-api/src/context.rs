@@ -375,9 +375,6 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
                 cctx.attached_dict.owned(),
                 compressor_dictionary,
                 stream_dictionary,
-                cctx.bufferless
-                    .as_ref()
-                    .and_then(crate::bufferless::BufferlessFrame::dictionary),
             ]
             .into_iter()
             .flatten(),

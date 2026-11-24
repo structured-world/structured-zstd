@@ -24,14 +24,18 @@ name = "structured_zstd"
 # `structured-zstd` library crate's own rlib of the same name.
 crate-type = ["cdylib", "staticlib"]
 
-# No `[features]` / `std` contract by design: this is a host-only cdylib/
-# staticlib whose `extern "C"` wrappers guard the boundary with
-# `std::panic::catch_unwind` (a Rust panic must not unwind into C), so the
-# crate cannot build without std. A default-on `std` feature would advertise a
-# `--no-default-features` build that fails to compile. This deliberately
-# deviates from the no-std-library feature convention (which targets crates that
-# must support a no_std build); a host-only binding has no such build. The
-# no_std + alloc surface lives in the `codec` crate below.
+# No `std` feature by design: this is a host-only cdylib/staticlib whose
+# `extern "C"` wrappers guard the boundary with `std::panic::catch_unwind` (a
+# Rust panic must not unwind into C), so the crate cannot build without std. A
+# default-on `std` feature would advertise a `--no-default-features` build that
+# fails to compile. This deliberately deviates from the no-std-library feature
+# convention (which targets crates that must support a no_std build); a
+# host-only binding has no such build. The no_std + alloc surface lives in the
+# `codec` crate below.
+[features]
+# Read v0.5-v0.7 frames, upstream's `ZSTD_LEGACY_SUPPORT=5`. Off by default, as
+# libzstd is built from 1.6.0 on.
+legacy = ["codec/legacy"]
 
 [dependencies]
 # The codec is imported under the alias `codec` rather than its own name: this

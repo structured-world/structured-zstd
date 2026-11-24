@@ -3107,13 +3107,15 @@ fn trace_records_every_frame() {
     let one_frame = fs::read(format!("{one}.zst")).unwrap();
     assert!(
         compressed[1].starts_with(&format!(
-            "zstd, 10507, compress, streaming, 19, 0, 0, 1600, {}, ",
+            "zstd, {UPSTREAM_VERSION_NUMBER}, compress, streaming, 19, 0, 0, 1600, {}, ",
             one_frame.len()
         )),
         "{}",
         compressed[1]
     );
-    assert!(compressed[2].starts_with("zstd, 10507, compress, streaming, 19, 0, 0, 14, "));
+    assert!(compressed[2].starts_with(&format!(
+        "zstd, {UPSTREAM_VERSION_NUMBER}, compress, streaming, 19, 0, 0, 14, "
+    )));
 
     // Two frames back to back decode to both inputs, and each is a line.
     let mut both = one_frame.clone();
@@ -3135,13 +3137,15 @@ fn trace_records_every_frame() {
     for pair in decoded.chunks(2) {
         assert!(
             pair[0].starts_with(&format!(
-                "zstd, 10507, decompress, streaming, 0, 0, 0, 1600, {}, ",
+                "zstd, {UPSTREAM_VERSION_NUMBER}, decompress, streaming, 0, 0, 0, 1600, {}, ",
                 one_frame.len()
             )),
             "{}",
             pair[0]
         );
-        assert!(pair[1].starts_with("zstd, 10507, decompress, streaming, 0, 0, 0, 14, "));
+        assert!(pair[1].starts_with(&format!(
+            "zstd, {UPSTREAM_VERSION_NUMBER}, decompress, streaming, 0, 0, 0, 14, "
+        )));
     }
 
     // A benchmark compresses and decompresses each level once per pass.
@@ -3152,9 +3156,10 @@ fn trace_records_every_frame() {
     let benched = &lines()[7..];
     assert!(!benched.is_empty());
     assert!(
-        benched
-            .iter()
-            .all(|line| line.starts_with("zstd, 10507, ") && line.contains(", single-pass, ")),
+        benched.iter().all(
+            |line| line.starts_with(&format!("zstd, {UPSTREAM_VERSION_NUMBER}, "))
+                && line.contains(", single-pass, ")
+        ),
         "{benched:#?}"
     );
     assert!(benched.iter().any(|line| line.contains(", compress, ")));
@@ -4439,7 +4444,6 @@ fn help_and_version_texts_are_plain_ascii_punctuation() {
     assert!(!usage.contains('\u{2014}'));
     assert!(usage.contains("Usage: zstd [OPTIONS...] [INPUT... | -] [-o OUTPUT]"));
     assert!(usage.contains("-H, --help"));
-    assert_eq!(UPSTREAM_VERSION, "1.5.7");
 }
 
 #[test]
@@ -8678,8 +8682,10 @@ fn benchmark_lines_follow_the_reference_layout() {
     // the tagged rows alone (`benchzstd.c:955`).
     let quiet = |args: &[&str]| bench_quiet_header(&parse(args).unwrap(), 7692);
     assert_eq!(
-        quiet(&["-b", "-q", "-B64K", "f"]).as_deref(),
-        Some("bench 1.5.7 : input 7692 bytes, 3 seconds, 64 KB blocks")
+        quiet(&["-b", "-q", "-B64K", "f"]),
+        Some(format!(
+            "bench {UPSTREAM_VERSION} : input 7692 bytes, 3 seconds, 64 KB blocks"
+        ))
     );
     assert_eq!(quiet(&["-b", "-q", "-p7", "f"]), None);
     assert!(quiet(&["-b", "-q", "-p0", "f"]).is_some());

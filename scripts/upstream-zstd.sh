@@ -2,9 +2,9 @@
 # Sourced by the conformance scripts: the pinned upstream zstd release and
 # a verified download helper.
 
-UPSTREAM_VERSION=1.5.7
-# The digest upstream publishes next to the tarball (`zstd-1.5.7.tar.gz.sha256`).
-UPSTREAM_TARBALL_SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+UPSTREAM_VERSION=1.6.0
+# The digest upstream publishes next to the tarball (`zstd-1.6.0.tar.gz.sha256`).
+UPSTREAM_TARBALL_SHA256=2ba599ae2a257976278e7e71e998433a387bfd18aa7b78678229fd5d84f5e9b8
 UPSTREAM_TARBALL_URL="https://github.com/facebook/zstd/releases/download/v${UPSTREAM_VERSION}/zstd-${UPSTREAM_VERSION}.tar.gz"
 
 sha256_of() {

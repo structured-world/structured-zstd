@@ -22,6 +22,8 @@ git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 # targets so they keep fuzzing the default build.
 [features]
 workspace = ["structured-zstd/caller-workspace"]
+# The v0.5-v0.7 decoders, off in the default build.
+legacy = ["structured-zstd/legacy"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -34,6 +36,7 @@ path = "fuzz_targets/decode.rs"
 [[bin]]
 name = "decode_legacy"
 path = "fuzz_targets/decode_legacy.rs"
+required-features = ["legacy"]
 
 [[bin]]
 name = "decode_direct"

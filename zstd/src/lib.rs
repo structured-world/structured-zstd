@@ -13,9 +13,9 @@
 //! * `decoding::workspace` (feature `caller-workspace`): streaming decoder
 //!   that runs entirely in caller-owned memory, never allocating, with
 //!   caller-set limits on window, output and work.
-//! * v0.5, v0.6 and v0.7 frames (feature `legacy`, on by default): the
-//!   formats every libzstd 1.5.7 build reads by default decode through the
-//!   same entry points, the frame queries and the streaming decoder
+//! * v0.5, v0.6 and v0.7 frames (feature `legacy`, off by default, as
+//!   libzstd builds it from 1.6.0 on): with it these formats decode through
+//!   the same entry points, the frame queries and the streaming decoder
 //!   included; `decoding::LegacyVersion` names them. Without the feature
 //!   they are refused as an unknown format.
 //!
