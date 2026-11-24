@@ -826,7 +826,8 @@ impl HuffmanTable {
             *off = acc;
             acc += count as usize;
         }
-        if cfg!(not(target_pointer_width = "64")) {
+        #[cfg(not(target_pointer_width = "64"))]
+        {
             // With a 32-bit word each lane register below is a register
             // pair and every step twice the work, so the cursors stay an
             // array: one store-to-load forward per symbol.
@@ -842,7 +843,9 @@ impl HuffmanTable {
             let g = usize::from(self.last_weight & 0xF);
             // SAFETY: as above.
             unsafe { *sorted.get_unchecked_mut(cursor[g]) = self.weights.len() as u8 };
-        } else {
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
             // The sixteen cursors live as byte lanes of two registers (weights
             // 0..8 in `lo`, 8..16 in `hi`), not in an array: a cursor array in
             // memory makes each placement load what an earlier one may just

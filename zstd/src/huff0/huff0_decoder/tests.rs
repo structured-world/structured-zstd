@@ -67,6 +67,53 @@ fn build_decoder_rejects_fse_streams_with_256_explicit_weights() {
     );
 }
 
+/// An FSE-described weight above the limit that lands in the four-at-a-time
+/// part of the weight decode is refused, and the first such weight is the one
+/// reported, as when every weight was checked as it landed.
+#[test]
+fn build_decoder_refuses_a_wide_fse_weight_in_the_bulk_decode() {
+    use crate::bit_io::BitWriter;
+    use crate::fse::fse_encoder::{FSEEncoder, build_table_from_symbol_counts};
+
+    // Long enough that the bulk loop runs (8 bytes of stream past the
+    // reader), with 13 then 14 early in it.
+    let mut weights: Vec<u8> = (0..120).map(|i| if i % 2 == 0 { 1 } else { 2 }).collect();
+    weights[5] = 13;
+    weights[9] = 14;
+
+    let mut encoded = Vec::new();
+    {
+        let mut writer = BitWriter::from(&mut encoded);
+        let mut counts = [0usize; 15];
+        for &w in &weights {
+            counts[w as usize] += 1;
+        }
+        let table = build_table_from_symbol_counts(&counts, 6, false);
+        let mut encoder = FSEEncoder::new(&table, &mut writer);
+        encoder.encode_interleaved(&weights);
+        writer.flush();
+    }
+    assert!(
+        (16..128).contains(&encoded.len()),
+        "fixture must reach the bulk decode and fit the FSE header byte, got {}",
+        encoded.len()
+    );
+
+    let mut description = Vec::with_capacity(encoded.len() + 1);
+    description.push(encoded.len() as u8);
+    description.extend_from_slice(&encoded);
+
+    let mut table = HuffmanTable::new();
+    let result = table.build_decoder(description.as_slice());
+    assert!(
+        matches!(
+            result,
+            Err(HuffmanTableError::WeightBiggerThanMaxNumBits { got: 13 })
+        ),
+        "the first weight past 12 must be refused, got {result:?}"
+    );
+}
+
 /// A direct-weights description (header `127 + n`, two 4-bit weights a byte).
 fn direct_weights(weights: &[u8]) -> Vec<u8> {
     let mut description = alloc::vec![127 + weights.len() as u8];

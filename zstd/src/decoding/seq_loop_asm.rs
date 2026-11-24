@@ -231,7 +231,9 @@ impl<const WORDS: bool> Loop<WORDS> {
     /// entries, and are left untouched until [`Loop::finish`]. `out` describes
     /// a linear output writable through `cap_w + 31`, and the window holds
     /// `dict_content` for a match whose literals end below `dict_end`.
-    /// `literals` is readable `lit_len + 32` bytes from its start.
+    /// `literals` is readable `lit_len + 32` bytes from its start. The loop
+    /// pays to enter ([`pays_to_enter`]), so the first pass decodes a
+    /// sequence before it can stop.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub(super) unsafe fn new(
@@ -247,6 +249,7 @@ impl<const WORDS: bool> Loop<WORDS> {
         left: usize,
     ) -> Self {
         debug_assert!(br.bits_consumed < 8);
+        debug_assert!(pays_to_enter(br, left));
         let source = br.source.as_ptr();
         let base = out.base as usize;
         Self {
@@ -573,16 +576,12 @@ impl<const WORDS: bool> Loop<WORDS> {
                 // slots, and reads no input below the floor's eight-byte
                 // window. Every field read is a plain integer.
                 unsafe { seq_pass_asm!(pointers, ll_e, ml_e, of_e) };
-                // The states advance together, so the pointers are all still
-                // at the slots (the pass left before its first advance) or all
-                // in the tables. Pointers at the slots are dropped: they would
-                // not follow a move of `self`, and the words they point at are
-                // the ones kept.
-                self.at = if ll_e == entries {
-                    [core::ptr::null(); 3]
-                } else {
-                    [ll_e, ml_e, of_e]
-                };
+                // The first pass decodes a sequence before it can stop (see
+                // [`Loop::new`]) and the states advance together, so all
+                // three pointers are in the tables now, none at the slots
+                // (which would not follow a move of `self`).
+                debug_assert_ne!(ll_e, entries);
+                self.at = [ll_e, ml_e, of_e];
             }
             true => {
                 let [mut ll_e, mut ml_e, mut of_e] = [self.ll_e, self.ml_e, self.of_e];
