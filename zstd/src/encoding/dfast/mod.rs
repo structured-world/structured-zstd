@@ -3943,6 +3943,13 @@ macro_rules! start_matching_dict_loop_body {
                     let packed_curr = (ip as u32) + packed_bias;
                     // SAFETY: the loop guard keeps `ip + 8 <= block_len`.
                     let v8 = unsafe { (block_ptr.add(ip) as *const u64).read_unaligned() };
+                    // The position a miss steps to, taken while the cursor is
+                    // still in a register: on a miss nothing else links one
+                    // position to the next, so this step is the loop's carried
+                    // chain, and computed after the probes it ran through a
+                    // spill of the cursor. The literal start moves only on a
+                    // commit, which leaves this loop.
+                    let next = ip + ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
                     let v4 = v8 as u32;
                     let hl_idx = dfast_slot(v8.wrapping_mul(PRIME), long_shift);
                     // The short key over the frame's `$mls` bytes (upstream
@@ -4099,7 +4106,7 @@ macro_rules! start_matching_dict_loop_body {
                                 .read_unaligned()
                         };
                         if dfast_branch!(10, cand4 != v4) {
-                            ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                            ip = next;
                             if dfast_branch!(24, ip > scan_limit) {
                                 break 'inner DfastInnerExit::Tail(ip);
                             }
@@ -4131,7 +4138,7 @@ macro_rules! start_matching_dict_loop_body {
                             }
                         }
                         if dfast_branch!(14, found == usize::MAX) {
-                            ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                            ip = next;
                             if dfast_branch!(24, ip > scan_limit) {
                                 break 'inner DfastInnerExit::Tail(ip);
                             }
@@ -4253,7 +4260,7 @@ macro_rules! start_matching_dict_loop_body {
                         break 'inner DfastInnerExit::Committed(chosen, 2, abs_ip);
                     }
                     // A below-floor short hit with no upgrade: keep scanning.
-                    ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                    ip = next;
                     if dfast_branch!(24, ip > scan_limit) {
                         break 'inner DfastInnerExit::Tail(ip);
                     }
