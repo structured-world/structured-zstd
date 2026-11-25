@@ -15,8 +15,8 @@ use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, code_for_descriptor_e
 use crate::ffi::{in_slice, out_slice};
 
 /// `ZSTD_VERSION_NUMBER` for the vendored upstream: MAJOR*10000 + MINOR*100 +
-/// RELEASE = 1*10000 + 5*100 + 7.
-const VERSION_NUMBER: c_uint = 10_507;
+/// RELEASE = 1*10000 + 6*100 + 0.
+const VERSION_NUMBER: c_uint = 10_600;
 
 /// `(0ULL - 1)` — frame content size could not be determined from the header.
 const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
@@ -42,7 +42,15 @@ pub extern "C" fn ZSTD_versionNumber() -> c_uint {
 /// `const char* ZSTD_versionString(void)`.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_versionString() -> *const c_char {
-    c"1.5.7".as_ptr()
+    c"1.6.0".as_ptr()
+}
+
+/// `int ZSTD_isDeterministicBuild(void)`: 0. The answer upstream gives as 1
+/// promises output identical to every other standard build of the same
+/// version, and this encoder's frames are its own, not libzstd's.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_isDeterministicBuild() -> c_int {
+    0
 }
 
 /// `int ZSTD_minCLevel(void)` — lowest (most negative) level accepted.

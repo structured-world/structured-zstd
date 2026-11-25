@@ -71,7 +71,7 @@ required-features = ["cli"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "ldm", "dict-builder", "lsm", "caller-workspace"]
+features = ["std", "hash", "ldm", "dict-builder", "lsm", "caller-workspace", "legacy"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -133,7 +133,6 @@ default = [
     # no dependency; a build that does not want it turns default features off,
     # as `no_std` builds already do.
     "dict-builder",
-    "legacy",
     "cli",
 ]
 # What the bundled command-line tool needs: the capabilities its parser
@@ -177,10 +176,10 @@ kernel-sve = ["kernel-neon"]
 # simd128 equivalent and stay scalar on wasm.
 kernel-simd128 = []
 dict-builder = ["std"]
-# Decode frames of the v0.5, v0.6 and v0.7 formats, the ones every libzstd
-# 1.5.7 build reads by default (upstream's legacy level 5). Without it such a
-# frame is refused as an unknown format, as a libzstd built at level 0
-# refuses it. Pure decoding code, no dependency.
+# Decode frames of the v0.5, v0.6 and v0.7 formats, as libzstd built with
+# `ZSTD_LEGACY_SUPPORT=5` does. Off by default, as upstream builds it from 1.6.0
+# on: without it such a frame is refused as an unknown format. Pure decoding
+# code, no dependency.
 legacy = []
 hash = ["dep:twox-hash"]
 # Long-distance matching in the encoder. Implies `hash`: the LDM match finder

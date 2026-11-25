@@ -6,7 +6,10 @@
 mod bufferless;
 mod cctx_params;
 mod experimental;
+#[cfg(feature = "legacy")]
 mod legacy;
+#[cfg(not(feature = "legacy"))]
+mod legacy_refused;
 mod provided;
 mod sequences;
 mod streams;
@@ -383,7 +386,13 @@ fn level_bounds_match_crate() {
     assert_eq!(ZSTD_minCLevel(), -131072);
     assert_eq!(ZSTD_maxCLevel(), 22);
     assert_eq!(ZSTD_defaultCLevel(), 3);
-    assert_eq!(ZSTD_versionNumber(), 10_507);
+    assert_eq!(ZSTD_versionNumber(), 10_600);
+    // SAFETY: the returned pointer is a static NUL-terminated string.
+    let version = unsafe { core::ffi::CStr::from_ptr(crate::simple::ZSTD_versionString()) };
+    assert_eq!(version.to_str().unwrap(), "1.6.0");
+    // Frames of this encoder are not libzstd 1.6.0's, so it does not claim to
+    // be a build whose output matches every other build of the version.
+    assert_eq!(crate::simple::ZSTD_isDeterministicBuild(), 0);
 }
 
 /// ABI layout lock for `ZSTD_FrameHeader`: it is passed by value across the C

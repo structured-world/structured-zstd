@@ -1,5 +1,6 @@
-//! v0.5-v0.7 frames through the C ABI, as libzstd 1.5.7 reads them by
-//! default: the frame queries, the one-shot decoders and the stream, on the
+//! v0.5-v0.7 frames through the C ABI built with `legacy`, as libzstd built
+//! with `ZSTD_LEGACY_SUPPORT=5` reads them: the frame queries, the one-shot
+//! decoders and the stream, on the
 //! frames the v0.5.1, v0.6.2 and v0.7.5 command lines wrote
 //! (`zstd/legacy_frames`).
 
