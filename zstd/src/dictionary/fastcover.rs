@@ -285,17 +285,10 @@ impl<'s> FastCoverContext<'s> {
             let mut active_begin = epoch_begin;
             let mut active_end = epoch_begin;
             let mut active_score = 0u64;
-            let mut ring_head = 0usize;
-            let mut ring_tail = 0usize;
+            let _ = (ring_ptr, ring_len);
             while active_end < epoch_end {
                 // SAFETY: `active_end < epoch_end <= nb_dmers`; see above.
-                // `ring_tail < ring_len`, the ring's length.
                 let idx = unsafe { hash_at::<H>(base.add(active_end), f) };
-                unsafe { *ring_ptr.add(ring_tail) = idx as u32 };
-                ring_tail += 1;
-                if ring_tail == ring_len {
-                    ring_tail = 0;
-                }
                 // SAFETY: `idx < 2^f`, both tables' length.
                 let count = unsafe { &mut *window_ptr.add(idx) };
                 if *count == zero {
@@ -304,13 +297,8 @@ impl<'s> FastCoverContext<'s> {
                 *count += one;
                 active_end += 1;
                 if active_end - active_begin == window_limit {
-                    // SAFETY: `ring_head < ring_len`; the index it holds was
-                    // hashed from a position, so it is below `2^f`.
-                    let del = unsafe { *ring_ptr.add(ring_head) } as usize;
-                    ring_head += 1;
-                    if ring_head == ring_len {
-                        ring_head = 0;
-                    }
+                    // SAFETY: `active_begin < active_end <= nb_dmers`.
+                    let del = unsafe { hash_at::<H>(base.add(active_begin), f) };
                     let count = unsafe { &mut *window_ptr.add(del) };
                     *count -= one;
                     if *count == zero {
@@ -327,11 +315,7 @@ impl<'s> FastCoverContext<'s> {
             // Reset the window counts for the next epoch.
             while active_begin < epoch_end {
                 // SAFETY: as for the leaving position above.
-                let del = unsafe { *ring_ptr.add(ring_head) } as usize;
-                ring_head += 1;
-                if ring_head == ring_len {
-                    ring_head = 0;
-                }
+                let del = unsafe { hash_at::<H>(base.add(active_begin), f) };
                 unsafe { *window_ptr.add(del) -= one };
                 active_begin += 1;
             }
