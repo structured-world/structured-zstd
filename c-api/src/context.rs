@@ -770,9 +770,10 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // whether a frame had read it (a v0.5-v0.7 frame holds no handle until
     // it ends).
     let decoder = &mut dctx.decoder;
-    let attached = dctx.attached_ddict.handles();
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        decoder.decode_all_with_dict_handles(src, dst, attached)
+    let attached = &dctx.attached_ddict;
+    let outcome = catch_unwind(AssertUnwindSafe(|| match attached.single() {
+        Some(dict) => decoder.decode_all_with_dict_handle(src, dst, dict),
+        None => decoder.decode_all_with_dict_handles(src, dst, attached.handles()),
     }));
     dctx.consume_prefix();
     match outcome {
