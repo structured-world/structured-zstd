@@ -63,7 +63,10 @@ rm -f "$CLI_TESTS/compression/adapt.sh"* "$CLI_TESTS/compression/multi-threaded.
 # `set -e`. Stops if the step is no longer spelled this way.
 ZSTDLESS_TEST="$CLI_TESTS/cltools/zstdless.sh"
 ZSTDLESS_BODY="$(<"$ZSTDLESS_TEST")"
-ZSTDLESS_FIXED="${ZSTDLESS_BODY/zstdless bad.zst >&2/zstdless bad.zst >&2 || true}"
+# Both sides quoted: bash 5.2 expands an unquoted `&` in the replacement to the
+# matched text.
+ZSTDLESS_STEP='zstdless bad.zst >&2'
+ZSTDLESS_FIXED="${ZSTDLESS_BODY/"$ZSTDLESS_STEP"/"$ZSTDLESS_STEP || true"}"
 if [[ "$ZSTDLESS_FIXED" == "$ZSTDLESS_BODY" ]]; then
   echo "cltools/zstdless.sh no longer has the bad-path step this script adjusts" >&2
   exit 1
