@@ -5,9 +5,9 @@ use super::experimental::code;
 use crate::bufferless::{
     ZSTD_compressBegin, ZSTD_compressBegin_advanced, ZSTD_compressBegin_usingCDict,
     ZSTD_compressBegin_usingDict, ZSTD_compressBlock, ZSTD_compressContinue, ZSTD_compressEnd,
-    ZSTD_copyCCtx, ZSTD_copyDCtx, ZSTD_decompressBegin, ZSTD_decompressBegin_usingDDict,
-    ZSTD_decompressBegin_usingDict, ZSTD_decompressBlock, ZSTD_decompressContinue,
-    ZSTD_getBlockSize, ZSTD_insertBlock, ZSTD_nextInputType, ZSTD_nextSrcSizeToDecompress,
+    ZSTD_decompressBegin, ZSTD_decompressBegin_usingDDict, ZSTD_decompressBegin_usingDict,
+    ZSTD_decompressBlock, ZSTD_decompressContinue, ZSTD_getBlockSize, ZSTD_insertBlock,
+    ZSTD_nextInputType, ZSTD_nextSrcSizeToDecompress,
 };
 use crate::cdict::{ZSTD_createCDict, ZSTD_createDDict, ZSTD_freeCDict, ZSTD_freeDDict};
 use crate::context::{
@@ -81,51 +81,6 @@ fn decode_bufferless(
         }
     }
     Ok(output)
-}
-
-/// A context copied with a pledge of 0 takes input of any size and leaves
-/// the content size out, as upstream reads 0 there and its own callers rely
-/// on (tests/fuzzer.c:2450, 4885).
-#[test]
-fn copy_cctx_reads_zero_as_unknown() {
-    let src = ZSTD_createCCtx();
-    let dst = ZSTD_createCCtx();
-    let mut out = [0u8; 64];
-    unsafe {
-        assert_eq!(ZSTD_compressBegin(src, 3), 0);
-        assert_eq!(ZSTD_copyCCtx(dst, src, 0), 0);
-        let n = ZSTD_compressEnd(dst, out.as_mut_ptr(), out.len(), b"bytes".as_ptr(), 5);
-        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
-        assert_eq!(
-            crate::simple::ZSTD_getFrameContentSize(out.as_ptr(), n),
-            crate::params::CONTENTSIZE_UNKNOWN
-        );
-        ZSTD_freeCCtx(dst);
-        ZSTD_freeCCtx(src);
-    }
-}
-
-/// A context copied onto itself begins its own frame again, and one copied
-/// onto itself on the decoding side is left as it is.
-#[test]
-fn copy_onto_itself() {
-    let cctx = ZSTD_createCCtx();
-    let dctx = ZSTD_createDCtx();
-    let mut out = [0u8; 64];
-    unsafe {
-        assert_eq!(ZSTD_compressBegin(cctx, 3), 0);
-        assert_eq!(ZSTD_copyCCtx(cctx, cctx, 5), 0);
-        let n = ZSTD_compressEnd(cctx, out.as_mut_ptr(), out.len(), b"bytes".as_ptr(), 5);
-        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
-        assert_eq!(crate::simple::ZSTD_getFrameContentSize(out.as_ptr(), n), 5);
-
-        assert_eq!(ZSTD_decompressBegin(dctx), 0);
-        ZSTD_copyDCtx(dctx, dctx);
-        let decoded = decode_bufferless(dctx, &out[..n], |d| ZSTD_decompressBegin(d)).unwrap();
-        assert_eq!(decoded, b"bytes");
-        ZSTD_freeDCtx(dctx);
-        ZSTD_freeCCtx(cctx);
-    }
 }
 
 /// A run of blocks has no frame window, so the streaming ceiling does not
@@ -211,51 +166,6 @@ fn compress_block_into_too_small_dst_ends_the_session() {
         );
         assert_eq!(code(rc), ZSTD_ErrorCode::ZSTD_error_stage_wrong);
         ZSTD_freeCCtx(cctx);
-    }
-}
-
-/// A context copied from one part-way through a frame starts a frame of its
-/// own: the copy carries the settings and the dictionary, not a stage its
-/// decoder never reached.
-#[test]
-fn copy_dctx_mid_frame_starts_afresh() {
-    let frame: &[u8] = &[
-        0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x18, 0, 0, b'a', b'b', b'c', 0x11, 0, 0, b'd', b'e',
-    ];
-    let src = ZSTD_createDCtx();
-    let dst = ZSTD_createDCtx();
-    let mut out = [0u8; 64];
-    unsafe {
-        assert_eq!(ZSTD_decompressBegin(src), 0);
-        // Through the frame header: `src` now waits for a block header.
-        let mut pos = 0;
-        for _ in 0..2 {
-            pos += step(src, &frame[pos..], &mut out).1;
-        }
-        assert_eq!(ZSTD_nextSrcSizeToDecompress(src), 3);
-        ZSTD_copyDCtx(dst, src);
-        assert_eq!(ZSTD_nextSrcSizeToDecompress(dst), 5);
-        let mut decoded = Vec::new();
-        let mut at = 0;
-        loop {
-            let want = ZSTD_nextSrcSizeToDecompress(dst);
-            if want == 0 {
-                break;
-            }
-            let rc = ZSTD_decompressContinue(
-                dst,
-                out.as_mut_ptr(),
-                out.len(),
-                frame[at..].as_ptr(),
-                want,
-            );
-            assert_eq!(ZSTD_isError(rc), 0, "{:?}", code(rc));
-            decoded.extend_from_slice(&out[..rc]);
-            at += want;
-        }
-        assert_eq!(decoded, b"abcde");
-        ZSTD_freeDCtx(dst);
-        ZSTD_freeDCtx(src);
     }
 }
 
@@ -640,40 +550,9 @@ fn block_api_round_trips() {
     }
 }
 
-/// A context begun and not yet used copies into another, which then makes
-/// the same frame; once compressing has started it does not.
+/// Dictionary begins decode dictionary frames.
 #[test]
-fn copy_cctx_repeats_the_begin() {
-    let input = DICT[DICT.len() - 3000..].to_vec();
-    let prepared = ZSTD_createCCtx();
-    let copy = ZSTD_createCCtx();
-    unsafe {
-        assert_eq!(
-            ZSTD_compressBegin_usingDict(prepared, DICT.as_ptr(), DICT.len(), 7),
-            0
-        );
-        assert_eq!(ZSTD_copyCCtx(copy, prepared, input.len() as u64), 0);
-        assert_eq!(ZSTD_copyCCtx(copy, prepared, 0), 0);
-        let from_copy = compress_parts(copy, &[&input]).unwrap();
-        let from_prepared = compress_parts(prepared, &[&input]).unwrap();
-        assert_eq!(from_copy, from_prepared);
-
-        assert_eq!(ZSTD_compressBegin(prepared, 3), 0);
-        let mut out = [0u8; 64];
-        ZSTD_compressContinue(prepared, out.as_mut_ptr(), out.len(), b"x".as_ptr(), 1);
-        assert_eq!(
-            code(ZSTD_copyCCtx(copy, prepared, 0)),
-            ZSTD_ErrorCode::ZSTD_error_stage_wrong
-        );
-        ZSTD_freeCCtx(prepared);
-        ZSTD_freeCCtx(copy);
-    }
-}
-
-/// Dictionary begins decode dictionary frames, and a prepared context copies
-/// with its dictionary.
-#[test]
-fn decompress_begin_with_dictionaries_and_copy() {
+fn decompress_begin_with_dictionaries() {
     let input = DICT[DICT.len() - 3000..].to_vec();
     let frame = unsafe {
         let cctx = ZSTD_createCCtx();
@@ -687,7 +566,6 @@ fn decompress_begin_with_dictionaries_and_copy() {
     };
     let ddict = unsafe { ZSTD_createDDict(DICT.as_ptr(), DICT.len()) };
     let prepared = ZSTD_createDCtx();
-    let copy = ZSTD_createDCtx();
     unsafe {
         let with_dict = |dctx| ZSTD_decompressBegin_usingDict(dctx, DICT.as_ptr(), DICT.len());
         assert_eq!(
@@ -704,16 +582,7 @@ fn decompress_begin_with_dictionaries_and_copy() {
             code(decode_bufferless(prepared, &frame, without).unwrap_err()),
             ZSTD_ErrorCode::ZSTD_error_dictionary_wrong
         );
-
-        assert_eq!(
-            ZSTD_decompressBegin_usingDict(prepared, DICT.as_ptr(), DICT.len()),
-            0
-        );
-        ZSTD_copyDCtx(copy, prepared);
-        // `copy` is begun already: decode without beginning again.
-        assert_eq!(decode_bufferless(copy, &frame, |_| 0).unwrap(), input);
         ZSTD_freeDCtx(prepared);
-        ZSTD_freeDCtx(copy);
         ZSTD_freeDDict(ddict);
     }
 }

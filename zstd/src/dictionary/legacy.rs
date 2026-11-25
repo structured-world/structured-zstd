@@ -687,14 +687,16 @@ fn try_merge<K: EncodeTier>(
                 item.length as usize,
             )
         {
-            // The reference takes this product at pointer width, where it does
-            // not wrap, unlike the two above.
-            let added = (i64::from(elt.length) - i64::from(item.length)).max(1) as u64;
+            // The reference takes the length difference in unsigned 32-bit
+            // arithmetic (`MAX(elt.length - table[u].length, 1)`, zstd 1.6.0
+            // zdict.c `ZDICT_tryMerge`), so an entry longer than `elt` adds a
+            // wrapped length; the product is `size_t`, so it wraps at pointer
+            // width.
+            let added = elt.length.wrapping_sub(item.length).max(1) as usize;
+            let gain = (elt.savings as usize).wrapping_mul(added) / elt.length as usize;
             let item = &mut list[u];
             item.pos = elt.pos;
-            item.savings = item
-                .savings
-                .wrapping_add((u64::from(elt.savings) * added / u64::from(elt.length)) as u32);
+            item.savings = item.savings.wrapping_add(gain as u32);
             item.length = elt.length.min(item.length + 1);
             return u;
         }

@@ -149,7 +149,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm,caller-workspace
+          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm,caller-workspace,legacy
           cargo doc -p structured-zstd --no-deps --document-private-items --features std,hash,ldm,dict-builder,lsm,caller-workspace
           cargo doc -p structured-zstd-c -p structured-zstd-wasm --no-deps --document-private-items
       - name: Gate — compare_ffi/memory must not pull bench-internals
@@ -245,7 +245,7 @@ jobs:
     timeout-minutes: 12
     runs-on: ubuntu-latest
     env:
-      UPSTREAM_TAG: v1.5.7
+      UPSTREAM_TAG: v1.6.0
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -264,6 +264,10 @@ jobs:
         run: cargo clippy -p structured-zstd-c --all-targets -- -D warnings
       - name: Unit + ABI tests
         run: cargo nextest run --profile ci -p structured-zstd-c
+      - name: Unit + ABI tests (legacy)
+        # Upstream's `ZSTD_LEGACY_SUPPORT=5` build: v0.5-v0.7 frames read
+        # through every entry point.
+        run: cargo nextest run --profile ci -p structured-zstd-c --features legacy
       - name: 32-bit toolchain (i686)
         # Upstream libzstd ships on 32-bit platforms; the drop-in C ABI must
         # keep building and passing there too (size_t error encoding, struct
@@ -331,7 +335,7 @@ jobs:
           test "${#pcs[@]}" -gt 0
           for pc in "${pcs[@]}"; do
             echo "checking $pc"; cat "$pc"
-            grep -qx "Version: 1.5.7" "$pc"
+            grep -qx "Version: ${UPSTREAM_TAG#v}" "$pc"
           done
       - name: Real C consumer links + round-trips
         run: |
@@ -418,13 +422,14 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         working-directory: zstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder,caller-workspace
-      - name: Test (without legacy)
-        # The default build decodes v0.5-v0.7 frames; without the feature the
-        # decoders and the command line refuse them as an unknown format. The
-        # feature changes only those two, so their tests run again here.
+      - name: Test (legacy)
+        # The default build refuses v0.5-v0.7 frames as an unknown format, as
+        # libzstd does from 1.6.0 on; with the feature the decoders and the
+        # command line read them. The feature changes only those two, so their
+        # tests run again here.
         if: needs.changes.outputs.code == 'true'
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --no-default-features --features hash,std,dict-builder -E 'test(/^decoding::/) | binary_id(structured-zstd::bin/structured-zstd)'
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder,legacy -E 'test(/^decoding::/) | binary_id(structured-zstd::bin/structured-zstd)'
       - name: Doc tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test --doc -p structured-zstd --features hash,std,dict-builder,caller-workspace
@@ -1126,9 +1131,9 @@ jobs:
           # other targets' do.
           shopt -s dotglob
           if [ -d artifacts/decode_legacy ] && [ -n "$(find artifacts/decode_legacy -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-            cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" decode_legacy artifacts/decode_legacy/*
+            cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" --features legacy decode_legacy artifacts/decode_legacy/*
           fi
-          cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" decode_legacy corpus/decode_legacy ../legacy_frames -- -max_total_time=90 -timeout=30
+          cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" --features legacy decode_legacy corpus/decode_legacy ../legacy_frames -- -max_total_time=90 -timeout=30
       - name: Upload new crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v7

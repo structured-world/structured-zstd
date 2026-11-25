@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 /// Upstream zstd release the vendored headers + reported pkg-config version
 /// track. Keep in sync with the tracking comment at the top of each header.
-const UPSTREAM_VERSION: &str = "1.5.7";
+const UPSTREAM_VERSION: &str = "1.6.0";
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

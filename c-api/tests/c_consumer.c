@@ -52,8 +52,8 @@ int main(void) {
         return 7;
     }
 
-    if (ZSTD_versionNumber() != 10507) return 8;
-    if (strcmp(ZSTD_versionString(), "1.5.7") != 0) return 9;
+    if (ZSTD_versionNumber() != ZSTD_VERSION_NUMBER) return 8;
+    if (strcmp(ZSTD_versionString(), ZSTD_VERSION_STRING) != 0) return 9;
 
     /* Context API round trip. */
     ZSTD_CCtx *cctx = ZSTD_createCCtx();

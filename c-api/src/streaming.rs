@@ -1087,6 +1087,7 @@ fn enter_stream_frame(
         // A v0.5-v0.7 header is measured by its own size fields; once whole,
         // the decoder starts it from the same reader (upstream's
         // `ZSTD_decompressStream` hands such a frame to its legacy streams).
+        #[cfg(feature = "legacy")]
         if !dctx.magicless
             && let Some(version) = codec::decoding::LegacyVersion::of(view)
         {
