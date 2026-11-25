@@ -383,6 +383,21 @@ benefits.
 - A dedicated section tracks the WebAssembly build (`simd128` + scalar) against the most popular npm wasm zstd, [`@bokuweb/zstd-wasm`](https://www.npmjs.com/package/@bokuweb/zstd-wasm).
 - Methodology in [BENCHMARKS.md](https://github.com/structured-world/structured-zstd/blob/main/BENCHMARKS.md): small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, optional local Silesia corpora.
 
+### Wanted: an AMD Zen 5 benchmark host
+
+The project is looking for an AMD Zen 5 machine (Ryzen 9000 or EPYC 9005) for
+performance measurements: some speed gaps against C zstd show up only on AMD
+cores, and they cannot be profiled on the hosted runners. What it needs:
+
+- Linux on bare metal, or a VM that passes the PMU through;
+- CPU performance counters readable by `perf` in user space (`cycles`,
+  `instructions`, `branches`, `branch-misses`, cache and TLB events), and
+  branch-stack sampling (`perf record -b`, AMD LbrExtV2);
+- exclusive use while a measurement runs, and remote access for an automated
+  runner.
+
+If you can offer one, please [open an issue](https://github.com/structured-world/structured-zstd/issues/new).
+
 <details>
 <summary>Internal: compression strategy backends</summary>
 
