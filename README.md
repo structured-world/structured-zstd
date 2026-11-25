@@ -334,7 +334,7 @@ in pure Rust:
 | `kernel-vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
 | `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
 | `dict-builder` | ✅ | Pure-Rust COVER / FastCOVER / legacy dictionary training |
-| `legacy` | ✅ | Decoding of the v0.5, v0.6 and v0.7 frame formats; without it they are refused as an unknown format |
+| `legacy` | ❌ | Decoding of the v0.5, v0.6 and v0.7 frame formats; without it they are refused as an unknown format |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 | `caller-workspace` | ❌ | [Decoding in caller-owned memory](#decoding-in-caller-owned-memory) |
 

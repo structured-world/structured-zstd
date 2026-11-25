@@ -2206,12 +2206,13 @@ fn write_version(out: &mut impl Write, verbosity: i32) -> io::Result<()> {
         env!("CARGO_PKG_VERSION")
     )?;
     if verbosity >= 3 {
-        let legacy = if cfg!(feature = "legacy") {
-            ", zstd legacy v0.5+"
+        /// The formats this build reads, as the reference lists them.
+        const SUPPORTS: &str = if cfg!(feature = "legacy") {
+            "*** supports: zstd, zstd legacy v0.5+"
         } else {
-            ""
+            "*** supports: zstd"
         };
-        writeln!(out, "*** supports: zstd{legacy}")?;
+        writeln!(out, "{SUPPORTS}")?;
     }
     if verbosity >= 4 {
         writeln!(out, "non-deterministic build")?;
@@ -5644,8 +5645,9 @@ fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
             // index is one), so the walk steps over them: 4-byte magic +
             // 4-byte length + the payload.
             Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
-                // `offset` and `length` are both below 2^64 / 2, so the sum
-                // cannot wrap.
+                // `offset` is below the file length, which the OS keeps under
+                // 2^63, and `length` below 2^32, so the sum cannot wrap.
+                debug_assert!(offset < compressed && compressed <= i64::MAX as u64);
                 let end = offset + 8 + u64::from(length);
                 if end > compressed {
                     bail!(

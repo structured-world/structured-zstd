@@ -889,15 +889,57 @@ impl DecoderScratchKind {
     }
 }
 
-/// The dictionary of `dicts` a frame naming `dict_id` decodes with: the one
-/// carrying that ID, else the last, as upstream keeps the most recently
-/// referenced DDict when its set holds none for the frame
-/// (`ZSTD_DCtx_selectFrameDDict`). `dicts` is not empty.
-fn dictionary_for_frame(dicts: &[DictionaryHandle], dict_id: Option<u32>) -> &DictionaryHandle {
-    dict_id
-        .and_then(|id| dicts.iter().rev().find(|dict| dict.id() == id))
-        .or_else(|| dicts.last())
-        .expect("callers pass at least one dictionary")
+/// The dictionaries a frame is handed to choose from.
+#[derive(Clone, Copy)]
+enum FrameDicts<'d> {
+    /// None: an RFC 8878 frame decodes without one, a v0.5-v0.7 frame with
+    /// the one registered under its ID.
+    None,
+    /// One dictionary, applied to a frame naming none or its ID.
+    One(&'d DictionaryHandle),
+    /// A set, one entry per ID: upstream's `ZSTD_d_refMultipleDDicts`.
+    Set(&'d [DictionaryHandle]),
+}
+
+impl<'d> FrameDicts<'d> {
+    /// Every dictionary handed in.
+    fn all(self) -> &'d [DictionaryHandle] {
+        match self {
+            Self::None => &[],
+            Self::One(dict) => core::slice::from_ref(dict),
+            Self::Set(dicts) => dicts,
+        }
+    }
+
+    /// The dictionary a frame naming `dict_id` decodes with, `None` for none.
+    ///
+    /// One dictionary applies unless the frame names another ID. A set gives a
+    /// frame naming a nonzero ID that entry, and fails without one; a frame
+    /// naming none or 0 takes the set's ID-0 entry, or no dictionary (upstream
+    /// 1.6.0 `ZSTD_DCtx_getFrameDDict`).
+    fn for_frame(
+        self,
+        dict_id: Option<u32>,
+    ) -> Result<Option<&'d DictionaryHandle>, FrameDecoderError> {
+        match self {
+            Self::None => Ok(None),
+            Self::One(dict) => match dict_id {
+                Some(expected) if expected != dict.id() => Err(FrameDecoderError::DictIdMismatch {
+                    expected,
+                    provided: dict.id(),
+                }),
+                _ => Ok(Some(dict)),
+            },
+            Self::Set(dicts) => {
+                let id = dict_id.unwrap_or(0);
+                let entry = dicts.iter().find(|dict| dict.id() == id);
+                if entry.is_none() && id != 0 {
+                    return Err(FrameDecoderError::DictNotProvided { dict_id: id });
+                }
+                Ok(entry)
+            }
+        }
+    }
 }
 
 struct FrameDecoderState {
@@ -1300,11 +1342,11 @@ impl FrameDecoder {
     /// Read the frame header from `source` into the frame state, creating it
     /// on first use. A v0.5-v0.7 frame is started instead when its magic
     /// number is what the header begins with, its dictionary chosen from
-    /// `dicts` (the registry's when empty); `Ok(false)` reports that.
+    /// `dicts`; `Ok(false)` reports that.
     fn read_frame_header_into_state<R: Read>(
         &mut self,
         source: &mut R,
-        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
+        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: FrameDicts<'_>,
     ) -> Result<bool, FrameDecoderError> {
         // A new header ends any v0.5-v0.7 frame, whether or not it reads.
         self.end_legacy_frame();
@@ -1343,7 +1385,7 @@ impl FrameDecoder {
         &mut self,
         magic: u32,
         source: &mut R,
-        dicts: &[DictionaryHandle],
+        dicts: FrameDicts<'_>,
     ) -> Result<(), FrameDecoderError> {
         use crate::decoding::errors::ReadFrameHeaderError as ReadError;
         use crate::decoding::legacy::{self, HeaderFields};
@@ -2300,7 +2342,7 @@ impl FrameDecoder {
         // previous one.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        if !self.read_frame_header_into_state(&mut source, &[])? {
+        if !self.read_frame_header_into_state(&mut source, FrameDicts::None)? {
             return Ok(());
         }
         let dict_id = self
@@ -2432,14 +2474,15 @@ impl FrameDecoder {
         source: impl Read,
         dict: &DictionaryHandle,
     ) -> Result<(), FrameDecoderError> {
-        self.reset_with_dict_handles(source, core::slice::from_ref(dict))
+        self.reset_with_frame_dicts(source, FrameDicts::One(dict))
     }
 
-    /// [`reset_with_dict_handle`](Self::reset_with_dict_handle) with a choice
-    /// of dictionaries: the frame decodes with the one its header names, and
-    /// a frame that names none takes the last of `dicts`. A frame naming a
-    /// dictionary missing from `dicts` fails with
-    /// [`FrameDecoderError::DictIdMismatch`]. An empty `dicts` decodes
+    /// [`reset_with_dict_handle`](Self::reset_with_dict_handle) with a set of
+    /// dictionaries, one per ID (upstream's `ZSTD_d_refMultipleDDicts`): a
+    /// frame naming a nonzero ID decodes with the entry of that ID, and fails
+    /// with [`FrameDecoderError::DictNotProvided`] when `dicts` has none; a
+    /// frame naming no dictionary, or ID 0, decodes with the entry of ID 0, or
+    /// without a dictionary when there is none. An empty `dicts` decodes
     /// without a dictionary, as [`Self::reset`] does.
     ///
     /// ```
@@ -2451,7 +2494,7 @@ impl FrameDecoder {
     /// let second = DictionaryHandle::from_dictionary(
     ///     Dictionary::from_raw_content(2, b"second dictionary content".to_vec()).unwrap(),
     /// );
-    /// // A frame without a dictionary ID: the last dictionary applies.
+    /// // A frame without a dictionary ID, and no entry of ID 0: no dictionary.
     /// let frame = structured_zstd::encoding::compress_to_vec(
     ///     &b"payload"[..],
     ///     structured_zstd::encoding::CompressionLevel::Fastest,
@@ -2460,6 +2503,7 @@ impl FrameDecoder {
     /// decoder
     ///     .reset_with_dict_handles(&frame[..], &[first, second])
     ///     .unwrap();
+    /// assert!(decoder.dictionary().is_none());
     /// ```
     pub fn reset_with_dict_handles(
         &mut self,
@@ -2469,6 +2513,16 @@ impl FrameDecoder {
         if dicts.is_empty() {
             return self.reset(source);
         }
+        self.reset_with_frame_dicts(source, FrameDicts::Set(dicts))
+    }
+
+    /// The reset of [`Self::reset_with_dict_handle`] and
+    /// [`Self::reset_with_dict_handles`], which keeps the frame's handle.
+    fn reset_with_frame_dicts(
+        &mut self,
+        source: impl Read,
+        dicts: FrameDicts<'_>,
+    ) -> Result<(), FrameDecoderError> {
         if let Some(dict) = self.reset_frame_for_dicts(source, dicts)? {
             self.state
                 .as_mut()
@@ -2513,7 +2567,7 @@ impl FrameDecoder {
                 .expect("a forced-dictionary stream's decoder holds its dictionary"),
         };
         let reset = self
-            .reset_frame_for_dicts(source, core::slice::from_ref(&dict))
+            .reset_frame_for_dicts(source, FrameDicts::One(&dict))
             .map(|_| ());
         // Back in place whatever the outcome, so a failed header leaves the
         // decoder holding its dictionary as before: in the state when there is
@@ -2527,22 +2581,21 @@ impl FrameDecoder {
 
     /// Everything [`reset_with_dict_handle`](Self::reset_with_dict_handle)
     /// does except storing the handle: parse the header, pick the dictionary
-    /// of `dicts` the frame decodes with ([`dictionary_for_frame`]), check the
-    /// ID, and point the entropy tables at it. `dicts` is not empty. `None`
-    /// when the frame is a v0.5-v0.7 one, which took its dictionary itself.
+    /// of `dicts` the frame decodes with ([`FrameDicts::for_frame`]), and
+    /// point the entropy tables at it. `None` when the frame decodes without
+    /// one, or is a v0.5-v0.7 one, which took its dictionary itself.
     fn reset_frame_for_dicts<'d>(
         &mut self,
         mut source: impl Read,
-        dicts: &'d [DictionaryHandle],
+        dicts: FrameDicts<'d>,
     ) -> Result<Option<&'d DictionaryHandle>, FrameDecoderError> {
-        use FrameDecoderError as err;
         // Fresh frame → drop the previous frame's per-block checksum
         // digests so the next decode starts with an empty vec.
         // Mirrors the same clear in `reset()`; reset_with_dict_handle
         // is a parallel entry point so it needs its own call.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        for dict in dicts {
+        for dict in dicts.all() {
             Self::validate_dictionary_content(dict.as_dict())?;
         }
         if !self.read_frame_header_into_state(&mut source, dicts)? {
@@ -2565,16 +2618,9 @@ impl FrameDecoder {
             .state
             .as_mut()
             .expect("state populated by reset_with_format/new_with_format");
-        let frame_dict_id = state.frame_header.dictionary_id();
-        let dict = dictionary_for_frame(dicts, frame_dict_id);
-        if let Some(dict_id) = frame_dict_id
-            && dict_id != dict.id()
-        {
-            return Err(err::DictIdMismatch {
-                expected: dict_id,
-                provided: dict.id(),
-            });
-        }
+        let Some(dict) = dicts.for_frame(state.frame_header.dictionary_id())? else {
+            return Ok(None);
+        };
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict.id());
         Ok(Some(dict))
@@ -2592,20 +2638,19 @@ impl FrameDecoder {
         input: &mut &[u8],
         dict: &DictionaryHandle,
     ) -> Result<(), FrameDecoderError> {
-        self.reset_from_slice_with_dict_handles(input, core::slice::from_ref(dict))
+        self.reset_from_slice_with_frame_dicts(input, FrameDicts::One(dict))
     }
 
     /// [`Self::reset_from_slice_with_dict_handle`] with the choice of
-    /// [`Self::reset_with_dict_handles`]. `dicts` is not empty.
-    fn reset_from_slice_with_dict_handles(
+    /// [`Self::reset_frame_for_dicts`].
+    fn reset_from_slice_with_frame_dicts(
         &mut self,
         input: &mut &[u8],
-        dicts: &[DictionaryHandle],
+        dicts: FrameDicts<'_>,
     ) -> Result<(), FrameDecoderError> {
-        use FrameDecoderError as err;
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        for dict in dicts {
+        for dict in dicts.all() {
             Self::validate_dictionary_content(dict.as_dict())?;
         }
         let magicless = self.magicless;
@@ -2641,16 +2686,9 @@ impl FrameDecoder {
             .state
             .as_mut()
             .expect("state populated by reset_with_parsed_header/new_with_parsed_header");
-        let frame_dict_id = state.frame_header.dictionary_id();
-        let dict = dictionary_for_frame(dicts, frame_dict_id);
-        if let Some(dict_id) = frame_dict_id
-            && dict_id != dict.id()
-        {
-            return Err(err::DictIdMismatch {
-                expected: dict_id,
-                provided: dict.id(),
-            });
-        }
+        let Some(dict) = dicts.for_frame(state.frame_header.dictionary_id())? else {
+            return Ok(());
+        };
         state.decoder_scratch.init_from_dict(dict);
         state.set_active_dict(dict);
         state.using_dict = Some(dict.id());
@@ -3952,7 +3990,12 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src), &[])
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.reset_from_slice(src),
+                FrameDicts::None,
+            )
         }
         #[cfg(feature = "lsm")]
         {
@@ -3961,7 +4004,7 @@ impl FrameDecoder {
                 output,
                 |this, src| this.reset_from_slice(src),
                 None,
-                &[],
+                FrameDicts::None,
             )
         }
     }
@@ -4015,7 +4058,7 @@ impl FrameDecoder {
             output,
             |this, src| this.reset_from_slice(src),
             Some(&mut visitor),
-            &[],
+            FrameDicts::None,
         )
     }
 
@@ -4048,7 +4091,7 @@ impl FrameDecoder {
                 input,
                 output,
                 |this, src| this.reset_from_slice_with_dict_handle(src, dict),
-                core::slice::from_ref(dict),
+                FrameDicts::One(dict),
             )
         }
         #[cfg(feature = "lsm")]
@@ -4058,17 +4101,16 @@ impl FrameDecoder {
                 output,
                 |this, src| this.reset_from_slice_with_dict_handle(src, dict),
                 None,
-                core::slice::from_ref(dict),
+                FrameDicts::One(dict),
             )
         }
     }
 
     /// [`decode_all_with_dict_handle`](Self::decode_all_with_dict_handle)
-    /// with a choice of dictionaries per frame, as
-    /// [`reset_with_dict_handles`](Self::reset_with_dict_handles) makes it:
-    /// each frame decodes with the dictionary its header names, or with the
-    /// last of `dicts` when it names none. An empty `dicts` is
-    /// [`decode_all`](Self::decode_all).
+    /// with a set of dictionaries, each frame choosing from it as
+    /// [`reset_with_dict_handles`](Self::reset_with_dict_handles) does: the
+    /// entry of the ID its header names, or the entry of ID 0 (or none) when
+    /// it names none. An empty `dicts` is [`decode_all`](Self::decode_all).
     ///
     /// ```
     /// use structured_zstd::decoding::{Dictionary, DictionaryHandle, FrameDecoder};
@@ -4101,8 +4143,8 @@ impl FrameDecoder {
             self.decode_all_impl(
                 input,
                 output,
-                |this, src| this.reset_from_slice_with_dict_handles(src, dicts),
-                dicts,
+                |this, src| this.reset_from_slice_with_frame_dicts(src, FrameDicts::Set(dicts)),
+                FrameDicts::Set(dicts),
             )
         }
         #[cfg(feature = "lsm")]
@@ -4110,9 +4152,9 @@ impl FrameDecoder {
             self.decode_all_impl(
                 input,
                 output,
-                |this, src| this.reset_from_slice_with_dict_handles(src, dicts),
+                |this, src| this.reset_from_slice_with_frame_dicts(src, FrameDicts::Set(dicts)),
                 None,
-                dicts,
+                FrameDicts::Set(dicts),
             )
         }
     }
@@ -4339,15 +4381,13 @@ impl FrameDecoder {
     /// Decode the v0.5-v0.7 frame starting `*input` into the start of
     /// `output`, advancing `*input` past it; returns the bytes written.
     ///
-    /// A v0.7 frame naming a dictionary takes the one of `dicts` with that ID
-    /// (else the last, which then fails the ID check), or with no `dicts` the
-    /// one registered under it. A frame naming none takes the last of `dicts`.
+    /// Its dictionary is the one [`Self::legacy_frame_dict`] picks from `dicts`.
     #[cfg(feature = "legacy")]
     fn decode_legacy_frame(
         &mut self,
         input: &mut &[u8],
         output: &mut [u8],
-        dicts: &[DictionaryHandle],
+        dicts: FrameDicts<'_>,
     ) -> Result<usize, FrameDecoderError> {
         use crate::decoding::errors::LegacyFrameError;
         use crate::decoding::legacy::SliceOutput;
@@ -4387,7 +4427,7 @@ impl FrameDecoder {
         &self,
         stream: &mut decoding::legacy::LegacyStream,
         input: &[u8],
-        dicts: &[DictionaryHandle],
+        dicts: FrameDicts<'_>,
         out: &mut O,
     ) -> Result<usize, FrameDecoderError> {
         let header = decoding::legacy::read_header_whole(input)?;
@@ -4421,7 +4461,7 @@ impl FrameDecoder {
         } else {
             None
         };
-        let dicts = held.map_or(&[][..], core::slice::from_ref);
+        let dicts = held.map_or(FrameDicts::None, FrameDicts::One);
         let start = output.len();
         let mut out = VecOutput { buf: output, start };
         let decoded = self.decode_whole_legacy_frame(&mut stream, input, dicts, &mut out);
@@ -4440,24 +4480,24 @@ impl FrameDecoder {
     }
 
     /// The dictionary a v0.5-v0.7 frame naming `dict_id` (0 for none)
-    /// decodes with: the one of `dicts` with that ID, else the last, which
-    /// then fails the frame's ID check; with no `dicts`, the one registered
-    /// under the ID.
+    /// decodes with: one dictionary handed in whatever the frame names (the
+    /// frame checks the ID itself), a set's entry as for an RFC 8878 frame,
+    /// and with none handed in the one registered under the ID.
     #[cfg(feature = "legacy")]
     fn legacy_frame_dict<'s>(
         &'s self,
         dict_id: u32,
-        dicts: &'s [DictionaryHandle],
+        dicts: FrameDicts<'s>,
     ) -> Result<Option<&'s DictionaryHandle>, FrameDecoderError> {
-        let named = (dict_id != 0).then_some(dict_id);
-        Ok(match (named, dicts.is_empty()) {
-            (_, false) => Some(dictionary_for_frame(dicts, named)),
-            (Some(dict_id), true) => Some(
-                self.registered_dict(dict_id)
-                    .ok_or(FrameDecoderError::DictNotProvided { dict_id })?,
-            ),
-            (None, true) => None,
-        })
+        match dicts {
+            FrameDicts::One(dict) => Ok(Some(dict)),
+            FrameDicts::Set(_) => dicts.for_frame(Some(dict_id)),
+            FrameDicts::None if dict_id == 0 => Ok(None),
+            FrameDicts::None => self
+                .registered_dict(dict_id)
+                .map(Some)
+                .ok_or(FrameDecoderError::DictNotProvided { dict_id }),
+        }
     }
 
     /// Default-feature decode_all_impl: no visitor parameter so the
@@ -4470,7 +4510,7 @@ impl FrameDecoder {
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
         // The dictionaries a v0.5-v0.7 frame chooses from.
-        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
+        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: FrameDicts<'_>,
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
@@ -4626,7 +4666,7 @@ impl FrameDecoder {
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
         mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
         // The dictionaries a v0.5-v0.7 frame chooses from.
-        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
+        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: FrameDicts<'_>,
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {

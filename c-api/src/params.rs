@@ -601,7 +601,20 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
                         ContentChecksum::Verify
                     };
                 }
-                ZSTD_D_REF_MULTIPLE_DDICTS => dctx.ref_multiple_ddicts = on,
+                ZSTD_D_REF_MULTIPLE_DDICTS => {
+                    // No entry of the set is inherited by single-DDict mode
+                    // (upstream 1.6.0 `ZSTD_DCtx_setParameter` clears the
+                    // DDict set when the mode is turned off).
+                    if !on
+                        && matches!(
+                            dctx.attached_ddict,
+                            crate::attach::DCtxDictAttach::RefDDicts { .. }
+                        )
+                    {
+                        dctx.set_attached_ddict(crate::attach::DCtxDictAttach::None);
+                    }
+                    dctx.ref_multiple_ddicts = on;
+                }
                 _ => dctx.disable_huffman_assembly = on,
             }
             0
