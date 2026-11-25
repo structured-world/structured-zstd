@@ -6,7 +6,10 @@
 //! searched in four steps, scored at the default level, on one thread.
 //!
 //! Run: `cargo run --profile bench -p ffi-bench --example train_loop_fastcover
-//!       -- <rust|c> <iters> <corpus_path>`
+//!       -- <rust|c> <iters> <corpus_path> [dict_out]`
+//!
+//! With `dict_out`, the last dictionary trained is written there, so two builds
+//! can be checked to train the same bytes.
 
 use std::env;
 
@@ -37,6 +40,7 @@ fn main() {
     let dict_size = source.len().div_ceil(8).clamp(256, 16 * 1024);
 
     let mut sink = 0usize;
+    let mut last = Vec::new();
     for _ in 0..iters {
         let dict = match side {
             "rust" => {
@@ -55,6 +59,10 @@ fn main() {
         };
         sink = sink.wrapping_add(dict.len());
         core::hint::black_box(&dict);
+        last = dict;
+    }
+    if let Some(out) = args.get(4) {
+        std::fs::write(out, &last).expect("write the dictionary");
     }
     eprintln!(
         "trained {} samples ({} bytes) into {dict_size} B x {iters} on {side}; sum={sink}",
