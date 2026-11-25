@@ -2228,6 +2228,79 @@ fn driver_fast_dictionary_table_follows_the_cdict_geometry_across_levels() {
     }
 }
 
+/// Regression: the binary-tree backend's attached dictionary table takes the
+/// CDict's `hashLog` (upstream walks `dms->hashTable` at the dictionary's
+/// cParams, `ZSTD_insertBtAndGetAllMatches`), not a width sized from the
+/// dictionary's length. A 1280-byte dictionary at level 11 is a btopt CDict of
+/// `hashLog` 12; sized from its length the table was 11 bits, half full on
+/// random input, and the empty-bucket test mispredicted twice as often as
+/// upstream's.
+#[test]
+fn driver_bt_dictionary_table_takes_the_cdict_hash_log() {
+    let dict: Vec<u8> = (0..1280u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(10 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(11));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    let cd = crate::encoding::cparams::get_cdict_cparams(11, dict.len(), &Default::default());
+    assert_eq!(
+        cd.strategy, 7,
+        "a 1280-byte dictionary at level 11 is a btopt CDict"
+    );
+    let built = driver
+        .hc_matcher_mut()
+        .table
+        .dms
+        .table()
+        .expect("attached dictionary tree")
+        .hash_log;
+    assert_eq!(
+        built, cd.hash_log as usize,
+        "dict tree hashLog must be the CDict's"
+    );
+}
+
+/// Regression: a reused compressor whose `hash_log` changes between frames
+/// gets a dictionary tree at the new CDict width. On 256-byte frames the live
+/// widths are capped by the source and stay the same, so the primed tree of
+/// the previous frame was re-borrowed at the old width.
+#[test]
+fn driver_bt_dictionary_tree_follows_a_changed_cdict_hash_log() {
+    let dict: Vec<u8> = (0..1280u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    for hash_log in [11u32, 12] {
+        let ov = super::super::parameters::ParamOverrides {
+            hash_log: Some(hash_log),
+            ..Default::default()
+        };
+        driver.set_source_size_hint(256);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.set_param_overrides(Some(ov));
+        driver.reset(CompressionLevel::Level(11));
+        if !driver.dictionary_is_resident() {
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        }
+        let cd = crate::encoding::cparams::get_cdict_cparams(11, dict.len(), &ov);
+        assert_eq!(cd.hash_log, hash_log, "the override sets the CDict width");
+        let built = driver
+            .hc_matcher_mut()
+            .table
+            .dms
+            .table()
+            .expect("attached dictionary tree")
+            .hash_log;
+        assert_eq!(
+            built, hash_log as usize,
+            "hash_log {hash_log}: dict tree width"
+        );
+    }
+}
+
 /// Regression: same for the Dfast attached tables. L3 and L4 share the
 /// source-capped live widths on a 1 KiB source, but a 300 KiB dictionary's
 /// CDict tables are 17 / 16 bits at L3 and 18 / 18 at L4; a resident L3
