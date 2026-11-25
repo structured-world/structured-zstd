@@ -24,9 +24,13 @@ for side in rust c; do
     echo "r$round $side $(( $(date +%s%N) - start ))"
   done
   echo "== record $side"
-  perf record -e cpu-clock -F 1999 -g -o "$side.data" -- "$bin" "$side" 20 "$corpus" 2>&1
+  perf record -e cpu-clock -F 4999 -g -o "$side.data" -- "$bin" "$side" 40 "$corpus" 2>&1
   echo "== self $side"
   perf report -i "$side.data" --stdio --no-children --sort symbol -g none --percent-limit 0.5 2>&1
   echo "== children $side"
   perf report -i "$side.data" --stdio --children --sort symbol -g none --percent-limit 3 2>&1
 done
+echo "== annotate rust"
+perf annotate -i rust.data --stdio --no-source --percent-limit 15 2>&1
+echo "== annotate c"
+perf annotate -i c.data --stdio --no-source ZSTD_compressBlock_doubleFast_dictMatchState_5 2>&1
