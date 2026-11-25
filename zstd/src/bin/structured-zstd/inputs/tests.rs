@@ -188,13 +188,12 @@ fn a_readable_tree_counts_no_unreadable_directory() {
 }
 
 /// `--filelist` names inputs one per line, in the shape `ls` prints them.
-/// Blank lines carry no name and are skipped; a Windows line ending is
-/// stripped like a Unix one, since the list may have been written elsewhere.
+/// Blank lines carry no name and are skipped; the last line needs no newline.
 #[test]
 fn a_filelist_adds_one_input_per_line() {
     let scratch = Scratch::new("filelist");
     let list = scratch.path().join("list.txt");
-    fs::write(&list, "first.bin\n\nsecond.bin\r\nthird.bin").unwrap();
+    fs::write(&list, "first.bin\n\nsecond.bin\nthird.bin").unwrap();
 
     let selection =
         select_inputs(vec![PathBuf::from("argv.bin")], &[list], false, false, 0).unwrap();
@@ -272,6 +271,17 @@ fn a_filelist_past_the_limit_is_refused_while_reading() {
         err.contains("larger than"),
         "the refusal names the limit: {err}"
     );
+}
+
+/// The list is read as bytes: a CR before the newline is part of the name
+/// where a name may hold one, and dropped only where CRLF ends a line (native
+/// Windows), as the reference command reads it from 1.6.0 on
+/// (`tests/playTests.sh`, "file list with CR at the end of lines").
+#[test]
+fn a_filelist_keeps_a_carriage_return_where_names_may_hold_one() {
+    let names = parse_filelist(&b"tmpCR\r\nplain\n"[..], 64, Path::new("list.txt")).unwrap();
+    let first = if cfg!(windows) { "tmpCR" } else { "tmpCR\r" };
+    assert_eq!(names, vec![PathBuf::from(first), PathBuf::from("plain")]);
 }
 
 /// A list whose size is already past the limit is refused before it is

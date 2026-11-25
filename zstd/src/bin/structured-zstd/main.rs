@@ -156,11 +156,11 @@ const ZSTD_SUFFIX: &str = ".zst";
 const DECOMPRESS_SUFFIXES: [(&str, &str); 3] = [("zst", ""), ("zstd", ""), ("tzst", "tar")];
 
 /// The reference command version whose command line this tool follows.
-const UPSTREAM_VERSION: &str = "1.5.7";
+const UPSTREAM_VERSION: &str = "1.6.0";
 
 /// [`UPSTREAM_VERSION`] as `ZSTD_VERSION_NUMBER` spells it
 /// (`major * 10000 + minor * 100 + release`), the version a trace line carries.
-const UPSTREAM_VERSION_NUMBER: u32 = 10507;
+const UPSTREAM_VERSION_NUMBER: u32 = 10600;
 
 /// How the reference command names stdout in a summary line.
 const STDOUT_MARK: &str = "/*stdout*\\";
@@ -526,11 +526,11 @@ fn read_leading_number(text: &str, width: NumberWidth, case: SuffixCase) -> Resu
 /// is refused, where the reference reads it as zero: `--size-hint=$UNSET` is a
 /// script that lost its value, not one asking for nothing.
 fn parse_number(text: &str, width: NumberWidth) -> Result<u64> {
-    // The reference's line for anything but a number (`NEXT_UINT32`); the
-    // `G` suffixes read here as well are an extension it does not list.
+    // The reference's line for anything but a number (`NEXT_UINT32`), which
+    // lists the `G` suffixes from 1.6.0 on.
     let not_a_number = || {
         Usage::plain(
-            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed ",
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB are allowed ",
         )
     };
     if !text.starts_with(|c: char| c.is_ascii_digit()) {
@@ -588,7 +588,9 @@ fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
 /// bytes it would refuse every run, turning an explicit request for the default
 /// into an error.
 fn parse_memory_limit(text: &str) -> Result<Option<u64>> {
-    let value = parse_size(text)?;
+    // A 32-bit field in the reference (`NEXT_UINT32(memLimit)`), so 4 GiB
+    // overflows as it does there.
+    let value = parse_number(text, NumberWidth::U32)?;
     let bytes = if text.trim().ends_with(|c: char| c.is_ascii_digit()) {
         value
             .checked_mul(1 << 20)
@@ -624,8 +626,12 @@ const DECODER_AUXILIARY_BYTES: u64 = 1 << 20;
 fn decode_window_ceiling(opts: &Options) -> u64 {
     use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
 
+    // Below the default too: a frame whose window passes a lower limit is
+    // refused when it is decoded, as the reference refuses it. The floor is
+    // the smallest window a frame declares (RFC 8878 3.1.1.1.2, `Window_Log`
+    // at least 10).
     if let Some(limit) = opts.memory_limit {
-        return limit.clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE);
+        return limit.clamp(1 << 10, MAX_DECODER_WINDOW_SIZE);
     }
     if opts.patch_window_lifted {
         return MAX_DECODER_WINDOW_SIZE;
@@ -640,21 +646,40 @@ fn decode_window_ceiling(opts: &Options) -> u64 {
     }
 }
 
-/// Check a requested decompression memory ceiling against the one this build
-/// actually enforces.
+/// Check a decode's `-D` dictionary against its `-M` limit, before it is read.
 ///
-/// `-M` is a safety promise about untrusted input, not a performance hint, so
-/// it is either kept or refused. The decoder rejects any frame whose window
-/// exceeds a fixed ceiling, which makes a request at or above that ceiling
-/// already satisfied — we are the stricter of the two. A request BELOW it is a
-/// promise this build cannot make, and saying nothing would leave the caller
-/// believing a bound that is not there.
+/// The limit is the decode's window ceiling, as the reference sets it
+/// (`ZSTD_DCtx_setMaxWindowSize(dctx, memLimit)`), so the frames it admits are
+/// the ones the decoder refuses otherwise. The dictionary is held whole besides,
+/// as read and again as parsed, and a limit those two copies alone pass is one
+/// the run would break before decoding a byte.
+fn check_decode_dictionary(requested: u64, dictionary_bytes: u64) -> Result<()> {
+    if dictionary_bytes
+        .checked_mul(2)
+        .is_none_or(|held| held > requested)
+    {
+        bail!(
+            "requested memory limit {requested} B does not cover the dictionary: \
+             {dictionary_bytes} B held as read and again as parsed."
+        );
+    }
+    Ok(())
+}
+
+/// Check a requested memory ceiling against what a benchmark or a training run
+/// holds.
+///
+/// There `-M` is a safety promise, not a performance hint, so it is either kept
+/// or refused: such a run builds a decoder at the default window ceiling and
+/// holds whole files besides, and a request below what that takes is a promise
+/// this build cannot make. A plain decode is not weighed here: its limit is the
+/// window ceiling itself (see [`decode_window_ceiling`]).
 ///
 /// `whole_file_bytes` is what this run holds in full rather than streams, and
-/// `copies` is how many forms of it exist at once: the `-D` dictionary is held
-/// as read and again as parsed, a benchmark holds its input, the compressed
-/// frame and the decompressed copy. Any of them can break the promise alone, so
-/// they are weighed from the file sizes before anything is loaded.
+/// `copies` is how many forms of it exist at once: a benchmark holds its input,
+/// the compressed frame and the decompressed copy. Any of them can break the
+/// promise alone, so they are weighed from the file sizes before anything is
+/// loaded.
 fn check_memory_limit(requested: u64, whole_file_bytes: u64, copies: u64) -> Result<()> {
     /// Window ceiling the decoder refuses to exceed by default.
     const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
@@ -1808,8 +1833,7 @@ fn parse_args_into(
                         option_value(long, "patch-apply", arg_os, &mut iter)?
                     {
                         // Decompression against a `--patch-from` reference. The
-                        // reference command (its development branch; 1.5.7 has
-                        // no such option) lifts its memory ceiling to the
+                        // reference command lifts its memory ceiling to the
                         // largest window here, since a patch
                         // reaches back across the whole reference. A `-M` given
                         // earlier is dropped the same way; one given later
@@ -2002,13 +2026,15 @@ fn parse_args_into(
     opts.verbosity = *verbosity;
     opts.pause = *pause;
 
-    // `-M` bounds decompression, so it is weighed only on the runs that decode.
+    // A benchmark decodes with a decoder at the default ceiling and holds whole
+    // files besides, so its limit is weighed against that once the command line
+    // is whole (a mode flag may follow the limit). A plain decode needs no such
+    // check: its limit is the window ceiling itself (`decode_window_ceiling`),
+    // and the `-D` dictionary is weighed in `run` once its size is known.
     // Compressing, listing or training allocates no decoder, and upstream takes
-    // the flag there without complaint. A mode flag may follow the limit, which
-    // is why this waits for the whole command line. The `-D` dictionary is
-    // weighed on top in `run`, once its size is known.
+    // the flag there without complaint.
     if let Some(limit) = opts.memory_limit
-        && decodes(&opts)
+        && opts.bench
     {
         check_memory_limit(limit, 0, 0)?;
     }
@@ -2162,19 +2188,36 @@ fn clamp_level(level: i32) -> i32 {
 /// `--version`: this tool's name, version and maker. Below the default display
 /// level (`-qV`) only the bare format version it implements is printed, the
 /// number scripts compare to decide which zstd features they can use; at
-/// `-vV` the supported formats follow.
+/// `-vV` the supported formats follow, and at `-vvV` that this build's output
+/// is not the reference's byte for byte (`ZSTD_isDeterministicBuild` is 0), the
+/// line upstream's own tests read to skip their output checksums.
 fn print_version(verbosity: i32) {
+    // A failed write to stdout has nowhere to be reported.
+    let _ = write_version(&mut io::stdout().lock(), verbosity);
+}
+
+fn write_version(out: &mut impl Write, verbosity: i32) -> io::Result<()> {
     if verbosity < DEFAULT_LEVEL {
-        println!("{UPSTREAM_VERSION}");
-        return;
+        return writeln!(out, "{UPSTREAM_VERSION}");
     }
-    println!(
+    writeln!(
+        out,
         "structured-zstd v{} by Structured World",
         env!("CARGO_PKG_VERSION")
-    );
+    )?;
     if verbosity >= 3 {
-        println!("*** supports: zstd");
+        /// The formats this build reads, as the reference lists them.
+        const SUPPORTS: &str = if cfg!(feature = "legacy") {
+            "*** supports: zstd, zstd legacy v0.5+"
+        } else {
+            "*** supports: zstd"
+        };
+        writeln!(out, "{SUPPORTS}")?;
     }
+    if verbosity >= 4 {
+        writeln!(out, "non-deterministic build")?;
+    }
+    Ok(())
 }
 
 /// The short usage: `-h`, and what a mistaken command line gets under its
@@ -2195,13 +2238,17 @@ fn write_short_usage(out: &mut impl Write, program: &str) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        // The usage is the reference's text as it prints it (`zstdcli.c:144-174`),
-        // trailing space and wording included.
+        "  -c, --stdout                  Write to STDOUT (even if it is a console) and keep the INPUT file(s)."
+    )?;
+    writeln!(
+        out,
+        // The usage is the reference's text as it prints it (1.6.0
+        // `zstdcli.c`, `usage`), trailing space and wording included.
         "  -k, --keep                    Preserve INPUT file(s). [Default] "
     )?;
     writeln!(
         out,
-        "  --rm                          Remove INPUT file(s) after successful (de)compression.\n"
+        "  --rm                          Remove INPUT file(s) after successful (de)compression to file.\n"
     )?;
     writeln!(
         out,
@@ -2268,9 +2315,7 @@ fn print_help(verbosity: i32, program: &str) {
 /// The part of the full help below the short usage.
 const HELP_ADVANCED: &str = "\
 Advanced options:
-  -c, --stdout                  Write to STDOUT (even if it is a console) and keep the INPUT file(s).
-
-  -v, --verbose                 Enable verbose output; pass multiple times to increase verbosity.
+  -v, --verbose                Enable verbose output; pass multiple times to increase verbosity.
   -q, --quiet                   Suppress warnings; pass twice to suppress errors.
   --trace LOG                   Log tracing information to LOG.
 
@@ -2302,6 +2347,7 @@ Advanced compression options:
                                 long-distance matching runs; up to 30 when compressing. When
                                 decompressing, admits windows up to 2^#.
   --patch-from=REF              Use REF as the reference point for Zstandard's diff engine.
+  --patch-apply=REF             Equivalent for `-d --patch-from=REF`.
   --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
                                 Override the level's compression parameters knob by knob.
   --exclude-compressed          Only compress files that are not already compressed.
@@ -2337,7 +2383,7 @@ Dictionary builder:
                                 Use the fast cover algorithm (with optional arguments).
 
   --train-legacy[=s=#]          Use the legacy algorithm with selectivity #. [Default: 9]
-  -B#                           Cut each file into samples of size #; otherwise each file
+  --split=#                     Cut each file into samples of size #; otherwise each file
                                 is one sample of up to 128 KiB. At least 5 samples are needed.
   -o NAME                      Use NAME as dictionary name. [Default: dictionary]
   --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
@@ -2347,7 +2393,7 @@ Benchmark options:
   -b#                           Perform benchmarking with compression level #. [Default: 3]
   -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]
   -i#                           Set the minimum evaluation to time # seconds. [Default: 3]
-  -B#                           Cut file into independent chunks of size #. [Default: No chunking]
+  --split=#                     Split input into independent chunks of size #. [Default: No chunking]
   -S                            Output one benchmark result per input file. [Default: Consolidated result]
   -D dictionary                 Benchmark using dictionary
 
@@ -2619,8 +2665,7 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
         if let Some(limit) = opts.memory_limit
             && decodes(opts)
         {
-            // As read and again as parsed.
-            check_memory_limit(limit, size, 2)?;
+            check_decode_dictionary(limit, size)?;
         }
         Ok(capacity)
     };
@@ -3281,8 +3326,12 @@ fn run_selected(mut opts: Options) -> Result<usize> {
                         && input.exists()
                         && paths_point_to_same_file(input, output)?))
             {
+                // The reference command's wording (fileio.c
+                // `FIO_openDstFile`), which scripts and its own tests match,
+                // then the two names it found to be one file.
                 bail!(
-                    "{} would be written over {}, which is also an input",
+                    "Refusing to open an output file which will overwrite the input file: \
+                     {} is {}",
                     output.display(),
                     input.display(),
                 );
@@ -3536,20 +3585,27 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             }
         }
     }
-    // Under `--output-dir-flat` two inputs named alike land on one output, the
-    // later replacing the earlier. Without `--rm` that is the reference
-    // command's behaviour and both sources remain; with it both sources would
-    // be removed and one input would survive nowhere, so the run stops before
-    // anything is written.
+    // Under `--output-dir-flat` two inputs named alike would land on one
+    // output, the later replacing the earlier (and, with `--rm`, both sources
+    // removed). The run stops before anything is written, naming each shared
+    // name, as the reference command does from 1.6.0 on (fileio.c
+    // `FIO_checkFilenameCollisions`).
     let collisions = flat_output_collisions(opts);
-    let removes_sources = opts.remove_source && !opts.keep;
-    if removes_sources && let Some(name) = collisions.first() {
+    if !collisions.is_empty() {
+        for name in &collisions {
+            display!(
+                opts.verbosity,
+                1,
+                "zstd: {}: multiple input files map to the same output file name",
+                Path::new(name).display()
+            );
+        }
         bail!(
-            "two inputs would write {} under --output-dir-flat, and --rm would then delete both \
-             sources; nothing was written",
-            Path::new(name).display()
+            "no files were processed; --output-dir-mirror can preserve the input directory \
+             structure"
         );
     }
+    let removes_sources = opts.remove_source && !opts.keep;
     // Outputs whose names differ can still be one file where the file system
     // ignores case or Unicode normalisation (`a.txt.zst` and `A.txt.zst`), which
     // no comparison of names can know. The file system answers instead: an
@@ -3624,27 +3680,19 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
         };
         tally.record(outcome);
     }
-    for name in collisions {
-        display!(
-            opts.verbosity,
-            2,
-            "WARNING: Two files have same filename: {}",
-            Path::new(&name).display()
-        );
-    }
     multi_summary(opts, total, &tally);
     Ok(tally.failed)
 }
 
-/// The output names that more than one input lands on under
-/// `--output-dir-flat`, where the later output replaces the earlier; the run
-/// warns once per name, as the reference command does.
+/// The names more than one input shares under `--output-dir-flat`, where one
+/// output would replace another; the run refuses them, naming each once.
 ///
-/// Judged by the derived output names rather than the inputs' own, which the
-/// reference command compares: decompression drops a suffix, so `a/foo.zst`
-/// and `b/foo.zstd` are two names for one `out/foo`. An input whose output
-/// cannot be derived, or that `--exclude-compressed` leaves alone, writes
-/// nothing and collides with nothing.
+/// As the reference command judges them: compression by the inputs' own names,
+/// which every output extends by the same suffix; decompression by the derived
+/// output names, since dropping a suffix makes `a/foo.zst` and `b/foo.zstd` two
+/// names for one `out/foo`. An input whose output cannot be derived, or that
+/// `--exclude-compressed` leaves alone, writes nothing and collides with
+/// nothing.
 fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
     if opts.output_dir.is_none()
         || opts.output_dir_mirror.is_some()
@@ -3657,7 +3705,14 @@ fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
         .iter()
         .filter(|input| input.as_path() != Path::new("-"))
         .filter(|input| !skips_as_compressed(opts, input))
-        .filter_map(|input| derive_output_path(opts, input).ok())
+        .filter_map(|input| {
+            let output = derive_output_path(opts, input).ok()?;
+            Some(if opts.mode == Mode::Compress {
+                input.clone()
+            } else {
+                output
+            })
+        })
         .collect();
     inputs::shared_file_names(&outputs)
 }
@@ -4632,7 +4687,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // replaces it (`DiB_saveDict`, `fopen(dictFileName, "wb")`).
     let in_place = writes_in_place(&output)?;
     if !in_place {
-        ensure_regular_output_destination(&output)?;
+        ensure_regular_output_destination(&output, false)?;
     }
     // The default destination is a plain `dictionary`, which a sample can
     // easily be named: the run would read that file and then replace it with
@@ -4811,19 +4866,19 @@ impl core::fmt::Display for TooFewSamples {
 impl std::error::Error for TooFewSamples {}
 
 /// The refusal of fewer than [`TRAINING_SAMPLES_MIN`] samples, none included,
-/// as the reference's trainer gives it (`dibio.c:364-368`): the advice as
-/// warnings, then its error line, status 14.
+/// as the reference's trainer gives it (1.6.0 `dibio.c`, `DiB_trainFromFiles`):
+/// the advice as warnings, then its error line, status 14.
 fn too_few_samples(verbosity: i32) -> Error {
     display!(
         verbosity,
         2,
-        "!  Warning : nb of samples too low for proper processing ! "
+        "!  Warning : nb of samples too low for proper processing !"
     );
-    display!(verbosity, 2, "!  Please provide _one file per sample_. ");
+    display!(verbosity, 2, "!  Please provide _one file per sample_.");
     display!(
         verbosity,
         2,
-        "!  Alternatively, split files into fixed-size blocks representative of samples, with -B# "
+        "!  Alternatively, split file(s) into fixed-size samples, with --split=#"
     );
     Box::new(Reported {
         text: "Error 14 : nb of samples too low".to_string(),
@@ -4998,6 +5053,16 @@ fn load_training_samples(
         );
     }
     let samples = training_extent(&file_sizes, block_size);
+    // The count has to fit the reference's `int` and its table of `size_t`
+    // lengths, and it refuses more before anything is allocated (1.6.0
+    // dibio.c `DiB_fileStats`); the same bound holds this table.
+    let samples_max = (i32::MAX as u128).min((usize::MAX / core::mem::size_of::<usize>()) as u128);
+    if samples > samples_max {
+        return Err(Box::new(Reported {
+            text: "Error 14 : too many samples for dictionary training".to_string(),
+            status: 14,
+        }));
+    }
     if samples < TRAINING_SAMPLES_MIN as u128 {
         return Err(Box::new(TooFewSamples));
     }
@@ -5528,7 +5593,10 @@ fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
     // An empty file is not a zstd stream: without this guard the walk loop
     // below never runs and we would print a spurious 0-frame success row.
     if compressed == 0 {
-        bail!("{}: not a zstd frame: empty file", path.display());
+        bail!(
+            "{}: reached end of file with incomplete frame",
+            path.display()
+        );
     }
     let mut offset = 0u64;
     // `Frames` counts every frame in the file and `Skips` says how many of them
@@ -5552,16 +5620,42 @@ fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
         file.seek(SeekFrom::Start(offset))?;
         let mut header_buf = [0u8; MAX_FRAME_HEADER_LEN];
         let header_read = read_filling(&mut file, &mut header_buf)?;
+        // What is left cannot hold the smallest header: the file ends in a
+        // partial frame (the reference command's `ZSTD_FRAMEHEADERSIZE_MIN`
+        // check, fileio.c `FIO_analyzeFrames`).
+        if header_read < 6 {
+            bail!(
+                "{}: reached end of file with incomplete frame",
+                path.display()
+            );
+        }
+        // A skippable header is eight bytes; its length is read only from a
+        // whole one.
+        let skippable_magic =
+            header_buf[0] & 0xF0 == 0x50 && header_buf[1..4] == [0x2A, 0x4D, 0x18];
+        if skippable_magic && header_read < 8 {
+            bail!(
+                "{}: reached end of file with incomplete skippable frame",
+                path.display()
+            );
+        }
         let info = match read_frame_header_info(&header_buf[..header_read], false) {
             Ok(info) => info,
             // Metadata frames sit inside ordinary archives (a seekable-zstd
             // index is one), so the walk steps over them: 4-byte magic +
             // 4-byte length + the payload.
             Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
-                offset = offset
-                    .checked_add(8 + u64::from(length))
-                    .filter(|end| *end <= compressed)
-                    .ok_or_else(|| eyre!("{}: truncated skippable frame", path.display()))?;
+                // `offset` is below the file length, which the OS keeps under
+                // 2^63, and `length` below 2^32, so the sum cannot wrap.
+                debug_assert!(offset < compressed && compressed <= i64::MAX as u64);
+                let end = offset + 8 + u64::from(length);
+                if end > compressed {
+                    bail!(
+                        "{}: seeked to position {end}, which is beyond file size of {compressed}",
+                        path.display()
+                    );
+                }
+                offset = end;
                 // Upstream counts a skippable frame in both columns: `Frames`
                 // is every frame in the file, `Skips` the metadata ones.
                 skips += 1;
@@ -6231,7 +6325,7 @@ fn write_output_file_if<T>(
         sink.flush().wrap_err("failed to flush output")?;
         return Ok(Some((value, Placement::Stream)));
     }
-    ensure_regular_output_destination(output)?;
+    ensure_regular_output_destination(output, opts.force)?;
     if output.exists() && !opts.force {
         if opts.verbosity <= 1 {
             display!(
@@ -7491,8 +7585,10 @@ fn replace_output_file(
     let output_kind = match output_destination_kind(output).inspect_err(|_err| {
         let _ = fs::remove_file(temporary_output_path);
     })? {
-        Some(kind) => kind,
-        None => {
+        // A link reaches here only under `-f`, which replaces it: renamed over
+        // as an absent output is, keeping none of what it points at.
+        Some(kind) if !kind.is_symlink() => kind,
+        _ => {
             return match fs::rename(temporary_output_path, output) {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -7601,8 +7697,14 @@ fn open_in_place(output: &Path) -> Result<File> {
         .wrap_err_with(|| output.display().to_string())
 }
 
-fn ensure_regular_output_destination(output: &Path) -> Result<()> {
-    if output_destination_kind(output)?.is_some_and(|kind| !kind.is_file()) {
+/// Refuse an existing output that is not a regular file. A symbolic link is
+/// accepted when `replace_link` is set (`-f`): the temporary is renamed over
+/// the link itself, so the output never goes through it, as the reference
+/// command replaces it from 1.6.0 on (`tests/playTests.sh`).
+fn ensure_regular_output_destination(output: &Path, replace_link: bool) -> Result<()> {
+    if output_destination_kind(output)?
+        .is_some_and(|kind| !kind.is_file() && !(replace_link && kind.is_symlink()))
+    {
         return Err(eyre!(
             "output path exists and is not a regular file: {output:?}"
         ));

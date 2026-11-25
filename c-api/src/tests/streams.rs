@@ -1001,8 +1001,8 @@ fn decompress_stream_refuses_to_spin_without_progress() {
 
 /// Under `ZSTD_d_refMultipleDDicts` every referenced DDict stays: a frame
 /// naming a dictionary ID decodes with that one, a frame naming none with the
-/// most recent, frame by frame within one call and across a stream. Without
-/// it the last reference replaces the others.
+/// entry of ID 0 (the raw-content one here), frame by frame within one call
+/// and across a stream. Without it the last reference replaces the others.
 #[test]
 fn multiple_ddicts_are_picked_by_the_frame() {
     let raw = b"a raw dictionary is nothing but content to match against ".repeat(30);
@@ -1083,6 +1083,155 @@ fn multiple_ddicts_are_picked_by_the_frame() {
         ZSTD_freeDCtx(zds);
         ZSTD_freeDDict(full);
         ZSTD_freeDDict(raw_ddict);
+    }
+}
+
+/// A skippable frame spends a referenced prefix as any frame does: upstream
+/// resolves the frame's dictionary (`ZSTD_getDDict`, which takes a single-use
+/// prefix) before it tells a skippable header from an ordinary one, so the
+/// frame after it no longer has the prefix, whose buffer the caller may have
+/// freed.
+#[test]
+fn a_skippable_frame_spends_the_prefix() {
+    let prefix = b"a prefix the next frame was compressed against ".repeat(20);
+    let input = b"a prefix the next frame was compressed against, and then some ".repeat(10);
+    let prefixed = unsafe {
+        let cctx = crate::context::ZSTD_createCCtx();
+        assert_eq!(
+            crate::attach::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()),
+            0
+        );
+        let mut out = vec![0u8; input.len() + 256];
+        let n = crate::context::ZSTD_compress2(
+            cctx,
+            out.as_mut_ptr(),
+            out.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        out.truncate(n);
+        ZSTD_freeCCtx(cctx);
+        out
+    };
+    // An empty skippable frame: magic and a zero length.
+    let skippable = [0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+    unsafe {
+        let zds = ZSTD_createDStream();
+        assert_eq!(
+            crate::attach::ZSTD_DCtx_refPrefix(zds, prefix.as_ptr(), prefix.len()),
+            0
+        );
+        assert_eq!(decode_simple(zds, &skippable).unwrap(), b"");
+        assert!(
+            decode_simple(zds, &prefixed).is_err(),
+            "the prefix went with the skippable frame"
+        );
+        ZSTD_freeDCtx(zds);
+    }
+}
+
+/// Turning `ZSTD_d_refMultipleDDicts` off drops the set: no entry of it is
+/// inherited by single-DDict mode (upstream 1.6.0 `ZSTD_DCtx_setParameter`
+/// clears the DDict set), so a frame naming one of them no longer finds it.
+#[test]
+fn disabling_multiple_ddicts_releases_the_set() {
+    let input = b"content to match against, and more of the dictionary sample ".repeat(30);
+    let named = unsafe {
+        let cctx = crate::context::ZSTD_createCCtx();
+        let mut out = vec![0u8; input.len() + 256];
+        let n = crate::attach::ZSTD_compress_usingDict(
+            cctx,
+            out.as_mut_ptr(),
+            out.len(),
+            input.as_ptr(),
+            input.len(),
+            DICT.as_ptr(),
+            DICT.len(),
+            3,
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        out.truncate(n);
+        ZSTD_freeCCtx(cctx);
+        out
+    };
+    unsafe {
+        let full = ZSTD_createDDict(DICT.as_ptr(), DICT.len());
+        let zds = ZSTD_createDStream();
+        assert_eq!(crate::params::ZSTD_DCtx_setParameter(zds, 1003, 1), 0);
+        assert_eq!(ZSTD_DCtx_refDDict(zds, full), 0);
+        assert_eq!(crate::params::ZSTD_DCtx_setParameter(zds, 1003, 0), 0);
+        let mut out = vec![0u8; input.len()];
+        let n = crate::context::ZSTD_decompressDCtx(
+            zds,
+            out.as_mut_ptr(),
+            out.len(),
+            named.as_ptr(),
+            named.len(),
+        );
+        assert_eq!(
+            code(n),
+            ZSTD_ErrorCode::ZSTD_error_dictionary_wrong,
+            "the set is gone with the mode"
+        );
+        ZSTD_freeDCtx(zds);
+        ZSTD_freeDDict(full);
+    }
+}
+
+/// One referenced dictionary decodes a frame that names none, one-shot and
+/// streaming: a frame compressed with it under `ZSTD_c_dictIDFlag` 0 carries
+/// no ID. Only a set (`ZSTD_d_refMultipleDDicts`) chooses by ID.
+#[test]
+fn single_ddict_decodes_a_frame_naming_no_dictionary() {
+    let input = b"content to match against, and more of the dictionary sample ".repeat(30);
+    let frame = unsafe {
+        let cctx = crate::context::ZSTD_createCCtx();
+        assert_eq!(
+            crate::params::ZSTD_CCtx_setParameter(cctx, crate::params::ZSTD_C_DICT_ID_FLAG, 0),
+            0
+        );
+        assert_eq!(
+            crate::attach::ZSTD_CCtx_loadDictionary(cctx, DICT.as_ptr(), DICT.len()),
+            0
+        );
+        let mut out = vec![0u8; input.len() + 256];
+        let n = crate::context::ZSTD_compress2(
+            cctx,
+            out.as_mut_ptr(),
+            out.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        out.truncate(n);
+        ZSTD_freeCCtx(cctx);
+        out
+    };
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        0
+    );
+    unsafe {
+        let full = ZSTD_createDDict(DICT.as_ptr(), DICT.len());
+        let zds = ZSTD_createDStream();
+        assert_eq!(ZSTD_DCtx_refDDict(zds, full), 0);
+        let mut out = vec![0u8; input.len()];
+        let n = crate::context::ZSTD_decompressDCtx(
+            zds,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        );
+        assert_eq!(n, input.len(), "{:?}", code(n));
+        assert!(out == input, "one-shot decoded with the dictionary");
+        assert!(
+            decode_simple(zds, &frame).unwrap() == input,
+            "streaming decoded with the dictionary"
+        );
+        ZSTD_freeDCtx(zds);
+        ZSTD_freeDDict(full);
     }
 }
 

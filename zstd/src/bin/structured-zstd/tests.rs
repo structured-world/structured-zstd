@@ -3107,13 +3107,15 @@ fn trace_records_every_frame() {
     let one_frame = fs::read(format!("{one}.zst")).unwrap();
     assert!(
         compressed[1].starts_with(&format!(
-            "zstd, 10507, compress, streaming, 19, 0, 0, 1600, {}, ",
+            "zstd, {UPSTREAM_VERSION_NUMBER}, compress, streaming, 19, 0, 0, 1600, {}, ",
             one_frame.len()
         )),
         "{}",
         compressed[1]
     );
-    assert!(compressed[2].starts_with("zstd, 10507, compress, streaming, 19, 0, 0, 14, "));
+    assert!(compressed[2].starts_with(&format!(
+        "zstd, {UPSTREAM_VERSION_NUMBER}, compress, streaming, 19, 0, 0, 14, "
+    )));
 
     // Two frames back to back decode to both inputs, and each is a line.
     let mut both = one_frame.clone();
@@ -3135,13 +3137,15 @@ fn trace_records_every_frame() {
     for pair in decoded.chunks(2) {
         assert!(
             pair[0].starts_with(&format!(
-                "zstd, 10507, decompress, streaming, 0, 0, 0, 1600, {}, ",
+                "zstd, {UPSTREAM_VERSION_NUMBER}, decompress, streaming, 0, 0, 0, 1600, {}, ",
                 one_frame.len()
             )),
             "{}",
             pair[0]
         );
-        assert!(pair[1].starts_with("zstd, 10507, decompress, streaming, 0, 0, 0, 14, "));
+        assert!(pair[1].starts_with(&format!(
+            "zstd, {UPSTREAM_VERSION_NUMBER}, decompress, streaming, 0, 0, 0, 14, "
+        )));
     }
 
     // A benchmark compresses and decompresses each level once per pass.
@@ -3152,9 +3156,10 @@ fn trace_records_every_frame() {
     let benched = &lines()[7..];
     assert!(!benched.is_empty());
     assert!(
-        benched
-            .iter()
-            .all(|line| line.starts_with("zstd, 10507, ") && line.contains(", single-pass, ")),
+        benched.iter().all(
+            |line| line.starts_with(&format!("zstd, {UPSTREAM_VERSION_NUMBER}, "))
+                && line.contains(", single-pass, ")
+        ),
         "{benched:#?}"
     );
     assert!(benched.iter().any(|line| line.contains(", compress, ")));
@@ -4439,7 +4444,6 @@ fn help_and_version_texts_are_plain_ascii_punctuation() {
     assert!(!usage.contains('\u{2014}'));
     assert!(usage.contains("Usage: zstd [OPTIONS...] [INPUT... | -] [-o OUTPUT]"));
     assert!(usage.contains("-H, --help"));
-    assert_eq!(UPSTREAM_VERSION, "1.5.7");
 }
 
 #[test]
@@ -4658,13 +4662,20 @@ fn command_line_errors_read_as_the_reference_prints_them() {
     );
     assert_eq!(usage(&["-5000000000", "f"]), overflow);
     assert_eq!(usage(&["--fast=5000000000", "f"]), overflow);
+    // The reference's 1.6.0 wording, which lists the `G` suffixes it reads
+    // (`tests/cli-tests/basic/memlimit.sh`).
     let not_a_number = (
-        "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed "
+        "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB are allowed "
             .to_string(),
         false,
     );
     assert_eq!(usage(&["--memory=32LB", "f"]), not_a_number);
     assert_eq!(usage(&["--memory=hello", "f"]), not_a_number);
+    // The limit is a 32-bit field there: 3 GiB fits, 4 GiB does not.
+    assert!(parse(&["--memory=3GiB", "f"]).is_ok());
+    for four in ["--memory=4G", "--memory=4GB", "--memory=4GiB"] {
+        assert_eq!(usage(&[four, "f"]), overflow);
+    }
     assert_eq!(
         usage(&["--output-dir-flat=", "f"]),
         (
@@ -4697,35 +4708,26 @@ fn stream_size_pledges_and_size_hint_only_advises() {
     assert_eq!(advisory.pledged_size, None);
 }
 
-/// `-M` is a safety promise, not a hint: it caps how much memory decompressing
-/// an untrusted frame may demand. This build enforces a fixed 128 MiB window
-/// ceiling, so a limit at or above that is already honoured — and one BELOW it
-/// is a promise we cannot keep, which must be refused rather than accepted and
-/// ignored.
+/// `-M` caps the window a decode admits, as the reference sets it
+/// (`ZSTD_DCtx_setMaxWindowSize(dctx, memLimit)`): any limit is kept, the
+/// default ceiling's included, and a frame whose window passes it is refused
+/// when it is decoded (`tests/cli-tests/basic/memlimit_alias.sh` decodes a
+/// 500 KB input under `--memory=8M` and refuses it under `--memory=1K`).
 #[test]
-fn memory_limit_is_honoured_or_refused_never_ignored() {
-    // Comfortably above the window plus the decoder's auxiliary buffers.
-    assert!(parse(&["-d", "-M256", "f"]).is_ok());
-    // Exactly the window is NOT enough: the decoder also holds literal, block,
-    // sequence and entropy-table buffers, so a promise of 128 MiB flat is one
-    // we would break.
-    assert!(parse(&["-d", "--memory=128MB", "f"]).is_err());
-    assert!(parse(&["-d", "--memory=160MB", "f"]).is_ok());
-    // Below it: refuse rather than pretend.
-    let err = match parse(&["-d", "-M8", "f"]) {
-        Ok(_) => panic!("a limit below our own ceiling must be refused"),
-        Err(err) => err.to_string(),
-    };
-    assert!(
-        err.contains("128"),
-        "the refusal should name the ceiling we do enforce, got: {err}"
-    );
-    // A bare number is MiB, a suffix means what it says. Applying the implicit
-    // MiB on top of an explicit suffix turns `-M1M` into a terabyte, which sails
-    // past the very check the flag exists for.
-    assert!(parse(&["-d", "-M1M", "f"]).is_err());
-    assert!(parse(&["-d", "-M128MB", "f"]).is_err());
-    assert!(parse(&["-d", "-M256MB", "f"]).is_ok());
+fn memory_limit_is_the_window_ceiling_a_decode_admits() {
+    for (args, ceiling) in [
+        (&["-d", "-M256", "f"][..], 256 << 20),
+        (&["-d", "--memory=128MB", "f"], 128 << 20),
+        (&["-d", "-M8", "f"], 8 << 20),
+        // A bare number is MiB, a suffix means what it says. Applying the
+        // implicit MiB on top of an explicit suffix would turn `-M1M` into a
+        // terabyte.
+        (&["-d", "-M1M", "f"], 1 << 20),
+        (&["-d", "--memory=1K", "f"], 1 << 10),
+    ] {
+        let opts = parse(args).unwrap();
+        assert_eq!(decode_window_ceiling(&opts), ceiling, "{args:?}");
+    }
     // Zero is the parameter's way of saying "the default ceiling", which is the
     // one this build already enforces — so it asks for nothing and is refused
     // by nothing. Read as a limit of zero bytes it would fail every run, which
@@ -4738,25 +4740,27 @@ fn memory_limit_is_honoured_or_refused_never_ignored() {
     let zero_long = parse(&["-d", "--memory=0", "f"]).expect("the long spelling too");
     assert_eq!(zero_long.memory_limit, None);
     // The long spelling has the same default unit as the short one.
-    assert!(parse(&["-d", "--memory=256", "f"]).is_ok());
-    assert!(parse(&["-d", "--memory=8", "f"]).is_err());
+    let long = parse(&["-d", "--memory=8", "f"]).unwrap();
+    assert_eq!(decode_window_ceiling(&long), 8 << 20);
     // `-t` decodes too, so the ceiling applies there as well.
-    assert!(parse(&["-t", "--memory=8", "f"]).is_err());
+    let test = parse(&["-t", "--memory=8", "f"]).unwrap();
+    assert_eq!(decode_window_ceiling(&test), 8 << 20);
 }
 
-/// The ceiling describes decompression. Compressing, listing or training
-/// creates no decoder, so a limit that decoding could not keep says nothing
-/// about those runs — upstream accepts it there, and refusing would fail
-/// commands that never allocate what the limit is about.
+/// The limit a benchmark is weighed against is what it holds: a decoder at the
+/// default ceiling and whole files besides. Compressing, listing or training
+/// creates no decoder, so a limit says nothing about those runs; upstream
+/// accepts it there, and refusing would fail commands that never allocate what
+/// the limit is about.
 #[test]
 fn the_memory_limit_only_binds_the_paths_that_decode() {
     assert!(parse(&["--memory=8", "f"]).is_ok());
     assert!(parse(&["-l", "--memory=8", "f"]).is_ok());
     assert!(parse(&["--train", "-M256", "s1", "s2"]).is_ok());
-    // A mode flag after the limit still decides: the check waits for it.
-    assert!(parse(&["--memory=8", "-d", "f"]).is_err());
-    // Benchmarking decompresses at every level it measures, so it decodes and
-    // the ceiling binds there too, whatever the mode field says.
+    // A plain decode keeps any limit as its window ceiling.
+    assert!(parse(&["--memory=8", "-d", "f"]).is_ok());
+    // Benchmarking decompresses at every level it measures, with a decoder at
+    // the default ceiling, so a limit below that is refused.
     assert!(parse(&["-b3", "-M8", "f"]).is_err());
     assert!(parse(&["-b3", "-M256", "f"]).is_ok());
 }
@@ -4788,8 +4792,8 @@ fn the_memory_limit_counts_the_dictionary_it_was_given() {
 fn an_oversized_dictionary_is_refused_before_it_is_read() {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("szstd-bigdict-{}.bin", std::process::id()));
-    // 8 KiB of dictionary is counted twice, so a limit with only 4 KiB of
-    // headroom above the decoder's own floor cannot cover it.
+    // 8 KiB of dictionary is counted twice, as read and as parsed, so a limit
+    // of 12 KiB cannot cover it.
     fs::write(&path, vec![0u8; 8 * 1024]).unwrap();
 
     // Unreadable, so the answer says which step ran first: refusing on the
@@ -4803,8 +4807,7 @@ fn an_oversized_dictionary_is_refused_before_it_is_read() {
 
     let mut opts = parse(&["-d", "f"]).unwrap();
     opts.dict = Some(path.clone());
-    opts.memory_limit =
-        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 4096);
+    opts.memory_limit = Some(12 * 1024);
     let refused = load_dictionary(&opts);
     let _ = fs::remove_file(&path);
 
@@ -4816,6 +4819,28 @@ fn an_oversized_dictionary_is_refused_before_it_is_read() {
         "the refusal must be the limit, not a read that should never have been \
          attempted: {err}"
     );
+}
+
+/// A decode's `-D` dictionary is held twice, as read and as parsed, so a limit
+/// covers it exactly when it covers both copies, and a limit below that is
+/// refused naming the dictionary.
+#[test]
+fn a_decode_dictionary_fits_a_limit_covering_both_copies() {
+    check_decode_dictionary(16 * 1024, 8 * 1024).expect("two copies fit exactly");
+    check_decode_dictionary(1 << 20, 0).expect("no dictionary bytes");
+    let err = check_decode_dictionary(16 * 1024 - 1, 8 * 1024)
+        .expect_err("one byte short")
+        .to_string();
+    assert!(err.contains("does not cover the dictionary"), "{err}");
+    // Twice a size past half the range overflows and cannot fit any limit.
+    assert!(check_decode_dictionary(u64::MAX, u64::MAX / 2 + 1).is_err());
+}
+
+/// `--version` goes to stdout through the same text the tests read.
+#[test]
+fn print_version_writes_the_version() {
+    print_version(0);
+    print_version(DEFAULT_LEVEL + 2);
 }
 
 /// Benchmarking holds the whole input and a decompressed copy of it, which is
@@ -5304,10 +5329,12 @@ fn flat_output_collisions_are_judged_by_the_output_names() {
         flat_output_collisions(&decompress),
         vec![OsString::from("bar.tar"), OsString::from("foo")]
     );
+    // Compression names the input, as the reference does: its outputs differ
+    // from the inputs' names by the one suffix every one of them gets.
     let compress = parse(&["--output-dir-flat", "out", "a/foo", "b/foo", "c/foo.zst"]).unwrap();
     assert_eq!(
         flat_output_collisions(&compress),
-        vec![OsString::from("foo.zst")]
+        vec![OsString::from("foo")]
     );
     let mirrored = parse(&["--output-dir-mirror", "tree", "a/foo", "b/foo"]).unwrap();
     assert!(flat_output_collisions(&mirrored).is_empty());
@@ -5338,8 +5365,8 @@ fn flat_collision_under_rm_is_refused_before_any_write() {
     .unwrap();
     let err = run(opts).expect_err("a collision under --rm must stop the run");
     assert!(
-        err.to_string().contains("x.txt.zst"),
-        "the refusal must name the shared output: {err}"
+        err.to_string().contains("no files were processed"),
+        "the refusal says nothing was processed: {err}"
     );
     assert_eq!(fs::read(&first).unwrap(), b"first input\n");
     assert_eq!(fs::read(&second).unwrap(), b"second input\n");
@@ -5409,11 +5436,11 @@ fn flat_collision_ignores_inputs_excluded_as_compressed() {
     assert_eq!(decoded(&archive).unwrap(), b"taken input\n");
 }
 
-/// Without `--rm` no source is at stake, and the run does what the reference
-/// command does: every input is processed, the later output replaces the
-/// earlier under `-f`, and both sources stay.
+/// Without `--rm` a collision still stops the run before anything is written,
+/// as the reference command does from 1.6.0 on: one output would otherwise
+/// silently replace the other (`tests/cli-tests/basic/output_dir_collision.sh`).
 #[test]
-fn flat_collision_without_rm_keeps_the_last_output() {
+fn flat_collision_without_rm_processes_nothing() {
     let scratch = Scratch::new("flat-no-rm");
     let first = scratch.file("d1/x.txt", b"first input\n");
     let second = scratch.file("d2/x.txt", b"second input\n");
@@ -5428,10 +5455,9 @@ fn flat_collision_without_rm_keeps_the_last_output() {
         second.to_str().unwrap(),
     ])
     .unwrap();
-    assert_eq!(run(opts).unwrap(), 0);
+    run(opts).expect_err("a collision stops the run");
     assert!(first.exists() && second.exists());
-    let archive = fs::read(out.join("x.txt.zst")).unwrap();
-    assert_eq!(decoded(&archive).unwrap(), b"second input\n");
+    assert!(!out.join("x.txt.zst").exists(), "nothing may be written");
 }
 
 /// Two names that differ can still reach one file on a file system that
@@ -6195,7 +6221,12 @@ fn an_output_that_is_also_an_input_is_refused() {
         let err = run(opts)
             .expect_err("an output that is an input is refused")
             .to_string();
-        assert!(err.contains("also an input"), "the refusal says why: {err}");
+        // The reference command's wording, which its own tests match
+        // (`tests/cli-tests/file-handling/same-file-parent-race.sh`).
+        assert!(
+            err.contains("Refusing to open an output file which will overwrite the input file"),
+            "the refusal says why: {err}"
+        );
         assert_eq!(
             fs::read(&input).unwrap(),
             b"original bytes",
@@ -7003,6 +7034,126 @@ fn open_source(path: &Path) -> (File, identity::Source) {
     let id = identity::of_open(&opened, &opened.metadata().unwrap());
     let source = identity::Source::opened(entry, id).unwrap();
     (opened, source)
+}
+
+/// More samples than the reference's `int` count (and its `size_t` length
+/// table) holds are refused with status 14 before any is read, the last partial
+/// piece counted (`tests/cli-tests/dict-builder/sample-count-overflow.sh`).
+#[test]
+fn too_many_training_samples_are_refused_before_loading() {
+    let scratch = Scratch::new("too-many-samples");
+    let max = (i32::MAX as u64).min((usize::MAX / core::mem::size_of::<usize>()) as u64);
+    let sample = scratch.file("sample", b"");
+    let set_len = |len: u64| {
+        File::options()
+            .write(true)
+            .open(&sample)
+            .unwrap()
+            .set_len(len)
+            .unwrap()
+    };
+    let status = |block: u64| -> Option<i32> {
+        let err = load_training_samples(
+            std::slice::from_ref(&sample),
+            Some(block),
+            Some(1 << 20),
+            |_| Ok(()),
+        )
+        .err()?;
+        let reported = err.downcast_ref::<Reported>()?;
+        assert_eq!(
+            reported.text,
+            "Error 14 : too many samples for dictionary training"
+        );
+        Some(reported.status)
+    };
+    set_len(max + 1);
+    assert_eq!(status(1), Some(14));
+    set_len(max * 2 + 1);
+    assert_eq!(status(2), Some(14), "the last partial piece counts");
+    set_len(max);
+    assert_eq!(status(1), None, "exactly the bound is accepted");
+}
+
+/// `-l` on an incomplete header says so and never reports a length it read
+/// from one; a skippable frame whose declared payload runs past the end names
+/// where it would have ended. The reference command's wording from 1.6.0 on
+/// (`tests/cli-tests/basic/list-short-skippable.sh`).
+#[test]
+fn list_reports_incomplete_and_overlong_skippable_headers() {
+    let scratch = Scratch::new("list-short");
+    let error = |name: &str, bytes: &[u8]| {
+        let path = scratch.file(name, bytes);
+        summarize_archive(&path).unwrap_err().to_string()
+    };
+    let prefix: &[u8] = b"\x28\xb5\x2f\xfd\x23\x11\x22\xde\xad\x04\x21\x00\x00AAAA";
+    assert!(error("empty.zst", b"").contains("incomplete"));
+    let header: &[u8] = b"\x50\x2a\x4d\x18\x00\x00\x00\x00";
+    for len in 1..8 {
+        for (name, bytes) in [
+            ("short.zst", header[..len].to_vec()),
+            ("after.zst", [prefix, &header[..len]].concat()),
+        ] {
+            let err = error(name, &bytes);
+            assert!(err.contains("incomplete"), "{name} {len}: {err}");
+            assert!(!err.contains("seeked to position"), "{name} {len}: {err}");
+        }
+    }
+    let complete = scratch.file("complete.zst", &[prefix, header].concat());
+    assert!(summarize_archive(&complete).is_ok());
+    let large = error("large.zst", b"\x50\x2a\x4d\x18\xf8\xff\xff\xff");
+    assert!(large.contains("seeked to position 4294967296"), "{large}");
+}
+
+/// `--version` at `-vvV` says the build is not deterministic in the reference's
+/// sense (its frames are not libzstd's byte for byte), which upstream's tests
+/// read to skip their output checksums; `-qV` stays the bare version.
+#[test]
+fn version_says_the_build_is_not_the_references_byte_for_byte() {
+    let text = |verbosity| {
+        let mut out = Vec::new();
+        write_version(&mut out, verbosity).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(text(DEFAULT_LEVEL - 1), format!("{UPSTREAM_VERSION}\n"));
+    assert!(!text(3).contains("non-deterministic"));
+    assert!(
+        text(4).ends_with("non-deterministic build\n"),
+        "{}",
+        text(4)
+    );
+    assert_eq!(
+        text(3).contains("zstd legacy v0.5+"),
+        cfg!(feature = "legacy")
+    );
+}
+
+/// An output name held by a symbolic link is never written through: without
+/// `-f` the run refuses it and creates nothing where it points; with `-f` a
+/// regular file replaces the link, and its target is still left alone. As the
+/// reference command does from 1.6.0 on (`tests/playTests.sh`, "output is not
+/// written through a dangling symbolic link").
+#[cfg(unix)]
+#[test]
+fn an_output_link_is_replaced_with_f_and_never_written_through() {
+    let scratch = Scratch::new("output-link");
+    let plain = scratch.path().join("hello");
+    fs::write(&plain, b"hello world\n").unwrap();
+    let plain = plain.to_str().unwrap();
+    assert_eq!(run(parse(&["-q", "--rm", plain]).unwrap()).unwrap(), 0);
+    let frame = format!("{plain}.zst");
+    let target = scratch.path().join("tmpLinkTarget");
+    std::os::unix::fs::symlink(&target, plain).unwrap();
+
+    let refused = run(parse(&["-q", "-d", &frame]).unwrap());
+    assert!(!matches!(refused, Ok(0)), "{refused:?}");
+    assert!(!target.exists(), "nothing is written through the link");
+
+    assert_eq!(run(parse(&["-q", "-d", "-f", &frame]).unwrap()).unwrap(), 0);
+    let replaced = fs::symlink_metadata(plain).unwrap();
+    assert!(replaced.is_file(), "a regular file replaced the link");
+    assert_eq!(fs::read(plain).unwrap(), b"hello world\n");
+    assert!(!target.exists(), "the link's target is still untouched");
 }
 
 /// A symbolic link to a file at `link`. Windows makes one only with the
@@ -8678,8 +8829,10 @@ fn benchmark_lines_follow_the_reference_layout() {
     // the tagged rows alone (`benchzstd.c:955`).
     let quiet = |args: &[&str]| bench_quiet_header(&parse(args).unwrap(), 7692);
     assert_eq!(
-        quiet(&["-b", "-q", "-B64K", "f"]).as_deref(),
-        Some("bench 1.5.7 : input 7692 bytes, 3 seconds, 64 KB blocks")
+        quiet(&["-b", "-q", "-B64K", "f"]),
+        Some(format!(
+            "bench {UPSTREAM_VERSION} : input 7692 bytes, 3 seconds, 64 KB blocks"
+        ))
     );
     assert_eq!(quiet(&["-b", "-q", "-p7", "f"]), None);
     assert!(quiet(&["-b", "-q", "-p0", "f"]).is_some());

@@ -33,12 +33,6 @@ pub(crate) const ZSTD_DCT_AUTO: c_int = 0;
 pub(crate) const ZSTD_DCT_RAW_CONTENT: c_int = 1;
 pub(crate) const ZSTD_DCT_FULL_DICT: c_int = 2;
 
-/// Synthetic non-zero ID for raw-content dictionaries. The encoder attach
-/// path requires a non-zero ID, but raw-content frames never put it on the
-/// wire (the ID flag is suppressed); the decoder side uses the same constant
-/// so an ID-less frame resolves against the same dictionary object.
-const RAW_CONTENT_DICT_ID: u32 = u32::MAX;
-
 /// Dictionary state attached to a compression context. Every dictionary is
 /// held prepared for compression, so the context's compressors attach it by
 /// reference however many frames use it.
@@ -191,8 +185,11 @@ pub(crate) unsafe fn parse_decode_dict_as(
         };
         return parsed.map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     }
+    // ID 0, as upstream's raw-content DDict has (`ZSTD_getDictID_fromDDict`):
+    // under `ZSTD_d_refMultipleDDicts` it is the entry a frame naming no
+    // dictionary takes.
     // SAFETY: the caller's contract, passed on.
-    let parsed = Dictionary::from_raw_content(RAW_CONTENT_DICT_ID, unsafe { load.hold(dict) })
+    let parsed = Dictionary::from_raw_content(0, unsafe { load.hold(dict) })
         .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
     Ok(DictionaryHandle::from_dictionary(parsed))
 }
@@ -401,6 +398,19 @@ impl DCtxDictAttach {
             | DCtxDictAttach::RefDDict { handle, .. }
             | DCtxDictAttach::Prefix { handle } => core::slice::from_ref(handle),
             DCtxDictAttach::RefDDicts { handles } => handles,
+        }
+    }
+
+    /// The one dictionary a frame decodes with whatever ID it names, when the
+    /// attach is a single one; `None` for no dictionary or a
+    /// `ZSTD_d_refMultipleDDicts` set, which [`Self::handles`] gives the codec
+    /// to choose from by ID.
+    pub(crate) fn single(&self) -> Option<&DictionaryHandle> {
+        match self {
+            DCtxDictAttach::Load { handle }
+            | DCtxDictAttach::RefDDict { handle, .. }
+            | DCtxDictAttach::Prefix { handle } => Some(handle),
+            DCtxDictAttach::None | DCtxDictAttach::RefDDicts { .. } => None,
         }
     }
 }

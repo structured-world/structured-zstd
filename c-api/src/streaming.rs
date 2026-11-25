@@ -1087,6 +1087,7 @@ fn enter_stream_frame(
         // A v0.5-v0.7 header is measured by its own size fields; once whole,
         // the decoder starts it from the same reader (upstream's
         // `ZSTD_decompressStream` hands such a frame to its legacy streams).
+        #[cfg(feature = "legacy")]
         if !dctx.magicless
             && let Some(version) = codec::decoding::LegacyVersion::of(view)
         {
@@ -1110,6 +1111,10 @@ fn enter_stream_frame(
                 inp.pos += 8 - held_len;
                 dctx.stream_entry = StreamEntry::Skip(u64::from(length));
                 dctx.stream_frame_done = false;
+                // The frame spends a single-use prefix as any frame does:
+                // upstream takes it (`ZSTD_getDDict`) before telling a
+                // skippable header from an ordinary one (`zdss_loadHeader`).
+                dctx.consume_prefix();
             }
             // The header runs past the input: all of it is held, and the
             // frame has begun.
@@ -1177,9 +1182,10 @@ fn start_stream_frame(
     // `refPrefix`): start the frame against it; an attached prefix is
     // single-use and consumed by this frame.
     let decoder = &mut dctx.decoder;
-    let attached = dctx.attached_ddict.handles();
-    let reset = catch_unwind(AssertUnwindSafe(|| {
-        decoder.reset_with_dict_handles(&mut reader, attached)
+    let attached = &dctx.attached_ddict;
+    let reset = catch_unwind(AssertUnwindSafe(|| match attached.single() {
+        Some(dict) => decoder.reset_with_dict_handle(&mut reader, dict),
+        None => decoder.reset_with_dict_handles(&mut reader, attached.handles()),
     }));
     match reset {
         Ok(Ok(())) => {

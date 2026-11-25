@@ -21,9 +21,7 @@ use crate::ffi::{in_slice, out_slice};
 use crate::params::{CONTENTSIZE_UNKNOWN, ZSTD_parameters};
 use crate::streaming::{CStreamState, FrameSetup};
 
-/// How a buffer-less frame was begun, kept so `ZSTD_copyCCtx` can begin
-/// another one the same way.
-#[derive(Clone)]
+/// How a buffer-less frame is begun.
 pub(crate) struct BufferlessBegin {
     params: CCtxParams,
     frame_params: Option<CompressionParameters>,
@@ -35,18 +33,10 @@ pub(crate) struct BufferlessBegin {
 
 /// A buffer-less frame in progress on a context.
 pub(crate) struct BufferlessFrame {
-    begin: BufferlessBegin,
     /// Nothing is compressed into the frame yet: its header still waits in
     /// the stream's pending output, for the first `ZSTD_compressContinue`
     /// to hand out or the first `ZSTD_compressBlock` to drop.
     fresh: bool,
-}
-
-impl BufferlessFrame {
-    /// The dictionary the frame was begun with, kept for `ZSTD_copyCCtx`.
-    pub(crate) fn dictionary(&self) -> Option<&EncoderDictionary> {
-        self.begin.dictionary.as_ref()
-    }
 }
 
 impl BufferlessBegin {
@@ -123,7 +113,7 @@ fn begin_frame(cctx: &mut ZSTD_CCtx, begin: BufferlessBegin) -> usize {
     }));
     match outcome {
         Ok(Ok(())) => {
-            cctx.bufferless = Some(BufferlessFrame { begin, fresh: true });
+            cctx.bufferless = Some(BufferlessFrame { fresh: true });
             cctx.progress = FrameProgress::default();
             0
         }
@@ -460,52 +450,6 @@ pub unsafe extern "C" fn ZSTD_getBlockSize(cctx: *const ZSTD_CCtx) -> usize {
         .and_then(|cctx| cctx.stream.as_ref())
         .and_then(|stream| stream.context.frame_block_size())
         .unwrap_or(codec::MAX_BLOCK_SIZE as usize)
-}
-
-/// `size_t ZSTD_copyCCtx(ZSTD_CCtx* dstCCtx, const ZSTD_CCtx* srcCCtx,
-/// unsigned long long pledgedSrcSize)` — begin on `dstCCtx` the buffer-less
-/// frame `srcCCtx` was begun with, before anything was compressed into it,
-/// with its own pledge (`0` or `ZSTD_CONTENTSIZE_UNKNOWN` = unknown, as
-/// upstream reads it) and the default frame flags.
-///
-/// # Safety
-/// Both contexts live or `NULL`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_copyCCtx(
-    dst_cctx: *mut ZSTD_CCtx,
-    src_cctx: *const ZSTD_CCtx,
-    pledged_src_size: u64,
-) -> usize {
-    if dst_cctx.is_null() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-    }
-    // The source is read, and its borrow ended, before the destination is
-    // borrowed mutably: the two may be the same context.
-    let begin = {
-        let Some(src) = (unsafe { src_cctx.as_ref() }) else {
-            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-        };
-        let Some(frame) = src.bufferless.as_ref().filter(|frame| frame.fresh) else {
-            return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-        };
-        // 0 is unknown here, whatever the note beside the declaration in
-        // zstd.h suggests: upstream converts it (zstd_compress.c:2596) and its
-        // own callers rely on that, copying with 0 and then compressing input
-        // (tests/fuzzer.c:2450, 4885). Reading it as an empty frame would
-        // refuse what every upstream build accepts.
-        let pledged = if pledged_src_size == 0 {
-            CONTENTSIZE_UNKNOWN
-        } else {
-            pledged_src_size
-        };
-        let mut begin = frame.begin.clone();
-        begin.params.pledged_src_size = pledged;
-        begin.params.content_size_flag = pledged != CONTENTSIZE_UNKNOWN;
-        begin.params.checksum_flag = false;
-        begin.params.dict_id_flag = true;
-        begin
-    };
-    begin_frame(unsafe { &mut *dst_cctx }, begin)
 }
 
 /// Where a buffer-less decode stands: which part of the frame the next
@@ -933,43 +877,5 @@ pub unsafe extern "C" fn ZSTD_insertBlock(
     match dctx.decoder.insert_block(block) {
         Ok(()) => block_size,
         Err(err) => encode(code_for_decoder_error(&err)),
-    }
-}
-
-/// `void ZSTD_copyDCtx(ZSTD_DCtx* dctx, const ZSTD_DCtx* preparedDCtx)` —
-/// make `dctx` a copy of `preparedDCtx` as `ZSTD_decompressBegin*` left it:
-/// its format, window limit, dictionaries and buffer-less run, ready for its
-/// first frame or block. A run part-way through a frame is copied as begun
-/// afresh with the same dictionary.
-///
-/// # Safety
-/// Both contexts live or `NULL`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_copyDCtx(dctx: *mut ZSTD_DCtx, prepared_dctx: *const ZSTD_DCtx) {
-    // Compared as pointers before any reference exists: a `&mut` and a `&` to
-    // one context would alias.
-    if core::ptr::eq(dctx.cast_const(), prepared_dctx) {
-        return;
-    }
-    let (Some(dst), Some(src)) = (unsafe { dctx.as_mut() }, unsafe { prepared_dctx.as_ref() })
-    else {
-        return;
-    };
-    dst.max_window_size = src.max_window_size;
-    dst.magicless = src.magicless;
-    dst.decoder.set_magicless(src.magicless);
-    dst.content_checksum = src.content_checksum;
-    dst.ref_multiple_ddicts = src.ref_multiple_ddicts;
-    dst.max_block_size = src.max_block_size;
-    dst.apply_max_block_size();
-    dst.stable_out_buffer = src.stable_out_buffer;
-    dst.disable_huffman_assembly = src.disable_huffman_assembly;
-    dst.set_attached_ddict(src.attached_ddict.clone());
-    let dictionary = src.bufferless.dictionary.clone();
-    // `begin_decode` leaves `dst` at the start of a run with the same
-    // dictionary, the documented copy. A copy cannot fail, so a begin that
-    // fails leaves `dst` with the settings and no run.
-    if crate::error::result_is_error(begin_decode(dst, dictionary)) {
-        dst.bufferless = BufferlessDecode::new(dst.magicless);
     }
 }

@@ -1839,9 +1839,9 @@ fn decoder_header_len(frame: &[u8]) -> usize {
     usize::from(crate::decoding::frame::read_frame_header(frame).unwrap().1)
 }
 
-/// Given a choice of dictionaries, a frame decodes with the one its header
-/// names wherever it sits in the list; a list without it is a mismatch, and
-/// an empty list decodes as no dictionary does.
+/// Given a set of dictionaries, a frame decodes with the one its header names
+/// wherever it sits in the set; a set without it does not provide it, and an
+/// empty set decodes as no dictionary does.
 #[test]
 fn dict_handles_pick_the_one_the_frame_names() {
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
@@ -1876,12 +1876,59 @@ fn dict_handles_pick_the_one_the_frame_names() {
 
     assert!(matches!(
         decoder.decode_all_with_dict_handles(&frame, &mut out, &[other]),
-        Err(FrameDecoderError::DictIdMismatch { .. })
+        Err(FrameDecoderError::DictNotProvided { .. })
     ));
     assert!(matches!(
         decoder.decode_all_with_dict_handles(&frame, &mut out, &[]),
         Err(FrameDecoderError::DictNotProvided { .. })
     ));
+}
+
+/// A frame that names no dictionary takes the set's ID-0 entry, or no
+/// dictionary when the set has none; never another entry. A frame naming an ID
+/// the set lacks fails (upstream 1.6.0 `ZSTD_DCtx_getFrameDDict`: ID 0 is the
+/// registered ID-0 DDict or none, a missing nonzero ID is `dictionary_wrong`).
+#[test]
+fn dict_set_takes_the_id_zero_entry_for_a_frame_naming_none() {
+    let content = b"raw dictionary content shared by the payload ".repeat(40);
+    let raw = DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, content.clone()).unwrap(),
+    );
+    let other = DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(9, b"unrelated content ".repeat(64)).unwrap(),
+    );
+    let payload: Vec<u8> = content[..1200].to_vec();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_dictionary_from_bytes(&content)
+        .expect("dict load");
+    compressor.set_source(payload.as_slice());
+    let mut frame = Vec::new();
+    compressor.set_drain(&mut frame);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; payload.len()];
+    // The ID-0 entry, wherever it sits in the set.
+    let n = decoder
+        .decode_all_with_dict_handles(&frame, &mut out, &[raw.clone(), other.clone()])
+        .expect("the ID-0 entry decodes a frame naming none");
+    assert!(
+        out[..n] == payload[..],
+        "decoded with another entry of the set"
+    );
+
+    // No ID-0 entry: no dictionary, so a plain frame starts with none. A fresh
+    // decoder, as `dictionary` also reports the one kept from a past frame.
+    let plain = crate::encoding::compress_to_vec(&b"payload"[..], CompressionLevel::Fastest);
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .reset_with_dict_handles(plain.as_slice(), core::slice::from_ref(&other))
+        .expect("a frame naming none starts without a dictionary");
+    assert!(
+        decoder.dictionary().is_none(),
+        "no entry of the set applies"
+    );
 }
 
 #[test]
