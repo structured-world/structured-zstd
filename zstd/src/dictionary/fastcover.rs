@@ -231,6 +231,7 @@ impl<'s> FastCoverContext<'s> {
     /// Pick a segment per epoch visit until `out` is filled from its end, and
     /// return where the content starts in it. `H` is the number of bytes a
     /// dmer hashes.
+    #[inline(never)]
     fn select_segments<const H: usize, C: WindowCount>(
         &self,
         out: &mut [u8],
