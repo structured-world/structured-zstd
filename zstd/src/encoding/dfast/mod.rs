@@ -3989,6 +3989,10 @@ macro_rules! start_matching_dict_loop_body {
                                 )
                             };
                             if dfast_branch!(2, cand4 == cur4) {
+                                // The match paths are laid out of the scan path,
+                                // so a miss runs straight through to the next
+                                // probe, as upstream's scan path does.
+                                core::hint::cold_path();
                                 let cand_r = live_abs.wrapping_add(cand_rel);
                                 let match_len = if in_live {
                                     // SAFETY: same buffer; the length caps the scan
@@ -4035,6 +4039,7 @@ macro_rules! start_matching_dict_loop_body {
                                 .read_unaligned()
                         };
                         if dfast_branch!(5, cand_v8 == v8) {
+                            core::hint::cold_path();
                             let cand_abs = position_base + (idxl as usize) - 1;
                             // SAFETY: the slot names a live position before the
                             // cursor; the length caps the scan to the block.
@@ -4070,6 +4075,7 @@ macro_rules! start_matching_dict_loop_body {
                                 let dcand_v8 =
                                     unsafe { (window_ptr.add(dp) as *const u64).read_unaligned() };
                                 if dfast_branch!(8, dcand_v8 == v8) {
+                                    core::hint::cold_path();
                                     let match_len = dict_match_len(dp, ip, 8);
                                     let cand = extend_back(
                                         history_abs_start + dp,
