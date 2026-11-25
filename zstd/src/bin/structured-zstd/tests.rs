@@ -4821,6 +4821,28 @@ fn an_oversized_dictionary_is_refused_before_it_is_read() {
     );
 }
 
+/// A decode's `-D` dictionary is held twice, as read and as parsed, so a limit
+/// covers it exactly when it covers both copies, and a limit below that is
+/// refused naming the dictionary.
+#[test]
+fn a_decode_dictionary_fits_a_limit_covering_both_copies() {
+    check_decode_dictionary(16 * 1024, 8 * 1024).expect("two copies fit exactly");
+    check_decode_dictionary(1 << 20, 0).expect("no dictionary bytes");
+    let err = check_decode_dictionary(16 * 1024 - 1, 8 * 1024)
+        .expect_err("one byte short")
+        .to_string();
+    assert!(err.contains("does not cover the dictionary"), "{err}");
+    // Twice a size past half the range overflows and cannot fit any limit.
+    assert!(check_decode_dictionary(u64::MAX, u64::MAX / 2 + 1).is_err());
+}
+
+/// `--version` goes to stdout through the same text the tests read.
+#[test]
+fn print_version_writes_the_version() {
+    print_version(0);
+    print_version(DEFAULT_LEVEL + 2);
+}
+
 /// Benchmarking holds the whole input and a decompressed copy of it, which is
 /// the largest thing the run allocates by far. A ceiling that weighs the
 /// decoder's window and ignores those buffers is a promise kept in the small
