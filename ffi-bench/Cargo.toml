@@ -271,6 +271,10 @@ path = "../zstd/examples/encode_loop_oneshot_z000033.rs"
 required-features = ["dict-builder"]
 
 [[example]]
+name = "train_loop_fastcover"
+path = "../zstd/examples/train_loop_fastcover.rs"
+
+[[example]]
 name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 
