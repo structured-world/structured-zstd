@@ -1973,7 +1973,21 @@ impl Matcher for MatchGeneratorDriver {
                 hc.configure(hc_cfg, strategy_tag, params.window_log);
                 // The attached dictionary tree takes the CDict's `hashLog`, as
                 // the Fast and Dfast attached tables do.
-                hc.table.dict_table_hash_log = dict_tables.map_or(0, |cd| cd.hash_log as usize);
+                // A primed tree of another width is dropped here, as the Fast
+                // backend's `set_dict_table_hash_log` does: the reset below
+                // re-borrows a primed tree without the shape check of the
+                // build, and source-capped live widths can stay the same while
+                // the CDict's changes.
+                let dict_hash_log = dict_tables.map_or(0, |cd| cd.hash_log as usize);
+                if hc
+                    .table
+                    .dms
+                    .table()
+                    .is_some_and(|t| t.hash_log != dict_hash_log)
+                {
+                    hc.table.dms.invalidate();
+                }
+                hc.table.dict_table_hash_log = dict_hash_log;
                 // A copy-mode frame merges the dictionary into the live tables,
                 // so the previous attach frame's dms must not be re-borrowed
                 // under it (the same decision the prime makes, taken here
