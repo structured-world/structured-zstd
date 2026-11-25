@@ -52,14 +52,23 @@ CLI_TESTS="$UPSTREAM/tests/cli-tests"
 # basic/version.sh, progress/: they expect the reference's own banner
 #   (`*** Zstandard CLI ... by Yann Collet ***`) and progress wording; this
 #   command names itself and draws its own progress.
-# cltools/zstdless.sh: it tests the reference's `zstdless` script, which this
-#   project does not ship, through the host's `less`, and expects the status
-#   of an older `less` (less 710 exits 1 on a missing file, so it fails with
-#   the reference binary too).
 rm -rf "$CLI_TESTS/file-stat" "$CLI_TESTS/progress"
-rm -f "$CLI_TESTS/cltools/zstdless.sh"*
 rm -f "$CLI_TESTS/basic/version.sh"*
 rm -f "$CLI_TESTS/compression/adapt.sh"* "$CLI_TESTS/compression/multi-threaded.sh"*
+# cltools/zstdless.sh runs `zstdless bad.zst` under `set -e`, so it also
+# asserts the exit status of `less`, which `zstdless` execs: less 668 exits 0
+# on a missing file, less 710 exits 1 (with the reference binary as well).
+# That status is the pager's, so the step may fail; its expected stderr still
+# checks this command's `can't stat` message, and the other steps keep
+# `set -e`. Stops if the step is no longer spelled this way.
+ZSTDLESS_TEST="$CLI_TESTS/cltools/zstdless.sh"
+ZSTDLESS_BODY="$(<"$ZSTDLESS_TEST")"
+ZSTDLESS_FIXED="${ZSTDLESS_BODY/zstdless bad.zst >&2/zstdless bad.zst >&2 || true}"
+if [[ "$ZSTDLESS_FIXED" == "$ZSTDLESS_BODY" ]]; then
+  echo "cltools/zstdless.sh no longer has the bad-path step this script adjusts" >&2
+  exit 1
+fi
+printf '%s\n' "$ZSTDLESS_FIXED" > "$ZSTDLESS_TEST"
 python3 "$CLI_TESTS/run.py" --zstd "$ZSTD_BIN" --datagen "$DATAGEN_BIN"
 
 if [[ "$KEEP_WORK" == 0 ]]; then
