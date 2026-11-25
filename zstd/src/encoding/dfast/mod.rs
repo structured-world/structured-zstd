@@ -3960,6 +3960,45 @@ macro_rules! start_matching_dict_loop_body {
                         *long_hash_ptr.add(hl_idx) = packed_curr;
                         *short_hash_ptr.add(hs_idx) = packed_curr;
                     }
+                    // Warm the four slots the next position probes on a miss,
+                    // the common outcome, so their loads overlap this one's
+                    // checks instead of following them.
+                    {
+                        let next = ip + ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                        if next <= scan_limit {
+                            // SAFETY: `next <= scan_limit` keeps its 8 bytes in
+                            // the block.
+                            let nv8 =
+                                unsafe { (block_ptr.add(next) as *const u64).read_unaligned() };
+                            let nl = nv8.wrapping_mul(PRIME);
+                            let ns = short_key::<$mls>(nv8).wrapping_mul(PRIME);
+                            let prefetch = crate::decoding::prefetch::prefetch_l1_at;
+                            prefetch(
+                                long_hash_ptr
+                                    .wrapping_add(dfast_slot(nl, long_shift))
+                                    .cast(),
+                            );
+                            prefetch(
+                                short_hash_ptr
+                                    .wrapping_add(dfast_slot(ns, short_shift))
+                                    .cast(),
+                            );
+                            prefetch(
+                                dict_long_ptr
+                                    .wrapping_add(
+                                        dfast_slot_and_tag::<true>(nl, dict_long_key_shift).0,
+                                    )
+                                    .cast(),
+                            );
+                            prefetch(
+                                dict_short_ptr
+                                    .wrapping_add(
+                                        dfast_slot_and_tag::<true>(ns, dict_short_key_shift).0,
+                                    )
+                                    .cast(),
+                            );
+                        }
+                    }
 
                     // Repcode at ip+1, 4-byte gate (zstd_double_fast.c:407-415).
                     // `ip + 8 <= block_len` from the loop guard covers the read.
