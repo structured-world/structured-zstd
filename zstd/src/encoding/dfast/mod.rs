@@ -4026,15 +4026,22 @@ macro_rules! start_matching_dict_loop_body {
                     // no-dictionary loop: with two, the compiler tests the floor
                     // first, and slots a previous frame left below it make that
                     // branch mispredict.
-                    if dfast_branch!(4, idxl.wrapping_sub(min_slot) < packed_curr - min_slot) {
-                        // SAFETY: the gates admit only slots naming a position at
-                        // or after the window floor and before the cursor, so this
-                        // lands inside live history.
+                    // A quarter of the slots name the window and the rest a
+                    // previous frame, in no pattern a predictor can learn, so
+                    // the window test selects the address instead of branching:
+                    // a slot out of window reads the live start, always readable,
+                    // and its compare is masked off. Only a hit branches.
+                    {
+                        let in_window = idxl.wrapping_sub(min_slot) < packed_curr - min_slot;
+                        let read_slot = core::hint::select_unpredictable(in_window, idxl, min_slot);
+                        // SAFETY: `read_slot` names a position at or after the
+                        // window floor and before the cursor: inside live history,
+                        // with the cursor's 8 bytes of lookahead past it.
                         let cand_v8 = unsafe {
-                            (slot_base_ptr.wrapping_add(idxl as usize) as *const u64)
+                            (slot_base_ptr.wrapping_add(read_slot as usize) as *const u64)
                                 .read_unaligned()
                         };
-                        if dfast_branch!(5, cand_v8 == v8) {
+                        if dfast_branch!(5, in_window & (cand_v8 == v8)) {
                             let cand_abs = position_base + (idxl as usize) - 1;
                             // SAFETY: the slot names a live position before the
                             // cursor; the length caps the scan to the block.
@@ -4092,19 +4099,16 @@ macro_rules! start_matching_dict_loop_body {
                     // the dictionary.
                     let short_cand_abs: usize;
                     let short_in_dict: bool;
-                    if dfast_branch!(9, idxs.wrapping_sub(min_slot) < packed_curr - min_slot) {
-                        // SAFETY: as for the long slot above.
-                        let cand4 = unsafe {
-                            (slot_base_ptr.wrapping_add(idxs as usize) as *const u32)
-                                .read_unaligned()
-                        };
-                        if dfast_branch!(10, cand4 != v4) {
-                            ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
-                            if dfast_branch!(24, ip > scan_limit) {
-                                break 'inner DfastInnerExit::Tail(ip);
-                            }
-                            continue 'inner;
-                        }
+                    // The window test selects the address, as for the long slot.
+                    let short_in_window = idxs.wrapping_sub(min_slot) < packed_curr - min_slot;
+                    let short_read_slot =
+                        core::hint::select_unpredictable(short_in_window, idxs, min_slot);
+                    // SAFETY: as for the long slot above.
+                    let cand4 = unsafe {
+                        (slot_base_ptr.wrapping_add(short_read_slot as usize) as *const u32)
+                            .read_unaligned()
+                    };
+                    if dfast_branch!(10, short_in_window & (cand4 == v4)) {
                         short_cand_abs = position_base + (idxs as usize) - 1;
                         short_in_dict = false;
                     } else {
@@ -4115,8 +4119,11 @@ macro_rules! start_matching_dict_loop_body {
                         // SAFETY: the index is below the dict short table's length.
                         let ds = unsafe { *dict_short_ptr.add(ds_slot) };
                         let mut found = usize::MAX;
-                        // An empty slot fails the bound, as for the long probe.
-                        if dfast_branch!(11, (ds & DFAST_TAG_MASK) == ds_tag) {
+                        // Only a live slot out of window defers to the dictionary
+                        // (upstream's `else if`, zstd_double_fast.c:440); a live
+                        // miss in window does not. An empty slot fails the bound,
+                        // as for the long probe.
+                        if dfast_branch!(11, !short_in_window & ((ds & DFAST_TAG_MASK) == ds_tag)) {
                             let dp = ((ds >> DFAST_TAG_BITS) as usize).wrapping_sub(1);
                             if dfast_branch!(12, dp < dict_end) {
                                 debug_assert!(dp + 4 <= dict_end);
