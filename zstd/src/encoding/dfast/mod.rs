@@ -3951,6 +3951,19 @@ macro_rules! start_matching_dict_loop_body {
                     // SAFETY: both indices are below their table's length.
                     let (idxl, idxs) =
                         unsafe { (*long_hash_ptr.add(hl_idx), *short_hash_ptr.add(hs_idx)) };
+                    // The dictionary's two slots are read here too, before any
+                    // test, as upstream reads them (zstd_double_fast.c:389-392):
+                    // independent of the live probes, the four loads then overlap
+                    // instead of the dictionary's waiting on a live miss.
+                    let (dl_slot, dl_tag) =
+                        dfast_slot_and_tag::<true>(v8.wrapping_mul(PRIME), dict_long_key_shift);
+                    let (ds_slot, ds_tag) = dfast_slot_and_tag::<true>(
+                        short_key::<$mls>(v8).wrapping_mul(PRIME),
+                        dict_short_key_shift,
+                    );
+                    // SAFETY: both indices are below their dictionary table's length.
+                    let (dl, ds) =
+                        unsafe { (*dict_long_ptr.add(dl_slot), *dict_short_ptr.add(ds_slot)) };
                     // Both tables updated at the cursor BEFORE the checks, as the
                     // reference does (zstd_double_fast.c:404): a self-collision on
                     // the `+1` long retry then resolves to a real match rather than
@@ -4051,10 +4064,6 @@ macro_rules! start_matching_dict_loop_body {
                         }
                     }
                     {
-                        let (dl_slot, dl_tag) =
-                            dfast_slot_and_tag::<true>(v8.wrapping_mul(PRIME), dict_long_key_shift);
-                        // SAFETY: the index is below the dict long table's length.
-                        let dl = unsafe { *dict_long_ptr.add(dl_slot) };
                         // The tag rejects a colliding slot without touching the
                         // dictionary bytes (upstream `ZSTD_comparePackedTags`). An
                         // empty slot whose tag happens to agree decodes to a
@@ -4108,12 +4117,6 @@ macro_rules! start_matching_dict_loop_body {
                         short_cand_abs = position_base + (idxs as usize) - 1;
                         short_in_dict = false;
                     } else {
-                        let (ds_slot, ds_tag) = dfast_slot_and_tag::<true>(
-                            short_key::<$mls>(v8).wrapping_mul(PRIME),
-                            dict_short_key_shift,
-                        );
-                        // SAFETY: the index is below the dict short table's length.
-                        let ds = unsafe { *dict_short_ptr.add(ds_slot) };
                         let mut found = usize::MAX;
                         // An empty slot fails the bound, as for the long probe.
                         if dfast_branch!(11, (ds & DFAST_TAG_MASK) == ds_tag) {
