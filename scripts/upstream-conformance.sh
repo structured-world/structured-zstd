@@ -52,7 +52,12 @@ CLI_TESTS="$UPSTREAM/tests/cli-tests"
 # basic/version.sh, progress/: they expect the reference's own banner
 #   (`*** Zstandard CLI ... by Yann Collet ***`) and progress wording; this
 #   command names itself and draws its own progress.
+# cltools/zstdless.sh: it tests the reference's `zstdless` script, which this
+#   project does not ship, through the host's `less`, and expects the status
+#   of an older `less` (less 710 exits 1 on a missing file, so it fails with
+#   the reference binary too).
 rm -rf "$CLI_TESTS/file-stat" "$CLI_TESTS/progress"
+rm -f "$CLI_TESTS/cltools/zstdless.sh"*
 rm -f "$CLI_TESTS/basic/version.sh"*
 rm -f "$CLI_TESTS/compression/adapt.sh"* "$CLI_TESTS/compression/multi-threaded.sh"*
 python3 "$CLI_TESTS/run.py" --zstd "$ZSTD_BIN" --datagen "$DATAGEN_BIN"
