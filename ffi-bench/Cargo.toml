@@ -275,6 +275,10 @@ name = "train_loop_fastcover"
 path = "../zstd/examples/train_loop_fastcover.rs"
 
 [[example]]
+name = "dict_samples_loop"
+path = "../zstd/examples/dict_samples_loop.rs"
+
+[[example]]
 name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 

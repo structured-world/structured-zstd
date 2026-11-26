@@ -278,6 +278,11 @@ name = "dfast_branch_profile"
 path = "examples/dfast_branch_profile.rs"
 required-features = ["kernel-trace", "dict-builder"]
 
+[[example]]
+name = "dict_samples_branch_profile"
+path = "examples/dict_samples_branch_profile.rs"
+required-features = ["kernel-trace", "dict-builder"]
+
 # All benches, integration tests, and FFI diagnostic examples are targets of
 # the non-published `ffi-bench` crate (they link the C `zstd` bindings); their
 # source files remain under `benches/`, `tests/`, and `examples/` here and are
