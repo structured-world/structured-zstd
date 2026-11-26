@@ -3939,7 +3939,10 @@ macro_rules! start_matching_dict_loop_body {
 
                 let mut ip = pos;
                 let inner_exit: DfastInnerExit = 'inner: loop {
-                    let abs_ip = $current_abs_start + ip;
+                    // The cursor's absolute position and `ip + 1` are formed
+                    // only on the paths that commit a match: computed here,
+                    // each was held across the probes through a stack slot
+                    // every position for a reader that a miss never reaches.
                     let packed_curr = (ip as u32) + packed_bias;
                     // SAFETY: the loop guard keeps `ip + 8 <= block_len`.
                     let v8 = unsafe { (block_ptr.add(ip) as *const u64).read_unaligned() };
@@ -3976,7 +3979,9 @@ macro_rules! start_matching_dict_loop_body {
                     // straddle the seam is rejected, and only a 4-byte hit pays for
                     // a count (upstream zstd (zstd_double_fast.c:400-410)).
                     {
-                        debug_assert!(rep1 != 0 && rep1 <= abs_ip + 1 - history_abs_start);
+                        debug_assert!(
+                            rep1 != 0 && rep1 <= $current_abs_start + ip + 1 - history_abs_start
+                        );
                         // `cand_r - live_abs`, wrapping below zero in the
                         // dictionary.
                         let cand_rel = ip.wrapping_add(rep_rel);
@@ -4016,11 +4021,11 @@ macro_rules! start_matching_dict_loop_body {
                                 if dfast_branch!(3, match_len >= DFAST_REP_MIN_MATCH_LEN) {
                                     let cand = extend_back(
                                         cand_r,
-                                        abs_ip + 1,
+                                        $current_abs_start + ip + 1,
                                         match_len,
                                         ip + 1 - literals_start,
                                     );
-                                    break 'inner DfastInnerExit::Committed(cand, 0, abs_ip);
+                                    break 'inner DfastInnerExit::Committed(cand, 0, ip);
                                 }
                             }
                         }
@@ -4056,9 +4061,13 @@ macro_rules! start_matching_dict_loop_body {
                                     block_len - (ip + 8),
                                 )
                             };
-                            let cand =
-                                extend_back(cand_abs, abs_ip, match_len, ip - literals_start);
-                            break 'inner DfastInnerExit::Committed(cand, 1, abs_ip);
+                            let cand = extend_back(
+                                cand_abs,
+                                $current_abs_start + ip,
+                                match_len,
+                                ip - literals_start,
+                            );
+                            break 'inner DfastInnerExit::Committed(cand, 1, ip);
                         }
                     }
                     {
@@ -4084,11 +4093,11 @@ macro_rules! start_matching_dict_loop_body {
                                     let match_len = dict_match_len(dp, ip, 8);
                                     let cand = extend_back(
                                         history_abs_start + dp,
-                                        abs_ip,
+                                        $current_abs_start + ip,
                                         match_len,
                                         ip - literals_start,
                                     );
-                                    break 'inner DfastInnerExit::Committed(cand, 3, abs_ip);
+                                    break 'inner DfastInnerExit::Committed(cand, 3, ip);
                                 }
                             }
                         }
@@ -4170,8 +4179,12 @@ macro_rules! start_matching_dict_loop_body {
                             )
                         }
                     };
-                    let short_cand =
-                        extend_back(short_cand_abs, abs_ip, s_match_len, ip - literals_start);
+                    let short_cand = extend_back(
+                        short_cand_abs,
+                        $current_abs_start + ip,
+                        s_match_len,
+                        ip - literals_start,
+                    );
                     // A bare 4-byte hash hit mints a wire offset that costs more
                     // than the four bytes buy, so it is only taken from 5 up; the
                     // `+1` upgrade below starts at 8 and is always above the floor.
@@ -4188,7 +4201,9 @@ macro_rules! start_matching_dict_loop_body {
                         let hl1_idx = dfast_slot(v8_1.wrapping_mul(PRIME), long_shift);
                         // SAFETY: the index is below the long table's length.
                         let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
-                        let packed_next = packed_curr + 1;
+                        // From the cursor, not from `packed_curr`, which would
+                        // then live past the table writes into this path.
+                        let packed_next = ((ip + 1) as u32) + packed_bias;
                         // The probed position is indexed as upstream indexes it
                         // (`hashLong[hl3] = curr + 1`, zstd_double_fast.c:459):
                         // nothing else writes it, since the complementary
@@ -4218,7 +4233,7 @@ macro_rules! start_matching_dict_loop_body {
                                 if dfast_branch!(18, l1_len > short_cand.match_len) {
                                     chosen = extend_back(
                                         cand_abs,
-                                        abs_ip + 1,
+                                        $current_abs_start + ip + 1,
                                         l1_len,
                                         ip + 1 - literals_start,
                                     );
@@ -4246,7 +4261,7 @@ macro_rules! start_matching_dict_loop_body {
                                         if dfast_branch!(22, dl1_len > short_cand.match_len) {
                                             chosen = extend_back(
                                                 history_abs_start + dp1,
-                                                abs_ip + 1,
+                                                $current_abs_start + ip + 1,
                                                 dl1_len,
                                                 ip + 1 - literals_start,
                                             );
@@ -4261,7 +4276,7 @@ macro_rules! start_matching_dict_loop_body {
                         23,
                         upgraded || short_cand.match_len >= short_hit_floor::<$mls>()
                     ) {
-                        break 'inner DfastInnerExit::Committed(chosen, 2, abs_ip);
+                        break 'inner DfastInnerExit::Committed(chosen, 2, ip);
                     }
                     // A below-floor short hit with no upgrade: keep scanning.
                     ip = next;
@@ -4271,7 +4286,7 @@ macro_rules! start_matching_dict_loop_body {
                 };
 
                 match inner_exit {
-                    DfastInnerExit::Committed(candidate, _path_tag, scan_pos) => {
+                    DfastInnerExit::Committed(candidate, _path_tag, curr) => {
                         #[cfg(feature = "kernel-trace")]
                         if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
                             std::eprintln!(
@@ -4302,7 +4317,6 @@ macro_rules! start_matching_dict_loop_body {
                         // Complementary insertion (zstd_double_fast.c:510-515):
                         // long at `curr + 2` and `ip - 2`, short at `curr + 2` and
                         // `ip - 1`, each where its key is readable, in that order.
-                        let curr = scan_pos - $current_abs_start;
                         // A match ends at least 4 bytes past the position that
                         // found it, so all four positions sit at or before
                         // `pos`: with 8 bytes readable there, every key is, and
@@ -4414,8 +4428,8 @@ macro_rules! start_matching_dict_loop_body {
 }
 
 /// How the dictionary scan loop left its inner loop: with a match to emit
-/// (candidate, a path tag the `DFTRACE` gate prints, and the SCAN position the
-/// complementary insertion anchors on), or out of scan room at the first
+/// (candidate, a path tag the `DFTRACE` gate prints, and the scan position in
+/// the block the complementary insertion anchors on), or out of scan room at the first
 /// position it did not pack into the tables.
 enum DfastInnerExit {
     Committed(MatchCandidate, u8, usize),
