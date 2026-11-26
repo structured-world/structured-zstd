@@ -2228,6 +2228,34 @@ impl FastKernelMatcher {
         }
 
         let base = self.history.as_ptr();
+        // A range of one repeated byte (a block written as RLE unsearched):
+        // every position in it whose hash read stays inside it has the same
+        // key, so dense indexing stores to one slot again and again and only
+        // its last position is left there. The seam positions below it read
+        // other bytes and are indexed as ever; then that last position alone,
+        // which leaves the table exactly as the dense walk does.
+        if step == 1
+            && range_start <= last_hashable
+            && crate::encoding::repeated_byte(&self.history[range_start..history_len]).is_some()
+        {
+            if backfill_start < range_start {
+                self.prime_hash_table_stepped_dispatch(
+                    move |pos: usize| base.wrapping_add(pos),
+                    backfill_start,
+                    range_start - 1,
+                    0,
+                    1,
+                );
+            }
+            self.prime_hash_table_stepped_dispatch(
+                move |pos: usize| base.wrapping_add(pos),
+                last_hashable,
+                last_hashable,
+                0,
+                1,
+            );
+            return;
+        }
         // Owned path: history offsets are already the flat `[dict][input]`
         // coordinate (input is appended after the dict in `history`), so no
         // virtual rebase is needed.

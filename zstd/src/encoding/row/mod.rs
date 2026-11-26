@@ -4645,9 +4645,52 @@ impl RowMatchGenerator {
     }
 
     fn insert_positions<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
-        for pos in start..end {
+        // A range of one repeated byte to the end of the live bytes (a block
+        // written as RLE unsearched): every position in it with eight bytes
+        // ahead hashes to the same row and tag, so the walk only turns that
+        // row's head round and overwrites its slots, and the last `row_mask`
+        // inserts rewrite every slot the head cycles through. Turning the head
+        // by the inserts skipped and making those last ones leaves the row
+        // exactly as the whole walk does.
+        let row_mask = (1usize << ROW_LOG) - 1;
+        // Up to here every position has eight bytes ahead and hashes them
+        // whole; the last few hash four (`key_hash_raw`), a key of their own,
+        // and are inserted one by one after the shortcut, in their order.
+        let whole_key_end = (self.history_abs_start + self.live_history().len() + 1)
+            .saturating_sub(8)
+            .min(end);
+        let mut pos = start;
+        if whole_key_end > start + row_mask && start >= self.history_abs_start {
+            let from = start - self.history_abs_start;
+            if crate::encoding::repeated_byte(&self.live_history()[from..]).is_some()
+                && let Some((row, tag)) = self.hash_and_row(whole_key_end - 1)
+            {
+                self.turn_row_head::<ROW_LOG>(row, whole_key_end - start - row_mask);
+                for pos in whole_key_end - row_mask..whole_key_end {
+                    self.insert_at::<ROW_LOG>(pos, row, tag);
+                }
+                pos = whole_key_end;
+            }
+        }
+        for pos in pos..end {
             self.insert_position::<ROW_LOG>(pos);
         }
+    }
+
+    /// Turn `row`'s head as `steps` inserts would, writing nothing else: after
+    /// the first step the head cycles through the row's `row_mask` slots.
+    fn turn_row_head<const ROW_LOG: usize>(&mut self, row: usize, steps: usize) {
+        if steps == 0 {
+            return;
+        }
+        let row_mask = (1usize << ROW_LOG) - 1;
+        let row_base = row << ROW_LOG;
+        let mut head = self.row_tags()[row_base] as usize;
+        head = next_row_slot(head, row_mask);
+        for _ in 0..(steps - 1) % row_mask {
+            head = next_row_slot(head, row_mask);
+        }
+        self.row_tags_mut()[row_base] = head as u8;
     }
 
     fn insert_positions_with_step<const ROW_LOG: usize>(
@@ -5398,6 +5441,9 @@ mod rebase_tests;
 
 #[cfg(test)]
 mod layout_tests;
+
+#[cfg(test)]
+mod uniform_tests;
 
 #[cfg(all(
     test,

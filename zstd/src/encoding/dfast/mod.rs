@@ -2445,11 +2445,33 @@ impl DfastMatchGenerator {
                 }
             };
         }
+        // A dense range of one repeated byte to the end of the live bytes (a
+        // block written as RLE unsearched): every position in it has the same
+        // long key and the same short key, so the walk stores to the same two
+        // slots again and again and only the last long and the last short
+        // position are left there. Those two alone leave both tables exactly
+        // as the dense walk does.
+        // SAFETY: `start - history_abs_start < concat_len` (`start < end` and
+        // `end` is clamped to the live bytes), so the slice lies inside them.
+        let uniform = step == 1
+            && crate::encoding::repeated_byte(unsafe {
+                core::slice::from_raw_parts(
+                    history_base_ptr.add(history_start + start - history_abs_start),
+                    concat_len - (start - history_abs_start),
+                )
+            })
+            .is_some();
         let mut pos = start;
         if step == 1 {
+            if uniform && long_safe_end > pos {
+                pos = long_safe_end - 1;
+            }
             insert_long_range!(pos, true, 1);
         } else {
             insert_long_range!(pos, false, step);
+        }
+        if uniform && short_safe_end > pos {
+            pos = short_safe_end - 1;
         }
         while pos < short_safe_end {
             unsafe {

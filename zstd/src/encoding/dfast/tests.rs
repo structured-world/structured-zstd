@@ -12,6 +12,52 @@ fn bound(workspace: &mut Workspace, tagged: bool) -> DfastMatchGenerator {
     matcher
 }
 
+/// Inserting a block of one repeated byte stores only its last long and last
+/// short position and leaves both tables exactly as inserting every position
+/// does: the others share those two keys and are overwritten in turn. After
+/// mixed content, in both slot formats and at every short key width.
+#[test]
+fn a_repeated_byte_block_inserts_to_the_dense_tables() {
+    let prefix: alloc::vec::Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    for tagged in [false, true] {
+        for mls in 4..=7u8 {
+            for byte in [0u8, 0x41] {
+                let mut ws_a = Workspace::new();
+                let mut ws_b = Workspace::new();
+                let build = |ws: &mut Workspace| {
+                    // The key width lays the tables out anew, so it is set
+                    // before they are bound.
+                    let mut m = DfastMatchGenerator::new(1 << 20);
+                    m.set_hash_bits(12, 11);
+                    m.set_min_match(mls);
+                    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+                    ws.open(m.tables_workspace_bytes(), usize::MAX);
+                    m.bind_tables(ws, tagged);
+                    m.commit_input(&prefix);
+                    m.insert_positions(m.history_abs_start, m.history_abs_start + prefix.len());
+                    m.commit_input(alloc::vec![byte; 5000]);
+                    m
+                };
+                let mut range = build(&mut ws_a);
+                let mut each = build(&mut ws_b);
+                let start = range.history_abs_start + prefix.len();
+                let end = start + 5000;
+                range.insert_positions(start, end);
+                for pos in start..end {
+                    each.insert_position(pos);
+                }
+                assert_eq!(
+                    range.tables.as_mut_slice().to_vec(),
+                    each.tables.as_mut_slice().to_vec(),
+                    "tagged {tagged}, mls {mls}, byte {byte:#x}"
+                );
+            }
+        }
+    }
+}
+
 /// A tagged rebase moves every position by the reducer and keeps its tag;
 /// a position at or under the reducer empties. The base moves by the
 /// reducer in position units, not in slot units.

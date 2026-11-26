@@ -136,6 +136,16 @@ pub fn active_match_kernel_name() -> &'static str {
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
 
+/// The byte `bytes` repeats throughout, when it is one byte repeated (an empty
+/// slice repeats none). Asked as whether the slice equals itself shifted by
+/// one, which is a `memcmp` over the whole of it: vectorised, where a scan that
+/// stops at the first other byte runs a byte at a time.
+#[inline]
+pub(crate) fn repeated_byte(bytes: &[u8]) -> Option<u8> {
+    let (&first, rest) = bytes.split_first()?;
+    (rest == &bytes[..rest.len()]).then_some(first)
+}
+
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
 /// use structured_zstd::encoding::{compress, CompressionLevel};

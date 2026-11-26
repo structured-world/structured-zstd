@@ -604,6 +604,48 @@ fn skip_matching_with_none_hint_skips_hash_population() {
 /// just-arrived block for matching plus the retained prefix for
 /// cross-block lookups). The hard upper bound is therefore the
 /// eviction threshold itself: `2 × max_window_size`.
+/// Indexing a block of one repeated byte stores only its seam positions and
+/// its last one, and leaves the table exactly as indexing every position
+/// does: each of the others hashes to the same slot and is overwritten by the
+/// next. Checked after mixed content, so the seam reads other bytes, at every
+/// key width.
+#[test]
+fn a_repeated_byte_block_indexes_to_the_dense_table() {
+    let prefix: Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    for mls in 4..=8u32 {
+        for byte in [0u8, 0x41] {
+            let build = || {
+                let mut m = FastKernelMatcher::with_params(17, 12, mls, 2);
+                m.commit_input(&prefix);
+                m.skip_matching_with_hint(Some(false));
+                m.commit_input(alloc::vec![byte; 5000]);
+                m
+            };
+            let mut shortcut = build();
+            let start = shortcut.take_staged_block();
+            shortcut.prime_hash_table_for_range_stepped(start, 1);
+            let mut dense = build();
+            let start = dense.take_staged_block();
+            let last = dense.committed_len() - 8;
+            let base = dense.history.as_ptr();
+            dense.prime_hash_table_stepped_dispatch(
+                move |pos: usize| base.wrapping_add(pos),
+                start - 7,
+                last,
+                0,
+                1,
+            );
+            assert_eq!(
+                shortcut.hash_table.hot_state().0.to_vec(),
+                dense.hash_table.hot_state().0.to_vec(),
+                "mls {mls}, byte {byte:#x}"
+            );
+        }
+    }
+}
+
 /// The Fast eviction cap is two windows up to a 2^30 window, as before, and
 /// past that stops short of the `u32` position range while still holding a
 /// full window and a block: every position the kernel stores stays a `u32`
