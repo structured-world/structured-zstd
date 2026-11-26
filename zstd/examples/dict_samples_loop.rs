@@ -48,7 +48,38 @@ fn main() {
                 }
             }
         }
-        other => panic!("unknown side {other:?}: rust or c"),
+        // A fresh context per frame, the dictionary prepared once: what a
+        // caller compressing one small frame at a time pays, table set-up
+        // included.
+        "rust-fresh" => {
+            use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
+            let prepared = EncoderDictionary::from_bytes(&dict).expect("dictionary should parse");
+            let mut out = Vec::new();
+            for _ in 0..iters {
+                for sample in &samples {
+                    let mut cctx: FrameCompressor =
+                        FrameCompressor::new(CompressionLevel::from_level(level));
+                    cctx.set_encoder_dictionary(prepared.clone())
+                        .expect("dictionary should attach");
+                    cctx.compress_independent_frame_into(sample, &mut out);
+                    total += out.len();
+                }
+            }
+        }
+        "c-fresh" => {
+            let prepared = zstd::dict::EncoderDictionary::copy(&dict, level);
+            let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(sample_size));
+            for _ in 0..iters {
+                for sample in &samples {
+                    let mut cctx = zstd::bulk::Compressor::with_prepared_dictionary(&prepared)
+                        .expect("attach dictionary");
+                    out.clear();
+                    cctx.compress_to_buffer(sample, &mut out).expect("compress");
+                    total += out.len();
+                }
+            }
+        }
+        other => panic!("unknown side {other:?}: rust, c, rust-fresh or c-fresh"),
     }
     eprintln!(
         "{} samples x {iters} on {side}: {total} bytes",
