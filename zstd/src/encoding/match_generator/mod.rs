@@ -1870,10 +1870,14 @@ impl Matcher for MatchGeneratorDriver {
                 // deliberately one bit under upstream's `hashLog`: the long
                 // table's extra bit doubles what a small frame clears (a fresh
                 // 10 KiB level-3 frame ran 36% slower) for a few bytes per
-                // megabyte of output. Only tables holding the input alone are
+                // megabyte of output. Only frames without a dictionary are
                 // capped: a copied or loaded dictionary sits in the live tables
-                // too, which keep the widths resolved for it.
-                let input_only = dict_hint.is_none() || dict_attaches;
+                // too, which keep the widths resolved for it, and an attached
+                // one keeps upstream's widths for the input alone. Capped, its
+                // long table held twice the live slots a position probes, so
+                // the in-window test there ran 25% taken where upstream's runs
+                // 15%, and mispredicted with it.
+                let input_only = dict_hint.is_none();
                 let window_bits =
                     self.reset_size_log
                         .filter(|_| input_only)
