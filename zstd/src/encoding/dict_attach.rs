@@ -86,16 +86,22 @@ impl<T> DictIndexSlot<T> {
         self.table.get()
     }
 
-    /// Publish `table` unless one already is. Another compressor may have
-    /// published first; the slot keeps that table, which a compressor at its
-    /// geometry attaches while one at another builds its own.
-    pub(crate) fn publish(&self, table: Published<T>) {
+    /// Publish the table `make` returns, unless one already is: `make` runs
+    /// only for an empty slot, so a compressor that finds the slot taken (the
+    /// one it attached, or another compressor's) takes no handle on its table.
+    /// Another compressor may still publish first; the slot keeps that table,
+    /// which a compressor at its geometry attaches while one at another builds
+    /// its own.
+    pub(crate) fn publish_with(&self, make: impl FnOnce() -> Option<Published<T>>) {
         #[cfg(target_has_atomic = "ptr")]
         {
             use core::sync::atomic::Ordering;
             if !self.table.load(Ordering::Acquire).is_null() {
                 return;
             }
+            let Some(table) = make() else {
+                return;
+            };
             let raw = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(table));
             if self
                 .table
@@ -113,7 +119,9 @@ impl<T> DictIndexSlot<T> {
             }
         }
         #[cfg(not(target_has_atomic = "ptr"))]
-        if self.table.get().is_none() {
+        if self.table.get().is_none()
+            && let Some(table) = make()
+        {
             self.table.get_or_init(|| table);
         }
     }
@@ -131,6 +139,44 @@ impl<T> Drop for DictIndexSlot<T> {
     }
 }
 
+impl<T: DictTableHeap> DictIndexSlot<T> {
+    /// Heap bytes the slot accounts for: its own allocation, and the
+    /// published table when nothing but the slot holds it any more. A table a
+    /// compressor still holds is that compressor's to report, so one owner of
+    /// both counts it once.
+    fn heap_size(&self) -> usize {
+        self.get().map_or(0, |published| {
+            #[cfg(target_has_atomic = "ptr")]
+            let slot = core::mem::size_of::<Published<T>>();
+            #[cfg(not(target_has_atomic = "ptr"))]
+            let slot = 0;
+            let table = if Shared::strong_count(&published.table) == 1 {
+                shared_allocation_size::<T>() + published.table.heap_bytes()
+            } else {
+                0
+            };
+            slot + table
+        })
+    }
+}
+
+/// Bytes of a [`Shared`] allocation of `T`: `Arc` and `Rc` both place two
+/// word-sized counts ahead of the value, padded to its alignment.
+fn shared_allocation_size<T>() -> usize {
+    core::alloc::Layout::new::<[usize; 2]>()
+        .extend(core::alloc::Layout::new::<T>())
+        .expect("a fixed-size layout extends")
+        .0
+        .pad_to_align()
+        .size()
+}
+
+/// The heap a built dictionary table holds beyond its own struct, for the
+/// matcher holding it and the dictionary holding it alike.
+pub(crate) trait DictTableHeap {
+    fn heap_bytes(&self) -> usize;
+}
+
 /// The tables a prepared dictionary holds for the backends that index it,
 /// one slot each, filled by the first compressor that builds them.
 #[derive(Default)]
@@ -139,6 +185,14 @@ pub(crate) struct DictIndex {
     pub(crate) row: DictIndexSlot<crate::encoding::row::RowDictTables>,
     pub(crate) fast: DictIndexSlot<crate::encoding::simple::fast_kernel::hash_table::FastHashTable>,
     pub(crate) dms: DictIndexSlot<crate::encoding::match_table::storage::DmsDictTables>,
+}
+
+impl DictIndex {
+    /// Heap bytes the dictionary's slots account for (see
+    /// [`DictIndexSlot::heap_size`]).
+    pub(crate) fn heap_size(&self) -> usize {
+        self.dfast.heap_size() + self.row.heap_size() + self.fast.heap_size() + self.dms.heap_size()
+    }
 }
 
 /// Lifecycle holder for an attached, immutable dictionary table of type `T`.

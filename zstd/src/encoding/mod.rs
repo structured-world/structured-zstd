@@ -110,7 +110,7 @@ pub use levels::config::{
     estimated_bt_strategy_extra_bytes, estimated_compression_workspace_bytes,
     estimated_compression_workspace_bytes_for_parameters,
     estimated_compression_workspace_bytes_for_run,
-    estimated_compression_workspace_bytes_for_source,
+    estimated_compression_workspace_bytes_for_source, estimated_dictionary_table_bytes,
 };
 pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{

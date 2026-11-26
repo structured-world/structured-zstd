@@ -1619,6 +1619,115 @@ fn a_prepared_dictionary_lends_its_tables_to_fresh_compressors() {
     }
 }
 
+/// The match-finder tables a compressor leaves with a prepared dictionary are
+/// in the dictionary's heap size once that compressor is gone, and in only
+/// one of the two sizes while it still holds them: an owner of both counts
+/// them once, an owner of the dictionary alone sees what it keeps alive.
+#[test]
+fn a_prepared_dictionary_reports_the_tables_left_with_it() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let small: Vec<u8> = dict_raw[1000..3000].to_vec();
+    for number in [1, 3, 5, 19] {
+        let shared = super::EncoderDictionary::from_serialized_or_raw_content(dict_raw).unwrap();
+        let prepared = shared.heap_size();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::from_level(number));
+        compressor.set_encoder_dictionary(shared.clone()).unwrap();
+        compressor.compress_independent_frame(&small);
+        // Held by the compressor: the dictionary adds its slot alone.
+        let while_held = shared.heap_size() - prepared;
+        assert!(
+            while_held < 256,
+            "level {number}: {while_held} bytes counted by the dictionary for a table \
+             the compressor holds"
+        );
+        drop(compressor);
+        // Left with the dictionary: its tables, at least a few KiB over a
+        // 52 KB dictionary on every backend.
+        let left = shared.heap_size() - prepared;
+        assert!(
+            left > while_held + 4096,
+            "level {number}: the dictionary reports {left} bytes for the tables it keeps"
+        );
+    }
+}
+
+/// A short hit the dfast dictionary loop turns down (four bytes, under the
+/// five a wider short key needs) must not leave `ip + 1` indexed in the long
+/// table: the scan then steps to `ip + 1`, whose long probe would find that
+/// very entry past the floor-only live gate and match the position against
+/// itself at offset 0.
+///
+/// Such a hit needs two keys that agree on four bytes, differ on the fifth and
+/// share a short slot. The bytes past the fourth reach only the top
+/// `8 * (MLS - 4)` bits of the hash product, and bijectively, so this happens
+/// only for a key of six or seven bytes on a short table narrower than those
+/// bits. For each such key width and each short table width from 8 to 15
+/// bits, the input holds such a pair, each after a marker whose match keeps
+/// the scan step at one.
+#[test]
+fn a_turned_down_short_hit_never_matches_the_cursor_against_itself() {
+    const PRIME: u64 = 0xCF1B_BCDC_B7A5_6463;
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let noise = generate_data(0x5eed, 1 << 16);
+    let mut noise_at = 0;
+    let mut take = |n: usize| {
+        noise_at += n;
+        &noise[noise_at - n..noise_at]
+    };
+    for mls in [6u32, 7] {
+        let mut input = Vec::new();
+        for bits in 8..=15 {
+            let slot = |key: &[u8; 8]| {
+                ((u64::from_le_bytes(*key) << (64 - 8 * mls)).wrapping_mul(PRIME)) >> (64 - bits)
+            };
+            // The fifth and sixth bytes vary under one four-byte prefix until
+            // two keys with different fifth bytes land in one slot.
+            let mut key: [u8; 8] = take(8).try_into().unwrap();
+            let mut seen = alloc::collections::BTreeMap::new();
+            let pair = (0..=u16::MAX)
+                .find_map(|tail| {
+                    key[4] = tail as u8;
+                    key[5] = (tail >> 8) as u8;
+                    seen.insert(slot(&key), key)
+                        .filter(|prev| prev[4] != key[4])
+                        .map(|prev| [prev, key])
+                })
+                .expect("2^16 keys collide in a table of at most 2^15 slots");
+            // The second key sits three bytes further into its unit than the
+            // first, so the markers' repeat offset does not reach from one
+            // to the other and take it before the short probe does.
+            for (key, lead) in pair.into_iter().zip([3, 6]) {
+                input.extend_from_slice(b"<<marker-0123>>|");
+                input.extend_from_slice(take(lead));
+                input.extend_from_slice(&key);
+                input.extend_from_slice(take(8 - lead));
+            }
+        }
+        let params =
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::from_level(3))
+                .strategy(crate::encoding::Strategy::Dfast)
+                .min_match(mls)
+                .build()
+                .unwrap();
+        let mut compressor: FrameCompressor = FrameCompressor::new(params.level());
+        compressor.set_parameters(&params);
+        compressor
+            .set_encoder_dictionary(
+                super::EncoderDictionary::from_serialized_or_raw_content(dict_raw).unwrap(),
+            )
+            .unwrap();
+        let frame = compressor.compress_independent_frame(&input);
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict_from_bytes(dict_raw).unwrap();
+        let mut out = Vec::with_capacity(input.len());
+        decoder
+            .decode_all_to_vec(&frame, &mut out)
+            .unwrap_or_else(|e| panic!("a {mls}-byte short key: {e:?}"));
+        assert_eq!(out, input, "a {mls}-byte short key");
+    }
+}
+
 /// A dictionary too short to index gives a copying frame nothing to take: its
 /// tables stay its own, and what earlier frames of the compressor left in
 /// them is not read. Every frame is a fresh compressor's.
@@ -5475,25 +5584,41 @@ fn a_prepared_dictionary_reports_everything_it_holds() {
 }
 
 /// The estimate taken before preparing bounds what the prepared dictionary
-/// then holds, however it was parsed: a budget sized by it must not be
-/// overrun by the allocation it was made for.
+/// then holds, however it was parsed, and once a compressor at that level has
+/// indexed it and left its tables with it: a budget sized by it must not be
+/// overrun by the allocation it was made for. Levels of every backend: Fast
+/// (-5, 1), dfast (3), rows (5, 9), the lazy tree (12) and the optimal
+/// parsers (19, 22).
 #[test]
 fn estimated_heap_size_bounds_every_prepared_form() {
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
-    let estimate = super::EncoderDictionary::estimated_heap_size(dict_raw.len());
-    let forms = [
-        super::EncoderDictionary::from_bytes(dict_raw).unwrap(),
-        super::EncoderDictionary::from_dictionary(
-            crate::decoding::Dictionary::decode_dict(dict_raw).unwrap(),
-        ),
-        super::EncoderDictionary::from_serialized_or_raw_content(&dict_raw[8..]).unwrap(),
-    ];
-    for prepared in forms {
-        assert!(
-            prepared.heap_size() <= estimate,
-            "{} > {estimate}",
-            prepared.heap_size()
-        );
+    let frame: Vec<u8> = dict_raw[1000..3000].to_vec();
+    for number in [-5, 1, 3, 5, 9, 12, 19, 22] {
+        let level = super::CompressionLevel::from_level(number);
+        let estimate = super::EncoderDictionary::estimated_heap_size(dict_raw.len(), level);
+        let forms = [
+            super::EncoderDictionary::from_bytes(dict_raw).unwrap(),
+            super::EncoderDictionary::from_dictionary(
+                crate::decoding::Dictionary::decode_dict(dict_raw).unwrap(),
+            ),
+            super::EncoderDictionary::from_serialized_or_raw_content(&dict_raw[8..]).unwrap(),
+        ];
+        for prepared in forms {
+            assert!(
+                prepared.heap_size() <= estimate,
+                "level {number}, prepared: {} > {estimate}",
+                prepared.heap_size()
+            );
+            let mut compressor: FrameCompressor = FrameCompressor::new(level);
+            compressor.set_encoder_dictionary(prepared.clone()).unwrap();
+            compressor.compress_independent_frame(&frame);
+            drop(compressor);
+            assert!(
+                prepared.heap_size() <= estimate,
+                "level {number}, with its tables: {} > {estimate}",
+                prepared.heap_size()
+            );
+        }
     }
 }
 

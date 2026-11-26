@@ -3,10 +3,12 @@
 //! arguments.
 
 use crate::cdict::{
-    ZSTD_compressionParameters, ZSTD_createCDict, ZSTD_createDDict, ZSTD_freeCDict, ZSTD_freeDDict,
-    ZSTD_sizeof_CDict, ZSTD_sizeof_DDict,
+    ZSTD_compress_usingCDict, ZSTD_compressionParameters, ZSTD_createCDict, ZSTD_createDDict,
+    ZSTD_freeCDict, ZSTD_freeDDict, ZSTD_sizeof_CDict, ZSTD_sizeof_DDict,
 };
-use crate::context::{ZSTD_createDCtx, ZSTD_decompressDCtx, ZSTD_freeDCtx};
+use crate::context::{
+    ZSTD_createCCtx, ZSTD_createDCtx, ZSTD_decompressDCtx, ZSTD_freeCCtx, ZSTD_freeDCtx,
+};
 use crate::error::{ZSTD_ErrorCode, ZSTD_getErrorCode, ZSTD_isError};
 use crate::estimate::{
     ZSTD_estimateCDictSize, ZSTD_estimateCDictSize_advanced, ZSTD_estimateDDictSize,
@@ -455,7 +457,9 @@ fn context_sizes_count_the_dictionaries_they_keep() {
 }
 
 /// The dictionary estimates bound what creating the dictionary then takes,
-/// so a caller budgeting by them is never overrun.
+/// and what a CDict holds once a context has compressed with it and left the
+/// match-finder tables it built with the CDict, so a caller budgeting by them
+/// is never overrun.
 #[test]
 fn dictionary_estimates_bound_the_created_objects() {
     let dict = include_bytes!("../../../zstd/dict_tests/dictionary");
@@ -463,8 +467,26 @@ fn dictionary_estimates_bound_the_created_objects() {
         let cdict = ZSTD_createCDict(dict.as_ptr(), dict.len(), 19);
         assert!(!cdict.is_null());
         let held = ZSTD_sizeof_CDict(cdict);
-        ZSTD_freeCDict(cdict);
         assert!(held <= ZSTD_estimateCDictSize(dict.len(), 19), "{held}");
+        let cctx = ZSTD_createCCtx();
+        let src = &dict[1000..3000];
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let written = ZSTD_compress_usingCDict(
+            cctx,
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            src.as_ptr().cast(),
+            src.len(),
+            cdict,
+        );
+        assert_eq!(ZSTD_isError(written), 0);
+        ZSTD_freeCCtx(cctx);
+        let held = ZSTD_sizeof_CDict(cdict);
+        ZSTD_freeCDict(cdict);
+        assert!(
+            held <= ZSTD_estimateCDictSize(dict.len(), 19),
+            "after a frame: {held}"
+        );
         assert_eq!(
             ZSTD_estimateCDictSize_advanced(dict.len(), ZSTD_getCParams(19, 0, dict.len()), 0),
             ZSTD_estimateCDictSize(dict.len(), 19)

@@ -201,6 +201,12 @@ pub(crate) struct DmsDictTables {
     pub(crate) nb_compares: usize,
 }
 
+impl crate::encoding::dict_attach::DictTableHeap for DmsDictTables {
+    fn heap_bytes(&self) -> usize {
+        (self.hash_table.capacity() + self.chain_table.capacity()) * core::mem::size_of::<u32>()
+    }
+}
+
 /// Storage of the optimal parsers' binary-tree search: the contiguous history
 /// buffer, the rolling window, and the hash / tree / hash3 tables.
 pub(crate) struct MatchTable {
@@ -1031,17 +1037,14 @@ impl MatchTable {
     /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
     /// the chunk-length deque, and any attached immutable dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
-        let u32_sz = core::mem::size_of::<u32>();
-        let usize_sz = core::mem::size_of::<usize>();
-        self.chunk_lens.capacity() * usize_sz
+        use crate::encoding::dict_attach::DictTableHeap;
+        self.chunk_lens.capacity() * core::mem::size_of::<usize>()
             // The history and one buffer for the hash, chain and hash3 regions
             // together, each counted here only when it is not in a context's
             // workspace.
             + self.history.owned_bytes()
             + self.tables.owned_bytes()
-            + self.dms.table().map_or(0, |t| {
-                (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
-            })
+            + self.dms.table().map_or(0, DictTableHeap::heap_bytes)
     }
 
     /// Phase 1 of ingest: `fill` writes the next block STRAIGHT into the tail

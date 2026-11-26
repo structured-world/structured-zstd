@@ -375,10 +375,8 @@ impl MatchGeneratorDriver {
                 if !shared {
                     table.prime_dms_bt(committed_dict_budget);
                 }
-                if let Some(index) = index
-                    && let Some(tree) = table.published_dms()
-                {
-                    index.dms.publish(tree);
+                if let Some(index) = index {
+                    index.dms.publish_with(|| table.published_dms());
                 }
             } else {
                 table.dms.invalidate();
@@ -401,24 +399,23 @@ impl MatchGeneratorDriver {
             _ => {}
         }
         // The tables just built become the dictionary's, for the compressors
-        // it attaches to next.
-        if let Some(index) = index {
+        // it attaches to next. Not those of a frame that loads the dictionary
+        // into its own tables: they are sized for that frame rather than for
+        // the dictionary, and a dictionary keeps only tables at its own
+        // cParams, as upstream's CDict does (what its size estimate bounds).
+        if let Some(index) = index
+            && self.reset_dict_use() != Some(crate::encoding::levels::config::DictUse::Load)
+        {
             match self.active_backend() {
-                super::super::strategy::BackendTag::Dfast => {
-                    if let Some(tables) = self.dfast_matcher_mut().published_dict_tables() {
-                        index.dfast.publish(tables);
-                    }
-                }
-                super::super::strategy::BackendTag::Row => {
-                    if let Some(tables) = self.row_matcher_mut().published_dict_index() {
-                        index.row.publish(tables);
-                    }
-                }
-                super::super::strategy::BackendTag::Simple => {
-                    if let Some(table) = self.simple_mut().published_dict_table() {
-                        index.fast.publish(table);
-                    }
-                }
+                super::super::strategy::BackendTag::Dfast => index
+                    .dfast
+                    .publish_with(|| self.dfast_matcher_mut().published_dict_tables()),
+                super::super::strategy::BackendTag::Row => index
+                    .row
+                    .publish_with(|| self.row_matcher_mut().published_dict_index()),
+                super::super::strategy::BackendTag::Simple => index
+                    .fast
+                    .publish_with(|| self.simple_mut().published_dict_table()),
                 super::super::strategy::BackendTag::HashChain => {}
             }
         }

@@ -275,7 +275,15 @@ impl FastHashTable {
     pub(crate) fn heap_size(&self) -> usize {
         self.table.owned_bytes()
     }
+}
 
+impl crate::encoding::dict_attach::DictTableHeap for FastHashTable {
+    fn heap_bytes(&self) -> usize {
+        self.heap_size()
+    }
+}
+
+impl FastHashTable {
     /// Clear the table back to all-sentinel. Used on encoder reset
     /// between independent frames so a stale absolute index from the
     /// previous frame can't get mistaken for a current-frame match.

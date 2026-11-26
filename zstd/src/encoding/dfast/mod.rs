@@ -265,6 +265,12 @@ pub(crate) struct DfastDictTables {
     pub(crate) index_floor: usize,
 }
 
+impl crate::encoding::dict_attach::DictTableHeap for DfastDictTables {
+    fn heap_bytes(&self) -> usize {
+        (self.long.capacity() + self.short.capacity()) * core::mem::size_of::<u32>()
+    }
+}
+
 /// Upstream `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of a tagged slot hold a
 /// hash tag so a probe rejects most collisions without touching the candidate's
 /// bytes (every untagged collision on incompressible input is a cache miss).
@@ -782,7 +788,7 @@ impl DfastMatchGenerator {
     /// tables when they are not in a context's workspace, the window-block
     /// deque, and any attached dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
-        let u32_sz = core::mem::size_of::<u32>();
+        use crate::encoding::dict_attach::DictTableHeap;
         self.window_blocks.capacity() * core::mem::size_of::<usize>()
             + self.history.owned_bytes()
             + self.tables.owned_bytes()
@@ -791,7 +797,7 @@ impl DfastMatchGenerator {
                 .table()
                 .into_iter()
                 .chain(self.dict_keep.table())
-                .map(|t| (t.long.capacity() + t.short.capacity()) * u32_sz)
+                .map(DictTableHeap::heap_bytes)
                 .sum::<usize>()
             + self.dict_keep.slot_bytes()
     }
@@ -3993,8 +3999,7 @@ macro_rules! start_matching_dict_loop_body {
                     let hl_idx = dfast_slot(v8.wrapping_mul(PRIME), long_shift);
                     // The short key over the frame's `$mls` bytes (upstream
                     // `ZSTD_hashPtr(ip, hBitsS, mls)`).
-                    let hs_idx = dfast_slot(short_key::<$mls>(v8).wrapping_mul(PRIME), short_shift);
-                    // SAFETY: both indices are below their table's length.
+                    let hs_idx = dfast_slot(short_key::<$mls>(v8).wrapping_mul(PRIME), short_shift);                    // SAFETY: both indices are below their table's length.
                     let (idxl, idxs) =
                         unsafe { (*long_hash_ptr.add(hl_idx), *short_hash_ptr.add(hs_idx)) };
                     // Both tables updated at the cursor BEFORE the checks, as the
@@ -4230,6 +4235,7 @@ macro_rules! start_matching_dict_loop_body {
                     // against 1677, a 128 KiB log at level 4 39075 against 37340.
                     let mut chosen = short_cand;
                     let mut upgraded = false;
+                    let short_taken = short_cand.match_len >= short_hit_floor::<$mls>();
                     if dfast_branch!(15, ip + 1 + HASH_READ_SIZE <= block_len) {
                         // SAFETY: guarded directly above.
                         let v8_1 =
@@ -4237,18 +4243,8 @@ macro_rules! start_matching_dict_loop_body {
                         let hl1_idx = dfast_slot(v8_1.wrapping_mul(PRIME), long_shift);
                         // SAFETY: the index is below the long table's length.
                         let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
-                        // From the cursor, not from `packed_curr`, which would
-                        // then live past the table writes into this path.
-                        let packed_next = ((ip + 1) as u32) + packed_bias;
-                        // The probed position is indexed as upstream indexes it
-                        // (`hashLong[hl3] = curr + 1`, zstd_double_fast.c:459):
-                        // nothing else writes it, since the complementary
-                        // insertion after a match covers `curr + 2` and the two
-                        // positions before the match end.
-                        // SAFETY: as for the read above.
-                        unsafe { *long_hash_ptr.add(hl1_idx) = packed_next };
                         let mut live_hit = false;
-                        debug_assert!(idxl1 < min_slot || idxl1 < packed_next);
+                        debug_assert!(idxl1 < min_slot || idxl1 < ((ip + 1) as u32) + packed_bias);
                         if dfast_branch!(16, idxl1 >= min_slot) {
                             // SAFETY: as for the long slot above.
                             let cand_v8 = unsafe {
@@ -4307,11 +4303,26 @@ macro_rules! start_matching_dict_loop_body {
                                 }
                             }
                         }
+                        // The probed position is indexed as upstream indexes it
+                        // (`hashLong[hl3] = curr + 1`, zstd_double_fast.c:459),
+                        // where its short hit always commits: nothing else
+                        // writes it, since the complementary insertion after a
+                        // match covers `curr + 2` and the two positions before
+                        // the match end. A hit turned down below the floor
+                        // leaves it unwritten: the scan may step to `ip + 1`
+                        // next, which indexes itself before its probes, and the
+                        // live gate (the floor alone) would otherwise admit this
+                        // entry there as a match of the cursor against itself.
+                        if dfast_branch!(25, upgraded || short_taken) {
+                            // From the cursor, not from `packed_curr`, which
+                            // would then live past the table writes into this
+                            // path. SAFETY: as for the read above.
+                            unsafe {
+                                *long_hash_ptr.add(hl1_idx) = ((ip + 1) as u32) + packed_bias;
+                            }
+                        }
                     }
-                    if dfast_branch!(
-                        23,
-                        upgraded || short_cand.match_len >= short_hit_floor::<$mls>()
-                    ) {
+                    if dfast_branch!(23, upgraded || short_taken) {
                         break 'inner DfastInnerExit::Committed(chosen, 2, ip);
                     }
                     // A below-floor short hit with no upgrade: keep scanning.
