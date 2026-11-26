@@ -68,10 +68,15 @@ impl MatchGeneratorDriver {
 
     /// [`crate::encoding::Matcher::prime_with_dictionary`] compiled for the kernel tier `K`, the one the encoder chose for the
     /// frame.
+    ///
+    /// `index` is the prepared dictionary's own tables, when the dictionary
+    /// came prepared: a backend whose geometry matches attaches them instead
+    /// of building its own, and one that builds publishes what it built.
     pub(crate) fn prime_with_dictionary_with<K: crate::encoding::fastpath::EncodeTier>(
         &mut self,
         dict_content: &[u8],
         offset_hist: [u32; 3],
+        index: Option<&crate::encoding::dict_attach::DictIndex>,
     ) {
         match self.active_backend() {
             super::super::strategy::BackendTag::Simple => {
@@ -130,8 +135,12 @@ impl MatchGeneratorDriver {
             super::super::strategy::BackendTag::Dfast
                 if self.dict_attached() || dfast_copies_index =>
             {
-                self.dfast_matcher_mut()
-                    .revive_dict_cache(dict_content.len());
+                let dfast = self.dfast_matcher_mut();
+                if !dfast.revive_dict_cache(dict_content.len())
+                    && let Some(index) = index
+                {
+                    dfast.attach_shared_dict_tables(&index.dfast, dict_content.len());
+                }
             }
             // The row backend's plan says whether this frame attaches.
             super::super::strategy::BackendTag::Row => {
@@ -365,6 +374,16 @@ impl MatchGeneratorDriver {
             }
             super::super::strategy::BackendTag::Row => self.row_matcher_mut().mark_dict_primed(),
             _ => {}
+        }
+        // The tables just built become the dictionary's, for the compressors
+        // it attaches to next.
+        if let Some(index) = index
+            && self.active_backend() == super::super::strategy::BackendTag::Dfast
+            && let Some(tables) = self.dfast_matcher_mut().primed_dict_tables()
+        {
+            index
+                .dfast
+                .publish(crate::encoding::dict_attach::Shared::clone(tables));
         }
         // The dictionary is indexed; later inserts are the input's own.
         self.storage.set_dictionary_index_floor(0);
