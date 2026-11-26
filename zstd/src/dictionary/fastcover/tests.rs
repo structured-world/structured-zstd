@@ -58,23 +58,27 @@ fn training_bytes_shorter_than_a_dmer_are_refused() {
 fn build_fills_at_most_the_capacity_from_the_training_bytes() {
     let (data, sizes) = lines(500);
     let set = SampleSet::new(&data, &sizes).unwrap();
-    let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
+    let mut ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
+    let counted = ctx.freqs.clone();
     let mut window = WindowCounts::default();
-    let mut freqs = Vec::new();
+    let mut undo = Vec::new();
     let mut out = Vec::new();
     let content = ctx
-        .build(&mut freqs, &mut window, &mut out, 4096, 256)
+        .build(&mut undo, &mut window, &mut out, 4096, 256)
         .unwrap()
         .to_vec();
     assert!(!content.is_empty() && content.len() <= 4096);
     // The last segment is at least a dmer of training bytes.
     let last = &content[content.len() - 8..];
     assert!(data.windows(8).any(|w| w == last));
-    // The window counts come back zeroed, the spent frequencies are refilled
-    // and the content scratch is overwritten, so the next build on the same
-    // scratch repeats the first.
+    // The build spent counts in place and put every one back: the table is
+    // the counted one again, which the next `k` builds from.
+    assert!(!undo.is_empty());
+    assert!(ctx.freqs == counted);
+    // The window counts come back zeroed and the content scratch is
+    // overwritten, so the next build on the same scratch repeats the first.
     let again = ctx
-        .build(&mut freqs, &mut window, &mut out, 4096, 256)
+        .build(&mut undo, &mut window, &mut out, 4096, 256)
         .unwrap();
     assert_eq!(content, again);
 }
@@ -90,7 +94,7 @@ fn a_segment_longer_than_a_16_bit_count_trains() {
     let data = vec![0u8; 10 * k + 1000];
     let each = data.len() / 5;
     let set = SampleSet::new(&data, &[each; 5]).unwrap();
-    let ctx = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
+    let mut ctx = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
     let mut out = Vec::new();
     let content = ctx
         .build(
@@ -110,7 +114,7 @@ fn a_segment_longer_than_a_16_bit_count_trains() {
 fn a_segment_longer_than_the_corpus_trains() {
     let (data, sizes) = lines(100);
     let set = SampleSet::new(&data, &sizes).unwrap();
-    let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
+    let mut ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
     let mut out = Vec::new();
     let content = ctx
         .build(
@@ -124,25 +128,19 @@ fn a_segment_longer_than_the_corpus_trains() {
     assert!(!content.is_empty() && content.len() <= 4096);
 }
 
-/// Every table width the interface takes is used as given, including by a
-/// frequency scratch carried from a build at another width.
+/// Every table width the interface takes is used as given, including by an
+/// undo scratch carried from a build at another width.
 #[test]
 fn every_table_width_trains() {
     let (data, sizes) = lines(200);
     let set = SampleSet::new(&data, &sizes).unwrap();
-    let mut freqs = Vec::new();
+    let mut undo = Vec::new();
     let mut out = Vec::new();
     for f in [1, 4, 8, 24] {
-        let ctx = FastCoverContext::new(&set, sizes.len(), 8, f, 1).unwrap();
+        let mut ctx = FastCoverContext::new(&set, sizes.len(), 8, f, 1).unwrap();
         assert_eq!(ctx.freqs.len(), 1 << f);
         let content = ctx
-            .build(
-                &mut freqs,
-                &mut WindowCounts::default(),
-                &mut out,
-                2048,
-                128,
-            )
+            .build(&mut undo, &mut WindowCounts::default(), &mut out, 2048, 128)
             .unwrap();
         assert!(!content.is_empty(), "f={f}");
     }

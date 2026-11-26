@@ -943,7 +943,7 @@ fn run_fastcover(
     let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
     let scored = !plain || options.cover.shrink.is_some() || space.split_point < 1.0;
     let mut window = fastcover::WindowCounts::default();
-    let mut freqs = Vec::new();
+    let mut undo = Vec::new();
     let mut content_scratch = Vec::new();
     let mut best = selection::Best::new(keep);
     // `None` beside a `d` is a dmer size these samples cannot count.
@@ -987,10 +987,10 @@ fn run_fastcover(
             };
             context = Some((d, built));
         }
-        let Some(ctx) = context.as_ref().and_then(|(_, built)| built.as_ref()) else {
+        let Some(ctx) = context.as_mut().and_then(|(_, built)| built.as_mut()) else {
             continue;
         };
-        let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
+        let content = ctx.build(&mut undo, &mut window, &mut content_scratch, dict_size, k)?;
         if !scored {
             return match keep {
                 selection::Keep::Content => Ok((content.to_vec(), chosen)),
