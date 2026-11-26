@@ -3670,26 +3670,32 @@ pub(crate) fn uses_fast_offset_codes(strategy: crate::encoding::strategy::Strate
 /// per-sequence probe the fast matcher never pays and can shift the FSE symbol
 /// histogram the wrong way). The repeat-offset history update follows directly
 /// from the emitted code, identical to the full converter's rules.
+///
+/// Computed with selects rather than branches: run inside the match finder's
+/// loop once per sequence, a branch on whether a sequence repeats an offset
+/// mispredicted about once a match, where upstream's matchers know the code
+/// at the store and branch on nothing.
+#[inline(always)]
 pub(crate) fn encode_offset_with_history_fast(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],
 ) -> u32 {
-    if lit_len > 0 {
-        if actual_offset == offset_hist[0] {
-            return 1; // rep[0] match: history unchanged
-        }
-    } else if actual_offset == offset_hist[1] {
-        // litLength-0 offBase 1 decodes as rep[1]: promote it, demote rep[0].
-        offset_hist[1] = offset_hist[0];
-        offset_hist[0] = actual_offset;
-        return 1;
-    }
-    // Explicit offset: rotate the full repeat-offset history.
-    offset_hist[2] = offset_hist[1];
-    offset_hist[1] = offset_hist[0];
-    offset_hist[0] = actual_offset;
-    actual_offset + 3
+    use core::hint::select_unpredictable;
+    let [h0, h1, h2] = *offset_hist;
+    let after_literals = lit_len > 0;
+    // offBase 1 is rep[0] after literals and rep[1] after none (RFC 8878
+    // 3.1.2.5).
+    let repeat = actual_offset == select_unpredictable(after_literals, h0, h1);
+    // A repeat after literals leaves the history as it is (its offset is
+    // `h0`); one after none promotes `h1` over `h0`; an explicit offset
+    // rotates all three. The new head is the offset in every case.
+    *offset_hist = [
+        actual_offset,
+        select_unpredictable(repeat & after_literals, h1, h0),
+        select_unpredictable(repeat, h2, h1),
+    ];
+    select_unpredictable(repeat, 1, actual_offset + 3)
 }
 
 /// The low `bits` bits of `value`, the extra-bit field the sequence section
