@@ -125,20 +125,6 @@ const K_STEP_INCR_DICT: usize = 1 << SEARCH_STRENGTH;
 /// boundary check.
 const HASH_READ_SIZE: usize = 8;
 
-/// Minimum length a DICTIONARY match must reach to be committed by the
-/// dict-aware (attach-mode) Fast kernel [`compress_block_fast_dict`]. A
-/// dictionary match reaches back across the whole input into the dictionary
-/// region, so its offset is inherently large — a SHORT one inflates the
-/// offset-code FSE alphabet (a single far offset forces the table to span up to
-/// its high code) for little literal saving, and can make a dict frame larger
-/// than the no-dict frame. Below this floor the kernel skips the dict match and
-/// lets the parse find a near (small-offset / repcode) match instead. Only
-/// dictionary matches carry this floor; main-table and repcode matches keep the
-/// 4-byte minimum. (Upstream zstd commits any 4-byte dict match, but it is not
-/// chasing byte-identity — we make our own match decisions where they improve
-/// the ratio, per the drop-in-not-binary-parity contract.)
-const MIN_DICT_MATCH_LEN: usize = 8;
-
 /// Short-cache tag width for the dictionary hash table (upstream zstd
 /// `ZSTD_SHORT_CACHE_TAG_BITS`). Each dict slot packs `(position << TAG_BITS) |
 /// tag`, where `tag` is the low `TAG_BITS` of a `hashLog + TAG_BITS`-wide hash.
@@ -1438,8 +1424,7 @@ fn fast_scan<const MLS: u32, const USE_CMOV: bool, const TAGGED: bool, W: ScanWi
 /// candidate load); `main_table` holds ONLY frame-input positions. Search order
 /// mirrors the upstream zstd: rep@ip0+1 → dict (only when the main candidate is
 /// invalid) → main. Correctness is independent of table contents (every match
-/// byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN` gates short far dict
-/// matches that would fragment the offset-FSE alphabet.
+/// byte-verified + bounds-guarded).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
@@ -1615,17 +1600,17 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                     match_pos -= 1;
                     m_len += 1;
                 }
-                if m_len >= MIN_DICT_MATCH_LEN {
-                    let offset = match_ip - match_pos;
-                    offset_2 = offset_1;
-                    offset_1 = offset as u32;
-                    break Some(DictMatch {
-                        lit_end: match_ip,
-                        offset,
-                        m_len,
-                        curr,
-                    });
-                }
+                // Any four-byte dictionary match is taken, as upstream takes it
+                // (zstd_fast.c:585-595).
+                let offset = match_ip - match_pos;
+                offset_2 = offset_1;
+                offset_1 = offset as u32;
+                break Some(DictMatch {
+                    lit_end: match_ip,
+                    offset,
+                    m_len,
+                    curr,
+                });
             }
 
             // Main match (recent input) — upstream zstd line 600.
@@ -2099,18 +2084,18 @@ fn compress_block_fast_dict_borrowed_impl<
                             match_pos -= 1;
                             m_len += 1;
                         }
-                        if m_len >= MIN_DICT_MATCH_LEN {
-                            let offset = (dict_end + match_ip) - match_pos;
-                            offset_2 = offset_1;
-                            offset_1 = offset as u32;
-                            rep1_from = offset + rep_floor;
-                            break Some(DictMatch {
-                                lit_end: match_ip,
-                                offset,
-                                m_len,
-                                curr,
-                            });
-                        }
+                        // Any four-byte dictionary match is taken, as upstream
+                        // takes it (zstd_fast.c:585-595).
+                        let offset = (dict_end + match_ip) - match_pos;
+                        offset_2 = offset_1;
+                        offset_1 = offset as u32;
+                        rep1_from = offset + rep_floor;
+                        break Some(DictMatch {
+                            lit_end: match_ip,
+                            offset,
+                            m_len,
+                            curr,
+                        });
                     }
                 }
             }
