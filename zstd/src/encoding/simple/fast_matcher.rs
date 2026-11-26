@@ -2447,6 +2447,59 @@ impl FastKernelMatcher {
         self.dict.invalidate();
     }
 
+    /// The `(hash_log, mls)` a dictionary table of a `dict_len`-byte
+    /// dictionary is built at: the CDict's `hashLog` when the driver resolved
+    /// it, else the same downsizing from the main table's width, and the main
+    /// table's key width.
+    fn dict_table_geometry(&self, dict_len: usize) -> (u32, u32) {
+        let main_hash_log = self.hash_table.hash_log();
+        let hash_log = self.dict_table_hash_log.unwrap_or_else(|| {
+            crate::encoding::cparams::create_cdict_table_logs(
+                main_hash_log as u8,
+                main_hash_log,
+                main_hash_log,
+                /* uses_bt */ false,
+                dict_len,
+            )
+            .0
+        });
+        (hash_log, self.hash_table.mls())
+    }
+
+    /// Attach the table a prepared dictionary of `dict_len` bytes holds, when
+    /// it is what this prime would build: the geometry
+    /// [`Self::dict_table_geometry`] resolves and the index floor. Returns
+    /// whether it was.
+    pub(crate) fn attach_shared_dict_table(
+        &mut self,
+        slot: &crate::encoding::dict_attach::DictIndexSlot<FastHashTable>,
+        dict_len: usize,
+    ) -> bool {
+        let (hash_log, mls) = self.dict_table_geometry(dict_len);
+        let floor = self.dict_index_floor;
+        self.dict
+            .attach_published(slot, |table, region_len, index_floor| {
+                table.hash_log() == hash_log
+                    && table.mls() == mls
+                    && index_floor == floor
+                    && region_len == dict_len
+            })
+    }
+
+    /// Dictionary tables this matcher started. Test-only.
+    #[cfg(test)]
+    pub(crate) fn dict_tables_built(&self) -> usize {
+        self.dict.built
+    }
+
+    /// The dictionary table this prime finished, for the prepared dictionary
+    /// to hold.
+    pub(crate) fn published_dict_table(
+        &self,
+    ) -> Option<crate::encoding::dict_attach::Published<FastHashTable>> {
+        self.dict.published(self.dict_index_floor)
+    }
+
     /// Build (or extend) the dictionary table in [`Self::dict`] over
     /// `history[range_start..]`,
     /// the freshly-appended dictionary bytes. Lazily allocates the dict table
@@ -2495,18 +2548,7 @@ impl FastKernelMatcher {
         // resolves that log from the level's CDict cParams
         // (`dict_table_hash_log`); a matcher driven without it derives the
         // same downsizing from its own table width.
-        let main_hash_log = self.hash_table.hash_log();
-        let mls = self.hash_table.mls();
-        let hash_log = self.dict_table_hash_log.unwrap_or_else(|| {
-            crate::encoding::cparams::create_cdict_table_logs(
-                main_hash_log as u8,
-                main_hash_log,
-                main_hash_log,
-                /* uses_bt */ false,
-                dict_len,
-            )
-            .0
-        });
+        let (hash_log, mls) = self.dict_table_geometry(dict_len);
         // A retained table of another width belongs to another dictionary
         // (or geometry); rebuild from the start.
         if self

@@ -29,15 +29,25 @@ pub(crate) type Shared<T> = alloc::sync::Arc<T>;
 #[cfg(not(target_has_atomic = "ptr"))]
 pub(crate) type Shared<T> = alloc::rc::Rc<T>;
 
+/// A fully built dictionary table with the boundary and fill origin it was
+/// built to, the state [`DictKeep::revive`] restores, and how far into the
+/// dictionary it starts indexing.
+pub(crate) struct Published<T> {
+    pub(crate) table: Shared<T>,
+    pub(crate) region_len: usize,
+    pub(crate) next_to_update: usize,
+    pub(crate) index_floor: usize,
+}
+
 /// A dictionary's built table for one backend, published by the first
 /// compressor that indexes the dictionary and attached by reference by every
 /// later one whose geometry matches (upstream `cdict->matchState`, built once
 /// in `ZSTD_createCDict`). Set once: a compressor resolving another geometry
 /// builds its own table, as it would without the slot.
 pub(crate) struct DictIndexSlot<T> {
-    /// A leaked `Box<Shared<T>>` once published, freed with the slot.
+    /// A leaked `Box<Published<T>>` once published, freed with the slot.
     #[cfg(target_has_atomic = "ptr")]
-    table: core::sync::atomic::AtomicPtr<Shared<T>>,
+    table: core::sync::atomic::AtomicPtr<Published<T>>,
     /// The slot owns a `Shared<T>`, and is `Send` / `Sync` only as that is;
     /// the atomic pointer alone would claim both for any `T`.
     #[cfg(target_has_atomic = "ptr")]
@@ -45,7 +55,7 @@ pub(crate) struct DictIndexSlot<T> {
     /// Without atomic pointers the dictionary is held by `Rc` and stays on
     /// one thread.
     #[cfg(not(target_has_atomic = "ptr"))]
-    table: core::cell::OnceCell<Shared<T>>,
+    table: core::cell::OnceCell<Published<T>>,
 }
 
 impl<T> Default for DictIndexSlot<T> {
@@ -63,7 +73,7 @@ impl<T> Default for DictIndexSlot<T> {
 
 impl<T> DictIndexSlot<T> {
     /// The published table, if any.
-    pub(crate) fn get(&self) -> Option<&Shared<T>> {
+    pub(crate) fn get(&self) -> Option<&Published<T>> {
         #[cfg(target_has_atomic = "ptr")]
         {
             let published = self.table.load(core::sync::atomic::Ordering::Acquire);
@@ -79,7 +89,7 @@ impl<T> DictIndexSlot<T> {
     /// Publish `table` unless one already is. Another compressor may have
     /// published first; the slot keeps that table, which a compressor at its
     /// geometry attaches while one at another builds its own.
-    pub(crate) fn publish(&self, table: Shared<T>) {
+    pub(crate) fn publish(&self, table: Published<T>) {
         #[cfg(target_has_atomic = "ptr")]
         {
             use core::sync::atomic::Ordering;
@@ -126,6 +136,9 @@ impl<T> Drop for DictIndexSlot<T> {
 #[derive(Default)]
 pub(crate) struct DictIndex {
     pub(crate) dfast: DictIndexSlot<crate::encoding::dfast::DfastDictTables>,
+    pub(crate) row: DictIndexSlot<crate::encoding::row::RowDictTables>,
+    pub(crate) fast: DictIndexSlot<crate::encoding::simple::fast_kernel::hash_table::FastHashTable>,
+    pub(crate) dms: DictIndexSlot<crate::encoding::match_table::storage::DmsDictTables>,
 }
 
 /// Lifecycle holder for an attached, immutable dictionary table of type `T`.
@@ -156,6 +169,10 @@ pub(crate) struct DictAttach<T> {
     /// stride phase continuous and closes the seam gap. `0` until the first
     /// fill; reset by [`Self::invalidate`].
     next_to_update: usize,
+    /// Tables this holder started: built anew, or copied from one it shared.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) built: usize,
 }
 
 impl<T: Clone> Clone for DictAttach<T> {
@@ -165,6 +182,8 @@ impl<T: Clone> Clone for DictAttach<T> {
             region_len: self.region_len,
             primed: self.primed,
             next_to_update: self.next_to_update,
+            #[cfg(test)]
+            built: self.built,
         }
     }
 
@@ -175,6 +194,10 @@ impl<T: Clone> Clone for DictAttach<T> {
         self.region_len = source.region_len;
         self.primed = source.primed;
         self.next_to_update = source.next_to_update;
+        #[cfg(test)]
+        {
+            self.built = source.built;
+        }
     }
 }
 
@@ -186,6 +209,14 @@ impl<T: Clone> DictAttach<T> {
     /// under the other holders.
     #[inline]
     pub(crate) fn table_mut_or_init(&mut self, init: impl FnOnce() -> T) -> &mut T {
+        #[cfg(test)]
+        if self
+            .table
+            .as_ref()
+            .is_none_or(|table| Shared::strong_count(table) > 1)
+        {
+            self.built += 1;
+        }
         Shared::make_mut(self.table.get_or_insert_with(|| Shared::new(init())))
     }
 
@@ -193,6 +224,14 @@ impl<T: Clone> DictAttach<T> {
     /// pass), under the same rule as [`Self::table_mut_or_init`].
     #[inline]
     pub(crate) fn table_mut(&mut self) -> Option<&mut T> {
+        #[cfg(test)]
+        if self
+            .table
+            .as_ref()
+            .is_some_and(|table| Shared::strong_count(table) > 1)
+        {
+            self.built += 1;
+        }
         self.table.as_mut().map(Shared::make_mut)
     }
 }
@@ -204,6 +243,8 @@ impl<T> DictAttach<T> {
             region_len: 0,
             primed: false,
             next_to_update: 0,
+            #[cfg(test)]
+            built: 0,
         }
     }
 
@@ -235,26 +276,47 @@ impl<T> DictAttach<T> {
         self.table.as_deref()
     }
 
-    /// The fully built table, to publish in the dictionary's
-    /// [`DictIndexSlot`].
-    pub(crate) fn primed_table(&self) -> Option<&Shared<T>> {
-        self.table.as_ref().filter(|_| self.primed)
+    /// The fully built table, built from `index_floor` on, to publish in the
+    /// dictionary's [`DictIndexSlot`].
+    pub(crate) fn published(&self, index_floor: usize) -> Option<Published<T>> {
+        self.table
+            .as_ref()
+            .filter(|_| self.primed)
+            .map(|table| Published {
+                table: Shared::clone(table),
+                region_len: self.region_len,
+                next_to_update: self.next_to_update,
+                index_floor,
+            })
     }
 
-    /// Attach a table another compressor built for this dictionary, fully
-    /// built, with the boundary and fill origin it was built to. Only on a
-    /// holder with no table: one already attached stays.
-    pub(crate) fn attach_shared(
+    /// Attach the table another compressor built for this dictionary and
+    /// published in `slot`, fully built, when `accept` takes it for the
+    /// dictionary about to be primed (given the table, the boundary it was
+    /// built to and its index floor), as [`DictKeep::revive`] takes a parked
+    /// one. Only on a holder with no table. Returns whether it was attached.
+    pub(crate) fn attach_published(
         &mut self,
-        table: &Shared<T>,
-        region_len: usize,
-        next_to_update: usize,
-    ) {
-        debug_assert!(self.table.is_none());
-        self.table = Some(Shared::clone(table));
-        self.region_len = region_len;
+        slot: &DictIndexSlot<T>,
+        accept: impl FnOnce(&T, usize, usize) -> bool,
+    ) -> bool {
+        let Some(published) = slot.get() else {
+            return false;
+        };
+        if self.table.is_some()
+            || !accept(
+                &published.table,
+                published.region_len,
+                published.index_floor,
+            )
+        {
+            return false;
+        }
+        self.table = Some(Shared::clone(&published.table));
+        self.region_len = published.region_len;
         self.primed = true;
-        self.next_to_update = next_to_update;
+        self.next_to_update = published.next_to_update;
+        true
     }
 
     /// The dict/input boundary (`dict_end`) for kernel bounds checks.
@@ -361,10 +423,20 @@ impl<T> DictKeep<T> {
             .map_or(0, |_| core::mem::size_of::<Option<Kept<T>>>())
     }
 
-    /// The parked table, fully built.
-    pub(crate) fn parked_table(&self) -> Option<&Shared<T>> {
+    /// The parked table, fully built from `index_floor` on, to publish in the
+    /// dictionary's [`DictIndexSlot`].
+    pub(crate) fn published(&self, index_floor: usize) -> Option<Published<T>> {
         match self.kept() {
-            Some(Kept::Parked { table, .. }) => Some(table),
+            Some(Kept::Parked {
+                table,
+                region_len,
+                next_to_update,
+            }) => Some(Published {
+                table: Shared::clone(table),
+                region_len: *region_len,
+                next_to_update: *next_to_update,
+                index_floor,
+            }),
             _ => None,
         }
     }

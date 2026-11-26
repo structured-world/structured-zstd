@@ -1079,6 +1079,18 @@ impl MatchGeneratorDriver {
         self.dfast_matcher().dict_table_builds
     }
 
+    /// Dictionary tables the active backend started, built anew or copied
+    /// from a shared one. Test-only.
+    #[cfg(test)]
+    pub(crate) fn dict_tables_built(&self) -> usize {
+        match &self.storage {
+            MatcherStorage::Simple(s) => s.dict_tables_built(),
+            MatcherStorage::Dfast(d) => d.dict.built,
+            MatcherStorage::Row(r) => r.dict.built,
+            MatcherStorage::HashChain(hc) => hc.table.dms.built,
+        }
+    }
+
     /// Whether a snapshot of a primed dictionary's tables is held. Test-only.
     #[cfg(test)]
     pub(crate) fn holds_primed_snapshot(&self) -> bool {
