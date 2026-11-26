@@ -22,7 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          # The base is found by its commit message, further back than a
+          # shallow history reaches.
+          fetch-depth: 20
       - uses: dtolnay/rust-toolchain@stable
       - name: Measure
         run: bash .github/exp-708/ring.sh
