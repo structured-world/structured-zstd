@@ -144,7 +144,20 @@ impl MatchGeneratorDriver {
             }
             // The row backend's plan says whether this frame attaches.
             super::super::strategy::BackendTag::Row => {
-                self.row_matcher_mut().revive_dict_cache(dict_content.len());
+                let row = self.row_matcher_mut();
+                if !row.revive_dict_cache(dict_content.len())
+                    && let Some(index) = index
+                {
+                    row.attach_shared_dict_index(&index.row, dict_content.len());
+                }
+            }
+            // The Fast backend keeps a dictionary table only for frames that
+            // attach the dictionary.
+            super::super::strategy::BackendTag::Simple if self.dict_attached() => {
+                if let Some(index) = index {
+                    self.simple_mut()
+                        .attach_shared_dict_table(&index.fast, dict_content.len());
+                }
             }
             _ => {}
         }
@@ -354,7 +367,19 @@ impl MatchGeneratorDriver {
             // `skip_matching_for_dictionary_priming`, so it carries no separate
             // dms — drop any stale one.
             if attach {
-                table.prime_dms_bt(committed_dict_budget);
+                // A prepared dictionary's own tree, when it is the one this
+                // frame would sort; the tree this frame sorts becomes it.
+                let shared = index.is_some_and(|index| {
+                    table.attach_shared_dms(&index.dms, committed_dict_budget)
+                });
+                if !shared {
+                    table.prime_dms_bt(committed_dict_budget);
+                }
+                if let Some(index) = index
+                    && let Some(tree) = table.published_dms()
+                {
+                    index.dms.publish(tree);
+                }
             } else {
                 table.dms.invalidate();
             }
@@ -377,13 +402,25 @@ impl MatchGeneratorDriver {
         }
         // The tables just built become the dictionary's, for the compressors
         // it attaches to next.
-        if let Some(index) = index
-            && self.active_backend() == super::super::strategy::BackendTag::Dfast
-            && let Some(tables) = self.dfast_matcher_mut().primed_dict_tables()
-        {
-            index
-                .dfast
-                .publish(crate::encoding::dict_attach::Shared::clone(tables));
+        if let Some(index) = index {
+            match self.active_backend() {
+                super::super::strategy::BackendTag::Dfast => {
+                    if let Some(tables) = self.dfast_matcher_mut().published_dict_tables() {
+                        index.dfast.publish(tables);
+                    }
+                }
+                super::super::strategy::BackendTag::Row => {
+                    if let Some(tables) = self.row_matcher_mut().published_dict_index() {
+                        index.row.publish(tables);
+                    }
+                }
+                super::super::strategy::BackendTag::Simple => {
+                    if let Some(table) = self.simple_mut().published_dict_table() {
+                        index.fast.publish(table);
+                    }
+                }
+                super::super::strategy::BackendTag::HashChain => {}
+            }
         }
         // The dictionary is indexed; later inserts are the input's own.
         self.storage.set_dictionary_index_floor(0);

@@ -5122,6 +5122,44 @@ impl RowMatchGenerator {
         })
     }
 
+    /// Attach the index a prepared dictionary of `dict_len` bytes holds, on
+    /// the terms [`Self::revive_dict_cache`] takes a parked one: a frame that
+    /// attaches the dictionary or copies it from its index, at the
+    /// [`RowDictShape`] and index floor this frame resolves. Returns whether
+    /// it was.
+    pub(crate) fn attach_shared_dict_index(
+        &mut self,
+        slot: &crate::encoding::dict_attach::DictIndexSlot<RowDictTables>,
+        dict_len: usize,
+    ) -> bool {
+        let Some(plan) = self
+            .dict_plan
+            .filter(|plan| plan.attach || self.dict_index_serves_copy(*plan))
+        else {
+            return false;
+        };
+        let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
+        let floor = self.dict_index_floor;
+        self.dict
+            .attach_published(slot, |index, region_len, index_floor| {
+                index.shape == shape
+                    && index.index_floor == floor
+                    && index_floor == floor
+                    && region_len == dict_len
+            })
+    }
+
+    /// The dictionary index this prime finished, attached or parked after
+    /// filling a copy, for the prepared dictionary to hold.
+    pub(crate) fn published_dict_index(
+        &self,
+    ) -> Option<crate::encoding::dict_attach::Published<RowDictTables>> {
+        let floor = self.dict_index_floor;
+        self.dict
+            .published(floor)
+            .or_else(|| self.dict_keep.published(floor))
+    }
+
     /// Index the just-committed dictionary block (current `chunk_lens` tail)
     /// per the frame's [`RowDictPlan`]: upstream `ZSTD_loadDictionaryContent`
     /// for the lazy strategies indexes every dictionary position up to

@@ -1347,34 +1347,31 @@ impl DfastMatchGenerator {
         slot: &crate::encoding::dict_attach::DictIndexSlot<DfastDictTables>,
         dict_len: usize,
     ) -> bool {
-        let Some(tables) = slot.get() else {
-            return false;
-        };
         let (long_bits, short_bits) = self
             .dict_table_bits
             .unwrap_or((self.long_hash_bits, self.short_hash_bits));
-        if self.dict.is_attached()
-            || tables.long_bits != long_bits
-            || tables.short_bits != short_bits
-            || tables.mls != self.mls
-            || tables.index_floor != self.dict_index_floor
-        {
-            return false;
-        }
-        // The dictionary sits at the front of the history, so a full build
-        // ends at its length; the dfast build keeps no fill origin.
-        self.dict.attach_shared(tables, dict_len, 0);
-        true
+        let floor = self.dict_index_floor;
+        let mls = self.mls;
+        self.dict
+            .attach_published(slot, |tables, region_len, index_floor| {
+                tables.long_bits == long_bits
+                    && tables.short_bits == short_bits
+                    && tables.mls == mls
+                    && tables.index_floor == floor
+                    && index_floor == floor
+                    && region_len == dict_len
+            })
     }
 
     /// The dictionary tables this prime finished, attached or parked after
     /// filling a copy, for the prepared dictionary to hold.
-    pub(crate) fn primed_dict_tables(
+    pub(crate) fn published_dict_tables(
         &self,
-    ) -> Option<&crate::encoding::dict_attach::Shared<DfastDictTables>> {
+    ) -> Option<crate::encoding::dict_attach::Published<DfastDictTables>> {
+        let floor = self.dict_index_floor;
         self.dict
-            .primed_table()
-            .or_else(|| self.dict_keep.parked_table())
+            .published(floor)
+            .or_else(|| self.dict_keep.published(floor))
     }
 
     /// The attached dictionary tables' `(long, short)` widths for the next

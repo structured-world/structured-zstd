@@ -890,6 +890,39 @@ impl MatchTable {
         self.dictionary_active = primed_len != 0;
     }
 
+    /// Attach the tree a prepared dictionary holds for the first
+    /// `region_len` bytes of the live history, when it is the one
+    /// [`Self::prime_dms_bt`] would sort: same key width, compare budget,
+    /// hash log, region and index floor. Returns whether it was.
+    pub(crate) fn attach_shared_dms(
+        &mut self,
+        slot: &crate::encoding::dict_attach::DictIndexSlot<DmsDictTables>,
+        region_len: usize,
+    ) -> bool {
+        let region = region_len.min(self.live_history().len());
+        let mls = self.search_mls;
+        let nb_compares = self.search_depth.max(1);
+        let hash_log = self.dict_table_hash_log;
+        let floor = self.dict_index_floor;
+        self.dms
+            .attach_published(slot, |tables, built_region, index_floor| {
+                tables.layout == DmsDictLayout::Bt
+                    && tables.mls == mls
+                    && tables.nb_compares == nb_compares
+                    && tables.hash_log == hash_log
+                    && built_region == region
+                    && index_floor == floor
+            })
+    }
+
+    /// The dictionary tree this prime sorted, for the prepared dictionary to
+    /// hold.
+    pub(crate) fn published_dms(
+        &self,
+    ) -> Option<crate::encoding::dict_attach::Published<DmsDictTables>> {
+        self.dms.published(self.dict_index_floor)
+    }
+
     /// Build the immutable dictionary match **binary tree** (upstream zstd
     /// `ZSTD_dictMatchState`, the dms-BT walked in `ZSTD_insertBtAndGetAllMatches`
     /// `zstd_opt.c:777-813`) over the first `region_len` bytes of the live
