@@ -1943,6 +1943,10 @@ fn compress_block_fast_dict_borrowed_impl<
     let prefix_start_index = prefix_start_index + main_bias;
     let input_index = dict_end as u32 + main_bias;
     let dict_slots = dict_table.dict_slots();
+    // The lowest dictionary position a candidate may take: in the window, and
+    // past the empty-slot sentinel 0. One compare against it, as upstream's
+    // `dictMatchIndex > dictStartIndex` (zstd_fast.c:580).
+    let dict_floor = window_low.max(1);
 
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
@@ -2033,7 +2037,9 @@ fn compress_block_fast_dict_borrowed_impl<
             // frame filled.
             {
                 let dpos = dict_idx as usize;
-                if dict_idx >= 1 && dpos < dict_end && dpos >= window_low {
+                // The dictionary table holds dictionary positions only.
+                debug_assert!(dpos < dict_end);
+                if dpos >= dict_floor {
                     // Four bytes decide it before anything counts, the way
                     // upstream does (`MEM_read32(dictMatch) == MEM_read32(ip0)`,
                     // zstd_fast.c:578). A tag hit is only a candidate, and on
@@ -2061,12 +2067,13 @@ fn compress_block_fast_dict_borrowed_impl<
                     // Equal compressed LENGTHS would not have shown that — two
                     // different parses can weigh the same.
                     //
-                    // The compare needs four bytes on the dictionary side. A
-                    // candidate within three bytes of the dictionary's end has
-                    // them only by crossing into the input, which is a
-                    // different buffer here (upstream's window is contiguous,
-                    // so its `MEM_read32` reads across for free), so those few
-                    // positions keep the counting form.
+                    // The compare needs four bytes on the dictionary side. The
+                    // ordinary fill stops 8 bytes short of the dictionary's end,
+                    // but a table built otherwise can name one of its last three
+                    // bytes, whose four reach into the input, a different
+                    // buffer here (upstream's window is contiguous, so its
+                    // `MEM_read32` reads across for free); those keep the
+                    // counting form.
                     let m0 = if dpos + 4 <= dict_end {
                         // SAFETY: `dpos + 4 <= dict_end == dict.len()`, and
                         // `curr <= ilimit` leaves 8 readable bytes at `curr`.
@@ -2090,9 +2097,10 @@ fn compress_block_fast_dict_borrowed_impl<
                         let mut match_pos = dpos;
                         let mut m_len = m0;
                         // Backward catch-up into the dict (current side in input,
-                        // candidate side in the dict prefix).
-                        while match_ip > anchor
-                            && match_pos > window_low
+                        // candidate side in the dict prefix). The two bounds are
+                        // one branch, as upstream joins them with `&`
+                        // (zstd_fast.c:586).
+                        while ((match_ip > anchor) & (match_pos > window_low))
                             && unsafe { *inp_base.add(match_ip - 1) == dict[match_pos - 1] }
                         {
                             match_ip -= 1;
@@ -2164,9 +2172,10 @@ fn compress_block_fast_dict_borrowed_impl<
                         block_end - (ip0 + 4),
                     )
                 };
-                while match_ip > anchor
-                    && match_pos > 0
-                    && (dict_end + match_pos) > window_low
+                // `match_pos > rep_floor` is `match_pos > 0` and the window's
+                // `dict_end + match_pos > window_low` at once; with the anchor
+                // it is one branch, as upstream's `&` (zstd_fast.c:604).
+                while ((match_ip > anchor) & (match_pos > rep_floor))
                     && unsafe { *inp_base.add(match_ip - 1) == *inp_base.add(match_pos - 1) }
                 {
                     match_ip -= 1;
