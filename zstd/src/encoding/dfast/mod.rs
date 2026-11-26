@@ -4029,11 +4029,15 @@ macro_rules! start_matching_dict_loop_body {
                     // Long match at the cursor: live table first, dictionary only
                     // if that missed (zstd_double_fast.c:417-433, `else if
                     // dictTagsMatchL`).
-                    // Floor and cursor in one unsigned compare, as in the
-                    // no-dictionary loop: with two, the compiler tests the floor
-                    // first, and slots a previous frame left below it make that
-                    // branch mispredict.
-                    if dfast_branch!(4, idxl.wrapping_sub(min_slot) < packed_curr - min_slot) {
+                    // The floor alone, one compare against a slot value as
+                    // upstream's `matchIndexL >= prefixLowestIndex`
+                    // (zstd_double_fast.c:417): positions only climb across
+                    // frames and a reset that rewinds them empties the tables,
+                    // so every slot at or above the floor names a position of
+                    // this frame before the cursor.
+                    debug_assert!(idxl < min_slot || idxl < packed_curr);
+                    debug_assert!(idxs < min_slot || idxs < packed_curr);
+                    if dfast_branch!(4, idxl >= min_slot) {
                         // SAFETY: the gates admit only slots naming a position at
                         // or after the window floor and before the cursor, so this
                         // lands inside live history.
@@ -4099,7 +4103,7 @@ macro_rules! start_matching_dict_loop_body {
                     // the dictionary.
                     let short_cand_abs: usize;
                     let short_in_dict: bool;
-                    if dfast_branch!(9, idxs.wrapping_sub(min_slot) < packed_curr - min_slot) {
+                    if dfast_branch!(9, idxs >= min_slot) {
                         // SAFETY: as for the long slot above.
                         let cand4 = unsafe {
                             (slot_base_ptr.wrapping_add(idxs as usize) as *const u32)
@@ -4193,8 +4197,8 @@ macro_rules! start_matching_dict_loop_body {
                         // SAFETY: as for the read above.
                         unsafe { *long_hash_ptr.add(hl1_idx) = packed_next };
                         let mut live_hit = false;
-                        if dfast_branch!(16, idxl1.wrapping_sub(min_slot) < packed_next - min_slot)
-                        {
+                        debug_assert!(idxl1 < min_slot || idxl1 < packed_next);
+                        if dfast_branch!(16, idxl1 >= min_slot) {
                             // SAFETY: as for the long slot above.
                             let cand_v8 = unsafe {
                                 (slot_base_ptr.wrapping_add(idxl1 as usize) as *const u64)
