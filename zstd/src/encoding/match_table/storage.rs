@@ -44,13 +44,28 @@ pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 /// cumulative input on a 32-bit build and is astronomically far on 64-bit.
 pub(crate) const REBASE_RESET_FLOOR_CEILING: usize = usize::MAX >> 1;
 
-/// Ceiling for `max_window_size` after a dictionary bump: the eviction band is
-/// `2 * max_window_size` and the kernel asserts `data.len() <= u32::MAX`, so a
-/// large dictionary must not push the doubled band (plus one pending block)
-/// past `u32::MAX`. Both `prime_with_dictionary` and the re-borrow reset clamp
-/// to this so the doubled-band-plus-block invariant survives.
-pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
-    (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
+/// Ceiling for `max_window_size` after a dictionary bump: the widest window
+/// plus a quarter of it for the dictionary on a 64-bit target, so a frame's
+/// own window is never cut, and on a 32-bit one half of the `u32` position
+/// range less a block, as before. Every backend's positions stay in `u32`
+/// under it: the Fast history is capped by [`FAST_HISTORY_LIMIT`] rather than
+/// at two windows, and the backends holding absolute positions rebase them
+/// by less than the range left above this window. Both
+/// `prime_with_dictionary` and the re-borrow resets clamp to it.
+pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize = if usize::BITS >= 64 {
+    (1usize << crate::common::MAX_WINDOW_LOG) + (1usize << (crate::common::MAX_WINDOW_LOG - 2))
+} else {
+    (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2
+};
+const _: () = assert!(MAX_PRIMED_WINDOW_SIZE >= 1usize << crate::common::MAX_WINDOW_LOG);
+
+/// The most history the Fast backend holds, the block being read included:
+/// its positions are indices into the history, stored as `u32`, so the
+/// two-window eviction band stops short of that range.
+pub(crate) const FAST_HISTORY_LIMIT: usize =
+    u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize;
+const _: () =
+    assert!(MAX_PRIMED_WINDOW_SIZE + crate::common::MAX_BLOCK_SIZE as usize <= FAST_HISTORY_LIMIT);
 
 /// Whether a table buffer of `capacity` slots is too big to keep for a layout
 /// of `wanted` slots, and should be handed back rather than re-used.

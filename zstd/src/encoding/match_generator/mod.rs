@@ -90,6 +90,23 @@ pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 /// advance `position_base` so future inserts stay inside the `u32`
 /// window. Same scheme as `encoding/ldm/table.rs`.
 pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
+
+/// What a rebase of `u32` positions takes off every stored position for a
+/// `window`, in the dfast and long-distance tables: the guard band, or less
+/// where the window leaves less of the `u32` range above it. A rebase fires
+/// once a position passes `u32::MAX - reducer`, so the window's oldest byte
+/// then sits above `u32::MAX - reducer - window`, which this keeps above the
+/// reducer by two blocks: the whole window stays addressable through the
+/// rebase, as upstream's correction keeps every index up to `maxDist` in the
+/// past valid (`ZSTD_window_correctOverflow`). Up to a 2^30 window (and a
+/// dictionary under it) that is the guard band.
+pub(crate) fn rebase_reducer(window: usize) -> u32 {
+    // `window <= MAX_PRIMED_WINDOW_SIZE`, which leaves well over two blocks of
+    // the `u32` range above it.
+    debug_assert!(window <= super::match_table::storage::MAX_PRIMED_WINDOW_SIZE);
+    let spare = (u32::MAX as usize - window - 2 * crate::common::MAX_BLOCK_SIZE as usize) / 2;
+    spare.min(DFAST_REBASE_GUARD_BAND as usize) as u32
+}
 // `kSearchStrength` (upstream `zstd_compress_internal.h:32`). The dfast step
 // ramp grows one position every `1 << kSearchStrength` = 256 bytes travelled
 // (upstream `kStepIncr`, zstd_double_fast.c:131). A smaller value accelerates
@@ -592,14 +609,14 @@ pub(crate) fn history_ceiling(
     block: usize,
 ) -> usize {
     use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
-    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so the
-    // ceiling stays inside `usize` on a 32-bit target; a sum past `usize` is
-    // past it too.
+    // A sum past `usize` is past the ceiling too.
     let window = window
         .checked_add(dict_len)
         .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
     let slack = match backend {
-        super::strategy::BackendTag::Simple => window,
+        super::strategy::BackendTag::Simple => {
+            crate::encoding::simple::fast_matcher::eviction_cap(window) - window
+        }
         _ => window >> 2,
     };
     window + slack + block

@@ -167,15 +167,13 @@ impl MatchGeneratorDriver {
         // by the dictionary length so the eviction band keeps the
         // primed bytes in `history`.
         //
-        // Cap: `with_params`/`reset` enforce `window_log <= 30` so the
-        // eviction band `2 * max_window_size` stays below `u32::MAX`
-        // with headroom for one MAX_BLOCK_SIZE pending block — the
-        // kernel asserts `data.len() <= u32::MAX`. A large enough
-        // dictionary could otherwise push `max_window_size` past
-        // that ceiling via the `saturating_add` below and silently
-        // re-introduce the same overflow the `window_log` cap was
-        // designed to prevent. Clamp the post-priming size so the
-        // doubled-band-plus-block invariant survives.
+        // Cap: every backend keeps its positions inside `u32` only for a
+        // window up to MAX_PRIMED_WINDOW_SIZE (the Fast history is cut at
+        // FAST_HISTORY_LIMIT, the absolute-position backends rebase by less
+        // than the range left above it). A large enough dictionary could
+        // otherwise push `max_window_size` past that ceiling via the
+        // `saturating_add` below. Clamp the post-priming size so the
+        // invariant survives.
         use super::super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
 
         // `requested_dict_budget` is what the caller asked for;

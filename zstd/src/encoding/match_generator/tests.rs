@@ -5350,6 +5350,40 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     );
 }
 
+/// Under a window wider than the range a full guard band leaves (2^31 and a
+/// quarter of it for a dictionary), the dfast rebase takes off less, so a
+/// position as old as the window survives it in both tables: rebased by the
+/// guard band, the window's oldest byte would have dropped to the empty
+/// sentinel and a match the window allows would be lost.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn dfast_rebase_keeps_a_window_past_2_30() {
+    for window in [1usize << 31, (1usize << 31) + (1 << 29)] {
+        let mut dfast = DfastMatchGenerator::new(window);
+        dfast.set_hash_bits(10, 10);
+        dfast.ensure_hash_tables();
+        // The first position the rebase fires at, and the oldest one a match
+        // from there may still reach.
+        let reducer = super::rebase_reducer(window) as usize;
+        let trigger_abs = (u32::MAX as usize) - reducer + 1;
+        let oldest = trigger_abs - window;
+        let oldest_packed = dfast.pack_slot(oldest);
+        let short0 = dfast.long_len();
+        dfast.tables[short0] = oldest_packed;
+        dfast.tables[0] = oldest_packed;
+        dfast.ensure_room_for(trigger_abs);
+        assert_eq!(dfast.position_base, reducer, "a {window}-byte window");
+        for slot in [dfast.tables[0], dfast.tables[short0]] {
+            assert_ne!(slot, DFAST_EMPTY_SLOT, "a {window}-byte window");
+            assert_eq!(
+                dfast.position_base + slot as usize - 1,
+                oldest,
+                "a {window}-byte window: its oldest position survives the rebase"
+            );
+        }
+    }
+}
+
 #[test]
 fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blocks() {
     let mut matcher = DfastMatchGenerator::new(1 << 22);

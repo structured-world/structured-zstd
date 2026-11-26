@@ -19,7 +19,7 @@ use super::fastpath::EncodeTier;
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MIN_MATCH_LEN,
-    DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA, DFAST_SKIP_STEP_GROWTH_INTERVAL,
+    DFAST_SHORT_HASH_BITS_DELTA, DFAST_SKIP_STEP_GROWTH_INTERVAL,
 };
 use super::match_table::helpers::extend_backwards_shared;
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
@@ -658,10 +658,10 @@ impl DfastMatchGenerator {
 
     /// Ensure that an absolute position `abs_pos` fits in the `u32`
     /// slot encoding when packed. If the relative offset would
-    /// exceed `u32::MAX - DFAST_REBASE_GUARD_BAND`, advance the base
-    /// by `DFAST_REBASE_GUARD_BAND` (in a loop, in case the caller
-    /// jumped past multiple guard bands at once) and shift every
-    /// stored slot down by the same amount. Mirrors
+    /// exceed `u32::MAX - reducer`, advance the base by the reducer
+    /// (`rebase_reducer` for the window, the guard band up to a 2^30
+    /// window; in a loop, in case the caller jumped past several at once)
+    /// and shift every stored slot down by the same amount. Mirrors
     /// `LdmHashTable::ensure_room_for` and the upstream zstd's
     /// `ZSTD_window_reduce` semantics.
     pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
@@ -674,10 +674,8 @@ impl DfastMatchGenerator {
         let (max_rel, reducer) = if self.tagged {
             (DFAST_TAGGED_MAX_REL, DFAST_TAGGED_REBASE)
         } else {
-            (
-                u32::MAX as usize - DFAST_REBASE_GUARD_BAND as usize,
-                DFAST_REBASE_GUARD_BAND,
-            )
+            let reducer = crate::encoding::match_generator::rebase_reducer(self.max_window_size);
+            (u32::MAX as usize - reducer as usize, reducer)
         };
         while abs_pos - self.position_base > max_rel {
             self.reduce(reducer);
@@ -872,8 +870,9 @@ impl DfastMatchGenerator {
             self.window_blocks.push_back(region);
             // Bump the eviction window by the dict size (clamped to
             // MAX_PRIMED_WINDOW_SIZE) so the resident dict + the next input both
-            // stay — base is `1 << window_log` (<= 2^30 < the ceiling), so the
-            // headroom subtraction can't underflow and the sum can't overflow.
+            // stay — base is `1 << window_log`, at most the widest window, which
+            // the ceiling holds by a compile-time assertion, so the headroom
+            // subtraction can't underflow and the sum can't overflow.
             let headroom = crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE
                 - self.max_window_size;
             self.max_window_size += region.min(headroom);

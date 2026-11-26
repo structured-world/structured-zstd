@@ -604,6 +604,29 @@ fn skip_matching_with_none_hint_skips_hash_population() {
 /// just-arrived block for matching plus the retained prefix for
 /// cross-block lookups). The hard upper bound is therefore the
 /// eviction threshold itself: `2 × max_window_size`.
+/// The Fast eviction cap is two windows up to a 2^30 window, as before, and
+/// past that stops short of the `u32` position range while still holding a
+/// full window and a block: every position the kernel stores stays a `u32`
+/// for the widest window and the widest window a dictionary grows.
+#[test]
+fn eviction_cap_holds_a_window_and_a_block_inside_u32() {
+    let block = crate::common::MAX_BLOCK_SIZE as usize;
+    for log in [10, 20, 27, crate::common::MAX_WINDOW_LOG.min(30)] {
+        assert_eq!(eviction_cap(1 << log), 2 << log, "a 2^{log} window");
+    }
+    for window in [
+        1usize << crate::common::MAX_WINDOW_LOG,
+        MAX_PRIMED_WINDOW_SIZE,
+    ] {
+        let cap = eviction_cap(window);
+        assert!(
+            cap <= u32::MAX as usize - block,
+            "a {window}-byte window: {cap}"
+        );
+        assert!(cap >= window + block, "a {window}-byte window: {cap}");
+    }
+}
+
 #[test]
 fn extend_history_drains_old_prefix_past_two_window_sizes() {
     // window_log = 8 → max_window_size = 256, eviction threshold

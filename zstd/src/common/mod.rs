@@ -48,4 +48,8 @@ pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 31;
 #[cfg(not(target_pointer_width = "64"))]
 pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 30;
 
+/// The widest window log the encoder writes: upstream `ZSTD_WINDOWLOG_MAX`,
+/// the window [`MAX_DECODER_WINDOW_SIZE`] decodes.
+pub(crate) const MAX_WINDOW_LOG: u32 = MAX_DECODER_WINDOW_SIZE.trailing_zeros();
+
 pub(crate) mod inline_vec;

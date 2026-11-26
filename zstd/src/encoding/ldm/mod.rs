@@ -175,7 +175,8 @@ impl LdmProducer {
                 let mut hasher = XxHash64::with_seed(LDM_XXH64_SEED);
                 hasher.write(&live_history[split_idx..split_idx + min_match]);
                 let xxhash = hasher.finish();
-                self.hash_table.ensure_room_for(split_abs);
+                self.hash_table
+                    .ensure_room_for(split_abs, 1usize << self.params.window_log);
                 self.hash_table.insert_absolute(
                     (xxhash as u32) & hash_id_mask,
                     split_abs,
@@ -340,7 +341,8 @@ impl LdmProducer {
                 // rebase scheme — see `table.rs`); ensure room
                 // before every insert so streams beyond
                 // `u32::MAX` rebase transparently.
-                self.hash_table.ensure_room_for(split_abs);
+                self.hash_table
+                    .ensure_room_for(split_abs, 1usize << self.params.window_log);
 
                 // Upstream zstd `zstd_ldm.c:420-426`: if this split would
                 // emit a sequence overlapping the previous one,

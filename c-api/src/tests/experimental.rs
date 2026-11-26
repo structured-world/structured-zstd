@@ -138,14 +138,20 @@ fn adjust_cparams_matches_upstream() {
     // With 16-entry rows it does not, and the hash comes down to 28 bits.
     let narrow_rows = cparams([20, 20, 30, 1, 4, 0, 4]);
     assert_eq!(ZSTD_adjustCParams(narrow_rows, 0, 0).hashLog, 28);
-    // Upstream keeps windowLog 31 on 64-bit; this encoder's ceiling is 30.
+    // windowLog 31 is kept on a 64-bit target and clamped to 30 on a 32-bit
+    // one, as upstream's `ZSTD_WINDOWLOG_MAX` is.
+    let widest = if cfg!(target_pointer_width = "64") {
+        31
+    } else {
+        30
+    };
     assert_eq!(
         fields(ZSTD_adjustCParams(
             cparams([31, 30, 30, 30, 9, 200_000, 12]),
             0,
             0
         )),
-        [30, 30, 30, 30, 7, 131_072, 9]
+        [widest, 30, 30, 30, 7, 131_072, 9]
     );
 }
 

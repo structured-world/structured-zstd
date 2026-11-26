@@ -355,10 +355,12 @@ impl LdmHashTable {
     /// Ensure that absolute position `abs_pos` can be stored as a
     /// `u32` offset relative to [`Self::position_base`] without
     /// overflow. When the relative position would exceed
-    /// `u32::MAX − REBASE_GUARD_BAND`, advance `position_base` by
-    /// [`REBASE_GUARD_BAND`] and run [`Self::reduce`] across all
-    /// entries. In the common case (`rel <= max_rel`) the call is
-    /// a single compare and returns immediately.
+    /// `u32::MAX − reducer`, advance `position_base` by the reducer and
+    /// run [`Self::reduce`] across all entries; the reducer is
+    /// `rebase_reducer` of the `window` the producer searches, so the whole
+    /// window survives the shift ([`REBASE_GUARD_BAND`] up to a 2^30
+    /// window). In the common case (`rel <= max_rel`) the call is a single
+    /// compare and returns immediately.
     ///
     /// The producer calls this before every insert so positions
     /// past 4 GiB rebase transparently. Caller positions remain
@@ -366,7 +368,7 @@ impl LdmHashTable {
     /// `Self::insert_absolute` handle the relative-coordinate
     /// translation internally. Upstream zstd: `ZSTD_ldm_reduceTable`
     /// (`zstd_ldm.c:520`), invoked from `ZSTD_window_update`.
-    pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
+    pub(crate) fn ensure_room_for(&mut self, abs_pos: usize, window: usize) {
         if abs_pos < self.position_base {
             // The caller asked about a position BEFORE the
             // current base — that's the producer error case,
@@ -383,12 +385,14 @@ impl LdmHashTable {
         // that skips frame regions) would otherwise leave `rel`
         // above `u32::MAX` after a single shift and panic on the
         // next insert.
-        let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
+        let reducer = crate::encoding::match_generator::rebase_reducer(window);
+        debug_assert!(reducer <= REBASE_GUARD_BAND);
+        let max_rel = u32::MAX as usize - reducer as usize;
         while abs_pos - self.position_base > max_rel {
-            // Shift the base forward by `REBASE_GUARD_BAND` —
-            // matches upstream zstd's "subtract the reducer value, clamp
-            // anything below to 0" semantics.
-            self.reduce(REBASE_GUARD_BAND);
+            // Shift the base forward by the reducer — matches upstream
+            // zstd's "subtract the reducer value, clamp anything below to 0"
+            // semantics.
+            self.reduce(reducer);
         }
     }
 
