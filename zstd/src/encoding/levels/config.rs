@@ -829,6 +829,50 @@ pub fn estimated_bt_strategy_extra_bytes(
     crate::encoding::bt::BtMatcher::estimated_workspace_bytes(block) + hash3
 }
 
+/// Upper bound on the heap a prepared dictionary keeps for the match-finder
+/// tables built over `content_len` bytes of it at the given CDict parameters
+/// (`strategy` as upstream numbers it, fast = 1 .. btultra2 = 9): what
+/// [`EncoderDictionary`](crate::encoding::EncoderDictionary) holds for the
+/// backend that strategy runs once a compressor has indexed it (upstream's
+/// `cdict->matchState`). A dictionary used at levels of different backends
+/// keeps one such table per backend.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::encoding::estimated_dictionary_table_bytes;
+///
+/// // A double-fast long and short table, 4 bytes a slot.
+/// assert!(estimated_dictionary_table_bytes(2, 14, 13, 4096) >= 4 << 14 | 4 << 13);
+/// // The optimal parsers' tree holds two links per dictionary position.
+/// assert!(estimated_dictionary_table_bytes(9, 14, 15, 4096) >= 8 * 4096);
+/// ```
+pub fn estimated_dictionary_table_bytes(
+    strategy: u32,
+    hash_log: u32,
+    chain_log: u32,
+    content_len: usize,
+) -> usize {
+    let slots = |log: u32| 1usize.checked_shl(log).unwrap_or(usize::MAX);
+    let words = |log: u32| slots(log).saturating_mul(4);
+    let tables = match strategy {
+        // One hash table.
+        1 => words(hash_log),
+        // Long and short tables.
+        2 => words(hash_log).saturating_add(words(chain_log)),
+        // Rows (a position slot, a tag byte and per-row heads) or a hash and
+        // chain table, or a sorted tree in the same two tables.
+        3..=6 => words(hash_log)
+            .saturating_add(slots(hash_log).saturating_mul(2))
+            .saturating_add(words(chain_log)),
+        // The optimal parsers' tree: bucket roots and two links a position.
+        _ => words(hash_log).saturating_add(content_len.saturating_mul(8)),
+    };
+    // The table's struct and the shared allocation and slot it sits in.
+    const HOLDER_BYTES: usize = 512;
+    tables.saturating_add(HOLDER_BYTES)
+}
+
 /// Resolve a [`CompressionLevel`] (+ optional source-size hint) to the
 /// concrete [`LevelParams`] the matcher runs: strategy tag, search method
 /// (match-finder), window log, and per-backend config.

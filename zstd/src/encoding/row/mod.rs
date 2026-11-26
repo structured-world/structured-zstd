@@ -451,6 +451,16 @@ pub(crate) struct RowDictTables {
     pub(crate) index_floor: usize,
 }
 
+impl crate::encoding::dict_attach::DictTableHeap for RowDictTables {
+    fn heap_bytes(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        self.heads.capacity()
+            + self.positions.capacity() * u32_sz
+            + self.tags.capacity()
+            + (self.hc_hash.capacity() + self.hc_chain.capacity()) * u32_sz
+    }
+}
+
 /// Everything besides the dictionary that a dictionary index's contents
 /// depend on, all from the CDict's cParams: the table geometry and form, and
 /// the key width and tree depth its positions were hashed and sorted with.
@@ -2923,7 +2933,7 @@ impl RowMatchGenerator {
     /// Heap bytes this matcher owns: history, the row head/position/tag tables,
     /// the chunk-length deque, and any attached dictionary row index.
     pub(crate) fn heap_size(&self) -> usize {
-        let u32_sz = core::mem::size_of::<u32>();
+        use crate::encoding::dict_attach::DictTableHeap;
         self.chunk_lens.capacity() * core::mem::size_of::<usize>()
             // The history and one buffer for whichever finder is live (the row
             // positions with the cursors and tags in its byte tail, or the
@@ -2936,12 +2946,7 @@ impl RowMatchGenerator {
                 .table()
                 .into_iter()
                 .chain(self.dict_keep.table())
-                .map(|t| {
-                    t.heads.capacity()
-                        + t.positions.capacity() * u32_sz
-                        + t.tags.capacity()
-                        + (t.hc_hash.capacity() + t.hc_chain.capacity()) * u32_sz
-                })
+                .map(DictTableHeap::heap_bytes)
                 .sum::<usize>()
             + self.dict_keep.slot_bytes()
     }
@@ -5120,6 +5125,44 @@ impl RowMatchGenerator {
         self.dict_keep.revive(&mut self.dict, |index, region_len| {
             index.shape == shape && index.index_floor == floor && region_len == dict_len
         })
+    }
+
+    /// Attach the index a prepared dictionary of `dict_len` bytes holds, on
+    /// the terms [`Self::revive_dict_cache`] takes a parked one: a frame that
+    /// attaches the dictionary or copies it from its index, at the
+    /// [`RowDictShape`] and index floor this frame resolves. Returns whether
+    /// it was.
+    pub(crate) fn attach_shared_dict_index(
+        &mut self,
+        slot: &crate::encoding::dict_attach::DictIndexSlot<RowDictTables>,
+        dict_len: usize,
+    ) -> bool {
+        let Some(plan) = self
+            .dict_plan
+            .filter(|plan| plan.attach || self.dict_index_serves_copy(*plan))
+        else {
+            return false;
+        };
+        let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
+        let floor = self.dict_index_floor;
+        self.dict
+            .attach_published(slot, |index, region_len, index_floor| {
+                index.shape == shape
+                    && index.index_floor == floor
+                    && index_floor == floor
+                    && region_len == dict_len
+            })
+    }
+
+    /// The dictionary index this prime finished, attached or parked after
+    /// filling a copy, for the prepared dictionary to hold.
+    pub(crate) fn published_dict_index(
+        &self,
+    ) -> Option<crate::encoding::dict_attach::Published<RowDictTables>> {
+        let floor = self.dict_index_floor;
+        self.dict
+            .published(floor)
+            .or_else(|| self.dict_keep.published(floor))
     }
 
     /// Index the just-committed dictionary block (current `chunk_lens` tail)

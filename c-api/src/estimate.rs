@@ -187,28 +187,44 @@ pub unsafe extern "C" fn ZSTD_estimateDStreamSize_fromFrame(
 }
 
 /// `size_t ZSTD_estimateCDictSize(size_t dictSize, int compressionLevel)` —
-/// budget for a `ZSTD_CDict` made from a `dictSize`-byte dictionary. The
-/// dictionary keeps its content and entropy tables; the match-finder tables
-/// are built in the compressing context, so the level does not change it.
+/// budget for a `ZSTD_CDict` made from a `dictSize`-byte dictionary: its
+/// content and entropy tables, and the match-finder tables it keeps for the
+/// level's backend once a context has indexed it.
 #[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_estimateCDictSize(dict_size: usize, _compression_level: c_int) -> usize {
+pub extern "C" fn ZSTD_estimateCDictSize(dict_size: usize, compression_level: c_int) -> usize {
     // An upper bound saturates: `usize::MAX` still bounds any allocation.
     core::mem::size_of::<crate::cdict::ZSTD_CDict>().saturating_add(
-        codec::encoding::EncoderDictionary::estimated_heap_size(dict_size),
+        codec::encoding::EncoderDictionary::estimated_heap_size(
+            dict_size,
+            CompressionLevel::from_level(compression_level),
+        ),
     )
 }
 
 /// `size_t ZSTD_estimateCDictSize_advanced(size_t dictSize,
 /// ZSTD_compressionParameters cParams, ZSTD_dictLoadMethod_e dictLoadMethod)`
-/// — as [`ZSTD_estimateCDictSize`]. The content is always copied, so the load
-/// method does not change it, and neither do the parameters.
+/// is [`ZSTD_estimateCDictSize`] with the match-finder tables at `cParams` in
+/// place of a level's. The content is always copied, so the load method
+/// does not change it.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_estimateCDictSize_advanced(
     dict_size: usize,
-    _cparams: ZSTD_compressionParameters,
+    cparams: ZSTD_compressionParameters,
     _dict_load_method: c_int,
 ) -> usize {
-    ZSTD_estimateCDictSize(dict_size, 0)
+    // The dictionary's own part, then its tables at the given parameters.
+    // An upper bound saturates: `usize::MAX` still bounds any allocation.
+    core::mem::size_of::<crate::cdict::ZSTD_CDict>()
+        .saturating_add(codec::encoding::EncoderDictionary::estimated_heap_size(
+            dict_size,
+            CompressionLevel::Uncompressed,
+        ))
+        .saturating_add(codec::encoding::estimated_dictionary_table_bytes(
+            cparams.strategy,
+            cparams.hashLog,
+            cparams.chainLog,
+            dict_size,
+        ))
 }
 
 /// `size_t ZSTD_estimateDDictSize(size_t dictSize, ZSTD_dictLoadMethod_e

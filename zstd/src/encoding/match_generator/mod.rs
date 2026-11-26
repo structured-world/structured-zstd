@@ -1079,6 +1079,18 @@ impl MatchGeneratorDriver {
         self.dfast_matcher().dict_table_builds
     }
 
+    /// Dictionary tables the active backend started, built anew or copied
+    /// from a shared one. Test-only.
+    #[cfg(test)]
+    pub(crate) fn dict_tables_built(&self) -> usize {
+        match &self.storage {
+            MatcherStorage::Simple(s) => s.dict_tables_built(),
+            MatcherStorage::Dfast(d) => d.dict.built,
+            MatcherStorage::Row(r) => r.dict.built,
+            MatcherStorage::HashChain(hc) => hc.table.dms.built,
+        }
+    }
+
     /// Whether a snapshot of a primed dictionary's tables is held. Test-only.
     #[cfg(test)]
     pub(crate) fn holds_primed_snapshot(&self) -> bool {
@@ -1870,10 +1882,14 @@ impl Matcher for MatchGeneratorDriver {
                 // deliberately one bit under upstream's `hashLog`: the long
                 // table's extra bit doubles what a small frame clears (a fresh
                 // 10 KiB level-3 frame ran 36% slower) for a few bytes per
-                // megabyte of output. Only tables holding the input alone are
+                // megabyte of output. Only frames without a dictionary are
                 // capped: a copied or loaded dictionary sits in the live tables
-                // too, which keep the widths resolved for it.
-                let input_only = dict_hint.is_none() || dict_attaches;
+                // too, which keep the widths resolved for it, and an attached
+                // one keeps upstream's widths for the input alone. Capped, its
+                // long table held twice the live slots a position probes, so
+                // the in-window test there ran 25% taken where upstream's runs
+                // 15%, and mispredicted with it.
+                let input_only = dict_hint.is_none();
                 let window_bits =
                     self.reset_size_log
                         .filter(|_| input_only)
@@ -2085,7 +2101,7 @@ impl Matcher for MatchGeneratorDriver {
         // calls `prime_with_dictionary_with` under its frame's tier.
         crate::encoding::fastpath::with_encode_tier!(
             self.tier,
-            K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist)
+            K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist, None)
         )
     }
 

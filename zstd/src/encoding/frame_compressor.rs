@@ -60,6 +60,10 @@ pub struct EncoderDictionary {
 pub(crate) struct EncoderDictionaryParts {
     dictionary: crate::decoding::Dictionary,
     pub(crate) entropy: CachedDictionaryEntropy,
+    /// The match finders' tables over the content, built by the first
+    /// compressor that indexes it and attached by reference by the rest
+    /// (upstream `cdict->matchState`).
+    pub(crate) index: crate::encoding::dict_attach::DictIndex,
 }
 
 impl core::ops::Deref for EncoderDictionaryParts {
@@ -85,6 +89,7 @@ impl EncoderDictionary {
             inner: SharedEncoderDictionary::new(EncoderDictionaryParts {
                 dictionary,
                 entropy,
+                index: crate::encoding::dict_attach::DictIndex::default(),
             }),
             serialized_len,
             prepared_at_level: false,
@@ -203,9 +208,12 @@ impl EncoderDictionary {
     }
 
     /// Heap bytes the prepared dictionary holds: the shared allocation itself,
-    /// the parsed dictionary's content and tables, and the entropy tables it
-    /// seeds. Clones share all of it, so this counts once however many
-    /// compressors the dictionary is attached to.
+    /// the parsed dictionary's content and tables, the entropy tables it
+    /// seeds, and the match-finder tables compressors built over it and left
+    /// with it once no compressor holds them any more (one a compressor still
+    /// holds is in that compressor's own size). Clones share all of it, so
+    /// this counts once however many compressors the dictionary is attached
+    /// to.
     ///
     /// # Examples
     /// ```
@@ -219,30 +227,59 @@ impl EncoderDictionary {
         Self::shared_allocation_size()
             + self.inner.dictionary.heap_bytes()
             + self.inner.entropy.heap_size()
+            + self.inner.index.heap_size()
     }
 
     /// Upper bound on [`Self::heap_size`] for a dictionary prepared from a
-    /// `serialized_len`-byte blob, before preparing it: for budgeting memory
-    /// ahead of time, as the C `ZSTD_estimateCDictSize` does.
+    /// `serialized_len`-byte blob and compressed with at `level`, before
+    /// preparing it: for budgeting memory ahead of time, as the C
+    /// `ZSTD_estimateCDictSize(dictSize, level)` does. It covers the
+    /// match-finder tables the dictionary keeps for that level's backend at
+    /// its own parameters (see [`estimated_dictionary_table_bytes`]); a
+    /// dictionary also used at a level of another backend keeps that
+    /// backend's tables too.
+    ///
+    /// [`estimated_dictionary_table_bytes`]: crate::encoding::estimated_dictionary_table_bytes
     ///
     /// # Examples
     /// ```
-    /// use structured_zstd::encoding::EncoderDictionary;
+    /// use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
     ///
-    /// let blob = b"raw content, no header";
+    /// let blob = b"raw content, no header, long enough to be indexed by a compressor";
     /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(blob).unwrap();
-    /// assert!(dictionary.heap_size() <= EncoderDictionary::estimated_heap_size(blob.len()));
+    /// let level = CompressionLevel::Level(3);
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    /// compressor.set_encoder_dictionary(dictionary.clone()).unwrap();
+    /// compressor.compress_independent_frame(b"raw content, a frame");
+    /// drop(compressor);
+    /// assert!(dictionary.heap_size() <= EncoderDictionary::estimated_heap_size(blob.len(), level));
     /// ```
-    pub fn estimated_heap_size(serialized_len: usize) -> usize {
+    pub fn estimated_heap_size(serialized_len: usize, level: CompressionLevel) -> usize {
         // The content is at most the blob. The tables are bounded by their
         // largest form: every FSE table and the Huffman table at their maximum
         // accuracy, as a dictionary's entropy section can declare them.
         const PREPARED_TABLES_HEAP: usize = 64 * 1024;
+        let match_finder = if matches!(level, CompressionLevel::Uncompressed) {
+            0
+        } else {
+            let cdict = crate::encoding::cparams::get_cdict_cparams(
+                crate::encoding::levels::config::numeric_level(level),
+                serialized_len,
+                &crate::encoding::parameters::ParamOverrides::default(),
+            );
+            crate::encoding::estimated_dictionary_table_bytes(
+                cdict.strategy,
+                cdict.hash_log,
+                cdict.chain_log,
+                serialized_len,
+            )
+        };
         // Saturating on purpose: `usize::MAX` still bounds what no allocation
         // can exceed, where a wrapped sum would under-report.
         Self::shared_allocation_size()
             .saturating_add(serialized_len)
             .saturating_add(PREPARED_TABLES_HEAP)
+            .saturating_add(match_finder)
     }
 
     /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two
@@ -1372,7 +1409,11 @@ pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
         let content = dict.inner.dict_content.as_slice();
         // The built-in matcher indexes the dictionary under the frame's tier.
         match state.matcher.builtin_driver() {
-            Some(driver) => driver.prime_with_dictionary_with::<K>(content, dict.inner.offset_hist),
+            Some(driver) => driver.prime_with_dictionary_with::<K>(
+                content,
+                dict.inner.offset_hist,
+                Some(&dict.inner.index),
+            ),
             None => state
                 .matcher
                 .prime_with_dictionary(content, dict.inner.offset_hist),

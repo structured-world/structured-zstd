@@ -68,10 +68,15 @@ impl MatchGeneratorDriver {
 
     /// [`crate::encoding::Matcher::prime_with_dictionary`] compiled for the kernel tier `K`, the one the encoder chose for the
     /// frame.
+    ///
+    /// `index` is the prepared dictionary's own tables, when the dictionary
+    /// came prepared: a backend whose geometry matches attaches them instead
+    /// of building its own, and one that builds publishes what it built.
     pub(crate) fn prime_with_dictionary_with<K: crate::encoding::fastpath::EncodeTier>(
         &mut self,
         dict_content: &[u8],
         offset_hist: [u32; 3],
+        index: Option<&crate::encoding::dict_attach::DictIndex>,
     ) {
         match self.active_backend() {
             super::super::strategy::BackendTag::Simple => {
@@ -130,12 +135,29 @@ impl MatchGeneratorDriver {
             super::super::strategy::BackendTag::Dfast
                 if self.dict_attached() || dfast_copies_index =>
             {
-                self.dfast_matcher_mut()
-                    .revive_dict_cache(dict_content.len());
+                let dfast = self.dfast_matcher_mut();
+                if !dfast.revive_dict_cache(dict_content.len())
+                    && let Some(index) = index
+                {
+                    dfast.attach_shared_dict_tables(&index.dfast, dict_content.len());
+                }
             }
             // The row backend's plan says whether this frame attaches.
             super::super::strategy::BackendTag::Row => {
-                self.row_matcher_mut().revive_dict_cache(dict_content.len());
+                let row = self.row_matcher_mut();
+                if !row.revive_dict_cache(dict_content.len())
+                    && let Some(index) = index
+                {
+                    row.attach_shared_dict_index(&index.row, dict_content.len());
+                }
+            }
+            // The Fast backend keeps a dictionary table only for frames that
+            // attach the dictionary.
+            super::super::strategy::BackendTag::Simple if self.dict_attached() => {
+                if let Some(index) = index {
+                    self.simple_mut()
+                        .attach_shared_dict_table(&index.fast, dict_content.len());
+                }
             }
             _ => {}
         }
@@ -345,7 +367,17 @@ impl MatchGeneratorDriver {
             // `skip_matching_for_dictionary_priming`, so it carries no separate
             // dms — drop any stale one.
             if attach {
-                table.prime_dms_bt(committed_dict_budget);
+                // A prepared dictionary's own tree, when it is the one this
+                // frame would sort; the tree this frame sorts becomes it.
+                let shared = index.is_some_and(|index| {
+                    table.attach_shared_dms(&index.dms, committed_dict_budget)
+                });
+                if !shared {
+                    table.prime_dms_bt(committed_dict_budget);
+                }
+                if let Some(index) = index {
+                    index.dms.publish_with(|| table.published_dms());
+                }
             } else {
                 table.dms.invalidate();
             }
@@ -365,6 +397,27 @@ impl MatchGeneratorDriver {
             }
             super::super::strategy::BackendTag::Row => self.row_matcher_mut().mark_dict_primed(),
             _ => {}
+        }
+        // The tables just built become the dictionary's, for the compressors
+        // it attaches to next. Not those of a frame that loads the dictionary
+        // into its own tables: they are sized for that frame rather than for
+        // the dictionary, and a dictionary keeps only tables at its own
+        // cParams, as upstream's CDict does (what its size estimate bounds).
+        if let Some(index) = index
+            && self.reset_dict_use() != Some(crate::encoding::levels::config::DictUse::Load)
+        {
+            match self.active_backend() {
+                super::super::strategy::BackendTag::Dfast => index
+                    .dfast
+                    .publish_with(|| self.dfast_matcher_mut().published_dict_tables()),
+                super::super::strategy::BackendTag::Row => index
+                    .row
+                    .publish_with(|| self.row_matcher_mut().published_dict_index()),
+                super::super::strategy::BackendTag::Simple => index
+                    .fast
+                    .publish_with(|| self.simple_mut().published_dict_table()),
+                super::super::strategy::BackendTag::HashChain => {}
+            }
         }
         // The dictionary is indexed; later inserts are the input's own.
         self.storage.set_dictionary_index_floor(0);

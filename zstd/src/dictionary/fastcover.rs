@@ -187,26 +187,23 @@ impl<'s> FastCoverContext<'s> {
     }
 
     /// Build content of at most `capacity` bytes from segments of `k` bytes
-    /// (upstream zstd `FASTCOVER_buildDictionary`). `freqs` is scratch the
-    /// build refills with the counted frequencies and spends, so one table
-    /// serves every build; `out` is scratch the content is written into, and
-    /// the returned slice borrows it.
+    /// (upstream zstd `FASTCOVER_buildDictionary`). The build spends the
+    /// counted frequencies in place and puts back every count it spent from
+    /// `undo`, scratch the build refills, so the table is the counted one again
+    /// for the next `k`; upstream copies the whole table per build instead,
+    /// `2^f` counts where a build spends at most one per dmer it selects.
+    /// `out` is scratch the content is written into, and the returned slice
+    /// borrows it.
     pub(super) fn build<'o>(
-        &self,
-        freqs: &mut Vec<u32>,
+        &mut self,
+        undo: &mut Vec<(u32, u32)>,
         window: &mut WindowCounts,
         out: &'o mut Vec<u8>,
         capacity: usize,
         k: usize,
     ) -> Result<&'o [u8], TableTooLarge> {
         debug_assert!(self.d <= k);
-        freqs.clear();
-        freqs
-            .try_reserve_exact(self.freqs.len())
-            .map_err(|_| TableTooLarge {
-                entries: self.freqs.len(),
-            })?;
-        freqs.extend_from_slice(&self.freqs);
+        undo.clear();
         let layout = EpochLayout {
             dmers_in_k: k - self.d + 1,
             epochs: compute_epochs(capacity, self.nb_dmers, k, 1),
@@ -217,26 +214,43 @@ impl<'s> FastCoverContext<'s> {
         // A window holds at most `dmers_in_k + 1` occurrences of one index (one
         // past the segment before the oldest leaves). Upstream zstd keeps them in
         // `u16` for any `k`; a longer segment than that counts in `u32`.
-        let WindowCounts { narrow, wide, ring } = window;
+        let WindowCounts { narrow, wide } = window;
+        // Moved out for the build, so `select_segments` reads the context and
+        // spends the table at once; moved back below.
+        let mut freqs = core::mem::take(&mut self.freqs);
         let tail = if layout.dmers_in_k < usize::from(u16::MAX) {
-            let counts = narrow.get_or_insert_with_result(self.f)?;
-            with_hashed_bytes!(self.d, H => self.select_segments::<H, u16>(out, freqs, counts, ring, layout))
+            let counts = narrow.get_or_insert_with_result(self.f);
+            counts.map(|counts| {
+                with_hashed_bytes!(self.d, H => self.select_segments::<H, u16>(out, &mut freqs, undo, counts, layout))
+            })
         } else {
-            let counts = wide.get_or_insert_with_result(self.f)?;
-            with_hashed_bytes!(self.d, H => self.select_segments::<H, u32>(out, freqs, counts, ring, layout))
+            let counts = wide.get_or_insert_with_result(self.f);
+            counts.map(|counts| {
+                with_hashed_bytes!(self.d, H => self.select_segments::<H, u32>(out, &mut freqs, undo, counts, layout))
+            })
         };
-        Ok(&out[tail..])
+        // Each spent slot was logged once, the first time it went to zero.
+        for &(idx, count) in undo.iter() {
+            freqs[idx as usize] = count;
+        }
+        self.freqs = freqs;
+        Ok(&out[tail?..])
     }
 
     /// Pick a segment per epoch visit until `out` is filled from its end, and
     /// return where the content starts in it. `H` is the number of bytes a
     /// dmer hashes.
+    ///
+    /// Out of line, as upstream's `FASTCOVER_selectSegment` is: inlined into
+    /// the search driver, the window loop ran out of registers and reloaded
+    /// its pointers and bounds from the stack at every position.
+    #[inline(never)]
     fn select_segments<const H: usize, C: WindowCount>(
         &self,
         out: &mut [u8],
         freqs: &mut [u32],
+        undo: &mut Vec<(u32, u32)>,
         segment_freqs: &mut [C],
-        ring: &mut Vec<u32>,
         layout: EpochLayout,
     ) -> usize {
         let EpochLayout { dmers_in_k, epochs } = layout;
@@ -251,18 +265,11 @@ impl<'s> FastCoverContext<'s> {
         let base = sample.as_ptr();
         let freq_ptr = freqs.as_mut_ptr();
         let window_ptr = segment_freqs.as_mut_ptr();
-        // A window reaching this many positions sheds its oldest.
+        // A window reaching this many positions sheds its oldest. The leaving
+        // dmer is hashed again, as upstream does: a ring of the window's
+        // indices saves the hash but keeps four more values live in the loop,
+        // which spill on x86-64 and cost more than the hash.
         let window_limit = dmers_in_k + 1;
-        // The window's dmer indices in arrival order, so each position is
-        // hashed once as it enters and read back as it leaves. Upstream hashes
-        // it again on the way out. A window never spans more than its epoch,
-        // so a segment longer than the longest epoch, the last one, needs no
-        // more room than that.
-        let longest_epoch = self.nb_dmers - (epochs.num - 1) * epochs.size;
-        let ring_len = window_limit.min(longest_epoch);
-        ring.clear();
-        ring.resize(ring_len, 0);
-        let ring_ptr = ring.as_mut_ptr();
         // Fill from the back (upstream zstd layout) so the best segments sit at
         // the end of the dictionary and get referenced with the smallest offsets.
         let mut tail = out.len();
@@ -285,17 +292,9 @@ impl<'s> FastCoverContext<'s> {
             let mut active_begin = epoch_begin;
             let mut active_end = epoch_begin;
             let mut active_score = 0u64;
-            let mut ring_head = 0usize;
-            let mut ring_tail = 0usize;
             while active_end < epoch_end {
                 // SAFETY: `active_end < epoch_end <= nb_dmers`; see above.
-                // `ring_tail < ring_len`, the ring's length.
                 let idx = unsafe { hash_at::<H>(base.add(active_end), f) };
-                unsafe { *ring_ptr.add(ring_tail) = idx as u32 };
-                ring_tail += 1;
-                if ring_tail == ring_len {
-                    ring_tail = 0;
-                }
                 // SAFETY: `idx < 2^f`, both tables' length.
                 let count = unsafe { &mut *window_ptr.add(idx) };
                 if *count == zero {
@@ -304,13 +303,8 @@ impl<'s> FastCoverContext<'s> {
                 *count += one;
                 active_end += 1;
                 if active_end - active_begin == window_limit {
-                    // SAFETY: `ring_head < ring_len`; the index it holds was
-                    // hashed from a position, so it is below `2^f`.
-                    let del = unsafe { *ring_ptr.add(ring_head) } as usize;
-                    ring_head += 1;
-                    if ring_head == ring_len {
-                        ring_head = 0;
-                    }
+                    // SAFETY: `active_begin < active_end <= nb_dmers`.
+                    let del = unsafe { hash_at::<H>(base.add(active_begin), f) };
                     let count = unsafe { &mut *window_ptr.add(del) };
                     *count -= one;
                     if *count == zero {
@@ -327,11 +321,7 @@ impl<'s> FastCoverContext<'s> {
             // Reset the window counts for the next epoch.
             while active_begin < epoch_end {
                 // SAFETY: as for the leaving position above.
-                let del = unsafe { *ring_ptr.add(ring_head) } as usize;
-                ring_head += 1;
-                if ring_head == ring_len {
-                    ring_head = 0;
-                }
+                let del = unsafe { hash_at::<H>(base.add(active_begin), f) };
                 unsafe { *window_ptr.add(del) -= one };
                 active_begin += 1;
             }
@@ -351,9 +341,18 @@ impl<'s> FastCoverContext<'s> {
                 "the best segment ends on a dmer that scores"
             );
             // Zero the chosen segment's frequencies: its dmers are covered.
+            // A slot is logged the first time it is spent, so the build can put
+            // the table back; one already zero has nothing to restore.
             for pos in best_begin..best_end {
                 // SAFETY: `pos < best_end <= epoch_end <= nb_dmers`.
-                unsafe { *freq_ptr.add(hash_at::<H>(base.add(pos), f)) = 0 };
+                let idx = unsafe { hash_at::<H>(base.add(pos), f) };
+                // SAFETY: `idx < 2^f`, the table's length.
+                let slot = unsafe { &mut *freq_ptr.add(idx) };
+                if *slot != 0 {
+                    // `idx < 2^f <= 2^MAX_F`, which fits `u32`.
+                    undo.push((idx as u32, *slot));
+                    *slot = 0;
+                }
             }
 
             if best_score == 0 {
@@ -420,13 +419,11 @@ impl WindowCount for u16 {}
 impl WindowCount for u32 {}
 
 /// Per-window occurrence counts (upstream zstd `segmentFreqs`), kept across
-/// builds: every build leaves them zero, so one table serves every `k`. With
-/// them, the ring of the window's dmer indices.
+/// builds: every build leaves them zero, so one table serves every `k`.
 #[derive(Default)]
 pub(super) struct WindowCounts {
     narrow: LazyCounts<u16>,
     wide: LazyCounts<u32>,
-    ring: Vec<u32>,
 }
 
 struct LazyCounts<C>(Option<Vec<C>>);
