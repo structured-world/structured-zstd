@@ -187,26 +187,23 @@ impl<'s> FastCoverContext<'s> {
     }
 
     /// Build content of at most `capacity` bytes from segments of `k` bytes
-    /// (upstream zstd `FASTCOVER_buildDictionary`). `freqs` is scratch the
-    /// build refills with the counted frequencies and spends, so one table
-    /// serves every build; `out` is scratch the content is written into, and
-    /// the returned slice borrows it.
+    /// (upstream zstd `FASTCOVER_buildDictionary`). The build spends the
+    /// counted frequencies in place and puts back every count it spent from
+    /// `undo`, scratch the build refills, so the table is the counted one again
+    /// for the next `k`; upstream copies the whole table per build instead,
+    /// `2^f` counts where a build spends at most one per dmer it selects.
+    /// `out` is scratch the content is written into, and the returned slice
+    /// borrows it.
     pub(super) fn build<'o>(
-        &self,
-        freqs: &mut Vec<u32>,
+        &mut self,
+        undo: &mut Vec<(u32, u32)>,
         window: &mut WindowCounts,
         out: &'o mut Vec<u8>,
         capacity: usize,
         k: usize,
     ) -> Result<&'o [u8], TableTooLarge> {
         debug_assert!(self.d <= k);
-        freqs.clear();
-        freqs
-            .try_reserve_exact(self.freqs.len())
-            .map_err(|_| TableTooLarge {
-                entries: self.freqs.len(),
-            })?;
-        freqs.extend_from_slice(&self.freqs);
+        undo.clear();
         let layout = EpochLayout {
             dmers_in_k: k - self.d + 1,
             epochs: compute_epochs(capacity, self.nb_dmers, k, 1),
@@ -218,14 +215,26 @@ impl<'s> FastCoverContext<'s> {
         // past the segment before the oldest leaves). Upstream zstd keeps them in
         // `u16` for any `k`; a longer segment than that counts in `u32`.
         let WindowCounts { narrow, wide } = window;
+        // Moved out for the build, so `select_segments` reads the context and
+        // spends the table at once; moved back below.
+        let mut freqs = core::mem::take(&mut self.freqs);
         let tail = if layout.dmers_in_k < usize::from(u16::MAX) {
-            let counts = narrow.get_or_insert_with_result(self.f)?;
-            with_hashed_bytes!(self.d, H => self.select_segments::<H, u16>(out, freqs, counts, layout))
+            let counts = narrow.get_or_insert_with_result(self.f);
+            counts.map(|counts| {
+                with_hashed_bytes!(self.d, H => self.select_segments::<H, u16>(out, &mut freqs, undo, counts, layout))
+            })
         } else {
-            let counts = wide.get_or_insert_with_result(self.f)?;
-            with_hashed_bytes!(self.d, H => self.select_segments::<H, u32>(out, freqs, counts, layout))
+            let counts = wide.get_or_insert_with_result(self.f);
+            counts.map(|counts| {
+                with_hashed_bytes!(self.d, H => self.select_segments::<H, u32>(out, &mut freqs, undo, counts, layout))
+            })
         };
-        Ok(&out[tail..])
+        // Each spent slot was logged once, the first time it went to zero.
+        for &(idx, count) in undo.iter() {
+            freqs[idx as usize] = count;
+        }
+        self.freqs = freqs;
+        Ok(&out[tail?..])
     }
 
     /// Pick a segment per epoch visit until `out` is filled from its end, and
@@ -240,6 +249,7 @@ impl<'s> FastCoverContext<'s> {
         &self,
         out: &mut [u8],
         freqs: &mut [u32],
+        undo: &mut Vec<(u32, u32)>,
         segment_freqs: &mut [C],
         layout: EpochLayout,
     ) -> usize {
@@ -331,9 +341,18 @@ impl<'s> FastCoverContext<'s> {
                 "the best segment ends on a dmer that scores"
             );
             // Zero the chosen segment's frequencies: its dmers are covered.
+            // A slot is logged the first time it is spent, so the build can put
+            // the table back; one already zero has nothing to restore.
             for pos in best_begin..best_end {
                 // SAFETY: `pos < best_end <= epoch_end <= nb_dmers`.
-                unsafe { *freq_ptr.add(hash_at::<H>(base.add(pos), f)) = 0 };
+                let idx = unsafe { hash_at::<H>(base.add(pos), f) };
+                // SAFETY: `idx < 2^f`, the table's length.
+                let slot = unsafe { &mut *freq_ptr.add(idx) };
+                if *slot != 0 {
+                    // `idx < 2^f <= 2^MAX_F`, which fits `u32`.
+                    undo.push((idx as u32, *slot));
+                    *slot = 0;
+                }
             }
 
             if best_score == 0 {
