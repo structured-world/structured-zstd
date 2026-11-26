@@ -1943,6 +1943,10 @@ fn compress_block_fast_dict_borrowed_impl<
     let prefix_start_index = prefix_start_index + main_bias;
     let input_index = dict_end as u32 + main_bias;
     let dict_slots = dict_table.dict_slots();
+    // The lowest dictionary position a candidate may take: in the window, and
+    // past the empty-slot sentinel 0. One compare against it, as upstream's
+    // `dictMatchIndex > dictStartIndex` (zstd_fast.c:580).
+    let dict_floor = window_low.max(1);
 
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
@@ -2033,7 +2037,9 @@ fn compress_block_fast_dict_borrowed_impl<
             // frame filled.
             {
                 let dpos = dict_idx as usize;
-                if dict_idx >= 1 && dpos < dict_end && dpos >= window_low {
+                // The dictionary table holds dictionary positions only.
+                debug_assert!(dpos < dict_end);
+                if dpos >= dict_floor {
                     // Four bytes decide it before anything counts, the way
                     // upstream does (`MEM_read32(dictMatch) == MEM_read32(ip0)`,
                     // zstd_fast.c:578). A tag hit is only a candidate, and on
