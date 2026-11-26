@@ -842,7 +842,7 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
         driver.reset(CompressionLevel::Level(3));
         let mut seqs = Vec::new();
         crate::encoding::fastpath::with_encode_tier!(tier, K => {
-            driver.prime_with_dictionary_with::<K>(&dict, [1, 4, 8]);
+            driver.prime_with_dictionary_with::<K>(&dict, [1, 4, 8], None);
             assert_eq!(
                 driver.active_backend(),
                 super::super::strategy::BackendTag::Dfast,

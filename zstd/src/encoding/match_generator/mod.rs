@@ -2089,7 +2089,7 @@ impl Matcher for MatchGeneratorDriver {
         // calls `prime_with_dictionary_with` under its frame's tier.
         crate::encoding::fastpath::with_encode_tier!(
             self.tier,
-            K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist)
+            K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist, None)
         )
     }
 

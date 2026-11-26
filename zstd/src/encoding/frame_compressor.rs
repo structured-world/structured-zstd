@@ -60,6 +60,10 @@ pub struct EncoderDictionary {
 pub(crate) struct EncoderDictionaryParts {
     dictionary: crate::decoding::Dictionary,
     pub(crate) entropy: CachedDictionaryEntropy,
+    /// The match finders' tables over the content, built by the first
+    /// compressor that indexes it and attached by reference by the rest
+    /// (upstream `cdict->matchState`).
+    pub(crate) index: crate::encoding::dict_attach::DictIndex,
 }
 
 impl core::ops::Deref for EncoderDictionaryParts {
@@ -85,6 +89,7 @@ impl EncoderDictionary {
             inner: SharedEncoderDictionary::new(EncoderDictionaryParts {
                 dictionary,
                 entropy,
+                index: crate::encoding::dict_attach::DictIndex::default(),
             }),
             serialized_len,
             prepared_at_level: false,
@@ -1372,7 +1377,11 @@ pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
         let content = dict.inner.dict_content.as_slice();
         // The built-in matcher indexes the dictionary under the frame's tier.
         match state.matcher.builtin_driver() {
-            Some(driver) => driver.prime_with_dictionary_with::<K>(content, dict.inner.offset_hist),
+            Some(driver) => driver.prime_with_dictionary_with::<K>(
+                content,
+                dict.inner.offset_hist,
+                Some(&dict.inner.index),
+            ),
             None => state
                 .matcher
                 .prime_with_dictionary(content, dict.inner.offset_hist),

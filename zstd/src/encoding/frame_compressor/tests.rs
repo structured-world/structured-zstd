@@ -1569,6 +1569,53 @@ fn copied_frames_build_the_dictionary_index_an_attached_frame_searches() {
     }
 }
 
+/// A prepared dictionary holds the dfast tables the first compressor built
+/// for it, and every later compressor it attaches to takes them instead of
+/// indexing the dictionary again (upstream attaches `cdict->matchState`):
+/// fresh compressors sharing one prepared dictionary build no dictionary
+/// tables, on frames that attach the dictionary and on frames that copy it,
+/// and write the frames a compressor given its own copy of the dictionary
+/// writes.
+#[test]
+fn a_prepared_dictionary_lends_its_tables_to_fresh_compressors() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let small: Vec<u8> = dict_raw[1000..3000].to_vec();
+    let large: Vec<u8> = dict_raw[..40 * 1024].iter().rev().copied().collect();
+    let prepare =
+        |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
+    let level = super::CompressionLevel::from_level(3);
+    let shared = prepare(dict_raw);
+
+    let mut first: FrameCompressor = FrameCompressor::new(level);
+    first.set_encoder_dictionary(shared.clone()).unwrap();
+    first.compress_independent_frame(&small);
+    assert_eq!(
+        first.state.matcher.dfast_dict_table_builds(),
+        (1, 1),
+        "the first compressor indexes the dictionary"
+    );
+
+    for input in [&small, &large, &small] {
+        let mut fresh: FrameCompressor = FrameCompressor::new(level);
+        fresh.set_encoder_dictionary(shared.clone()).unwrap();
+        let frame = fresh.compress_independent_frame(input);
+        assert_eq!(
+            fresh.state.matcher.dfast_dict_table_builds(),
+            (0, 0),
+            "a {}-byte frame takes the dictionary's tables",
+            input.len()
+        );
+        let mut own: FrameCompressor = FrameCompressor::new(level);
+        own.set_encoder_dictionary(prepare(dict_raw)).unwrap();
+        assert_eq!(
+            frame,
+            own.compress_independent_frame(input),
+            "a {}-byte frame",
+            input.len()
+        );
+    }
+}
+
 /// A dictionary too short to index gives a copying frame nothing to take: its
 /// tables stay its own, and what earlier frames of the compressor left in
 /// them is not read. Every frame is a fresh compressor's.
