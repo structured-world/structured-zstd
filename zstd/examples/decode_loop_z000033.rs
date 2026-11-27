@@ -33,6 +33,9 @@ fn main() {
     let checksum = options.contains(&"checksum");
     let ldm = options.contains(&"ldm");
     let exact = options.contains(&"exact");
+    // "ours" decodes the frame our encoder writes (one standalone frame, as
+    // `compress_independent_frame` emits per block) instead of libzstd's.
+    let ours = options.contains(&"ours");
 
     // Source resolution. This example is named after the `z000033` corpus,
     // so an explicit path or the in-tree corpus is the contract. The LCG
@@ -150,6 +153,18 @@ fn main() {
         "encode failed"
     );
     compressed.truncate(written);
+    if ours {
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+        let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+        compressor.set_content_checksum(checksum);
+        compressor.compress_independent_frame_into(&src, &mut compressed);
+    }
+    let written = compressed.len();
+    eprintln!(
+        "frame by {}, last bytes {:02x?}",
+        if ours { "structured-zstd" } else { "libzstd" },
+        &compressed[written.saturating_sub(8)..]
+    );
     eprintln!(
         "encoded {} bytes → {} bytes at level {}",
         src.len(),
@@ -171,6 +186,50 @@ fn main() {
     let start = std::time::Instant::now();
     let mut total = 0usize;
     match mode {
+        "enc-rust" => {
+            // The encode side of the same frames: one reused compressor, one
+            // reused output buffer, a standalone frame per call.
+            use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+            let mut compressor: FrameCompressor =
+                FrameCompressor::new(CompressionLevel::Level(level));
+            compressor.set_content_checksum(checksum);
+            let mut out = Vec::new();
+            for _ in 0..iters {
+                compressor.compress_independent_frame_into(std::hint::black_box(&src), &mut out);
+                total = total.wrapping_add(out.len());
+            }
+        }
+        "enc-ffi" => {
+            let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
+            assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
+            unsafe {
+                zstd_sys::ZSTD_CCtx_setParameter(
+                    cctx,
+                    zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+                    level,
+                );
+                zstd_sys::ZSTD_CCtx_setParameter(
+                    cctx,
+                    zstd_sys::ZSTD_cParameter::ZSTD_c_checksumFlag,
+                    i32::from(checksum),
+                );
+            }
+            let mut out = vec![0u8; dst_cap];
+            for _ in 0..iters {
+                let w = unsafe {
+                    zstd_sys::ZSTD_compress2(
+                        cctx,
+                        out.as_mut_ptr() as *mut core::ffi::c_void,
+                        dst_cap,
+                        std::hint::black_box(src.as_ptr()) as *const core::ffi::c_void,
+                        src.len(),
+                    )
+                };
+                assert_eq!(unsafe { zstd_sys::ZSTD_isError(w) }, 0, "ZSTD_compress2");
+                total = total.wrapping_add(w);
+            }
+            unsafe { zstd_sys::ZSTD_freeCCtx(cctx) };
+        }
         "ffi" => {
             // Reuse one DCtx to mirror the c_ffi compare_ffi arm. RAII
             // guard ensures `ZSTD_freeDCtx` runs even if the per-iter
