@@ -26,10 +26,13 @@ fn main() {
     // content_checksum_flag = 1 so the decode loop exercises the post-decode
     // XXH64 verify pass; "ldm" turns on long-distance matching. The
     // benchmark's `level_<N>_*_ldm` decode cells read frames with both, so
-    // reproduce one with `checksum,ldm`.
+    // reproduce one with `checksum,ldm`. "exact" decodes into a buffer of
+    // exactly the content size, as a caller that knows it allocates, with no
+    // room past it for either decoder's wide copies.
     let options: Vec<&str> = args.get(5).map_or(Vec::new(), |s| s.split(',').collect());
     let checksum = options.contains(&"checksum");
     let ldm = options.contains(&"ldm");
+    let exact = options.contains(&"exact");
 
     // Source resolution. This example is named after the `z000033` corpus,
     // so an explicit path or the in-tree corpus is the contract. The LCG
@@ -159,7 +162,7 @@ fn main() {
         (compressed[4] >> 2) & 1
     );
 
-    let mut target = vec![0u8; n + WILDCOPY_OVERLENGTH];
+    let mut target = vec![0u8; if exact { n } else { n + WILDCOPY_OVERLENGTH }];
     // Pre-touch pages so first iter doesn't pay anon-fault cost.
     for chunk in target.chunks_mut(4096) {
         chunk[0] = 0;
