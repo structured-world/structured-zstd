@@ -32,6 +32,26 @@ pub(in crate::decoding) fn for_each_entry_form(kernel: CpuKernelTag, mut f: impl
     FORM.with(|c| c.set(None));
 }
 
+std::thread_local! {
+    /// Experiment: blocks seen by the AVX2 short arm, their sequences in all,
+    /// and those of blocks with fewer than the loop's entry threshold.
+    static BLOCKS: core::cell::Cell<[u64; 4]> = const { core::cell::Cell::new([0; 4]) };
+}
+
+/// Experiment: counts a block of `n` sequences on the AVX2 short arm.
+pub(in crate::decoding) fn count_block(n: usize) {
+    BLOCKS.with(|b| {
+        let mut c = b.get();
+        c[0] += 1;
+        c[1] += n as u64;
+        if n <= super::MIN_SEQUENCES {
+            c[2] += 1;
+            c[3] += n as u64;
+        }
+        b.set(c);
+    });
+}
+
 /// Counts one pass by the assembly's status (0 done, 1 boundary, 2 pending).
 pub(super) fn count_exit(status: usize) {
     EXITS.with(|exits| {
@@ -60,6 +80,44 @@ pub(in crate::decoding) fn assert_loop_ran_since(before: [u64; 3], shape: usize)
              (exits before {before:?}, after {after:?})"
         );
     }
+}
+
+/// Experiment: the loop's exits over a frame list named by `LSM_FRAMES`
+/// (`[u32 len][u32 decoded][frame]...`); skipped without it.
+#[test]
+fn exits_over_a_frame_list() {
+    let Ok(path) = std::env::var("LSM_FRAMES") else {
+        return;
+    };
+    let data = std::fs::read(path).unwrap();
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    let mut at = 0usize;
+    let mut frames = 0u64;
+    let before = exits();
+    while at < data.len() {
+        let len = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+        let decoded = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+        at += 8;
+        let mut out = std::vec![0u8; decoded];
+        assert_eq!(
+            decoder.decode_all(&data[at..at + len], &mut out).unwrap(),
+            decoded
+        );
+        at += len;
+        frames += 1;
+    }
+    let after = exits();
+    let blocks = BLOCKS.with(core::cell::Cell::get);
+    std::eprintln!(
+        "frames {frames} done {} boundary {} pending {} | short-arm blocks {} sequences {} | below entry: blocks {} sequences {}",
+        after[0] - before[0],
+        after[1] - before[1],
+        after[2] - before[2],
+        blocks[0],
+        blocks[1],
+        blocks[2],
+        blocks[3]
+    );
 }
 
 /// Whether the kernels include AVX2, the one whose loop is the assembly; says

@@ -816,6 +816,13 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         // keeps that question out of every other iteration. The block decoder
         // calls in only for a section with sequences.
         debug_assert!(num_sequences > 0, "sequence section without sequences");
+        #[cfg(all(
+            test,
+            feature = "std",
+            target_pointer_width = "64",
+            not(feature = "fuzz-exports")
+        ))]
+        super::seq_loop_asm::tests::count_block(num_sequences);
         'short: {
             // Sequences before the last still to run in Rust: all of them,
             // unless the assembly below takes them first.
