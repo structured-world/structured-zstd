@@ -174,15 +174,23 @@ macro_rules! exec_sequence_avx2_inline_at {
                 let op_lit = base.add(tail);
                 let op_match = base.add(tail + lit_length_v);
                 let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                copy16(op_lit, lit_src_v);
-                if lit_length_v > 16 {
-                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                // Experiment: 32-byte literal copy, and 32-byte match copy for
+                // offsets of 32 and more (the gate above reserves 31 bytes).
+                $crate::decoding::exec_sequence_inline::x86::copy32_avx2(op_lit, lit_src_v);
+                if lit_length_v > 32 {
+                    $crate::decoding::exec_sequence_inline::x86::wildcopy_no_overlap_avx2(
+                        op_lit.add(32),
+                        lit_src_v.add(32),
+                        lit_length_v - 32,
+                    );
                 }
-                // Split at `WILDCOPY_VECLEN`, as upstream's `ZSTD_execSequence`
-                // (zstd_decompress_block.c:1077), not at the 32-byte vector
-                // width: a 32-byte arm would add a data-dependent branch to
-                // every match.
-                if match_length_v >= 256 {
+                if match_length_v < 256 && offset_v >= 32 {
+                    $crate::decoding::exec_sequence_inline::x86::wildcopy_no_overlap_avx2(
+                        op_match,
+                        match_src,
+                        match_length_v,
+                    );
+                } else if match_length_v >= 256 {
                     // A long match: a copy from a fixed short distance would read
                     // its own recent stores, so it goes from doubling distances
                     // instead. The gate above leaves room for its 31-byte
