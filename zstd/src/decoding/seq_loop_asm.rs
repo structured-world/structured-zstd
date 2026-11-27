@@ -260,7 +260,7 @@ impl<const WORDS: bool> Loop<WORDS> {
                     ml_dec.entry_words(),
                     of_dec.entry_words(),
                 ],
-                input_floor: (source as usize).wrapping_add(INPUT_FLOOR),
+                input_floor: source as usize,
                 lit_end: literals as usize + lit_len,
                 out_end: base + out.cap_w,
                 out_floor: base.wrapping_add(out.live_base),
@@ -357,8 +357,10 @@ impl<const WORDS: bool> Loop<WORDS> {
             ($form:tt, $ll_e:ident, $ml_e:ident, $of_e:ident) => {
             core::arch::asm!(
                 "2:",
-                "cmp r10, qword ptr [rsi + 48]",
-                "jb 90f",
+                // More than the container consumed: only a corrupt stream
+                // gets here; the Rust path reports it.
+                "cmp r9, 64",
+                "ja 90f",
                 // Offset: a new one (more than one extra bit), or a repeat.
                 entry_extra!($form, "edx", "r13"),
                 "cmp edx, 1",
@@ -394,6 +396,16 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "shr rax, 3",
                 "sub r10, rax",
                 "and r9d, 7",
+                // Near the stream's start the window stops at its first byte
+                // and the bits it could not step back stay counted as
+                // consumed, as upstream's `BIT_reloadDStream` does.
+                "cmp r10, qword ptr [rsi + 48]",
+                "jae 22f",
+                "mov rax, qword ptr [rsi + 48]",
+                "sub rax, r10",
+                "lea r9, [r9 + rax*8]",
+                "mov r10, qword ptr [rsi + 48]",
+                "22:",
                 "mov r8, qword ptr [r10]",
                 "21:",
                 "shlx rax, r8, r9",
@@ -412,6 +424,13 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "shr rax, 3",
                 "sub r10, rax",
                 "and r9d, 7",
+                "cmp r10, qword ptr [rsi + 48]",
+                "jae 23f",
+                "mov rax, qword ptr [rsi + 48]",
+                "sub rax, r10",
+                "lea r9, [r9 + rax*8]",
+                "mov r10, qword ptr [rsi + 48]",
+                "23:",
                 "mov r8, qword ptr [r10]",
                 // The gates of the copies below; any refusal leaves the loop.
                 "mov rdx, qword ptr [rsi + 88]",

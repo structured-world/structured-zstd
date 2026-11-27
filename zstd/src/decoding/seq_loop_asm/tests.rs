@@ -102,14 +102,13 @@ pub(in crate::decoding) fn exits() -> [u64; 3] {
     EXITS.with(|exits| exits.get())
 }
 
-/// Asserts that since `before` the loop stopped at the stream's start and
-/// handed sequences to Rust. `Done` is not asked for: a block's last
-/// sequences sit in the first bytes of its bit stream, below the floor, so an
-/// entered block ends at `Boundary` unless the stream outlasts its sequences,
-/// which no frame of those tests produces.
+/// Asserts that since `before` the loop ran an entered block to its end and
+/// handed sequences to Rust. The loop runs a block's last sequences too, its
+/// window stopping at the stream's first byte, so an entered block of a valid
+/// frame ends `Done`; `Boundary` is left for a corrupt stream.
 pub(in crate::decoding) fn assert_loop_ran_since(before: [u64; 3], shape: usize) {
     let after = exits();
-    for (exit, name) in [(1, "Boundary"), (2, "Pending")] {
+    for (exit, name) in [(0, "Done"), (2, "Pending")] {
         assert!(
             after[exit] > before[exit],
             "shape {shape}: the assembly loop never exited {name} \
