@@ -572,6 +572,9 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "70:",
                 "cmp rax, 16",
                 "jb 80f",
+                // A zero offset (malformed input) is the Rust path's to refuse.
+                "test rcx, rcx",
+                "jz 80f",
                 "vmovdqu xmm0, xmmword ptr [r15]",
                 "vmovdqu xmmword ptr [r14], xmm0",
                 "cmp rdx, 16",
