@@ -1499,12 +1499,6 @@ pub trait FseEntry: Copy + Default {
     /// fills `base_value` / `num_additional_bits` via a separate enrich
     /// pass.
     fn from_raw(new_state: u16, symbol: u8, num_bits: u8) -> Self;
-
-    /// Store the entry into its table slot during the build.
-    #[inline(always)]
-    fn store(self, slot: &mut core::mem::MaybeUninit<Self>) {
-        slot.write(self);
-    }
 }
 
 impl FseEntry for Entry {
@@ -1554,31 +1548,6 @@ impl FseEntry for SeqSymbol {
             num_additional_bits: 0,
             base_value: 0,
         }
-    }
-
-    /// Two scalar stores of four bytes, as upstream builds `ZSTD_seqSymbol`:
-    /// left to itself the optimiser packs pairs of entries into vector lanes
-    /// with inserts and shuffles, which take longer than the entry they build.
-    /// Volatile only so the two stores are not merged across entries.
-    #[inline(always)]
-    fn store(self, slot: &mut core::mem::MaybeUninit<Self>) {
-        #[cfg(target_endian = "little")]
-        {
-            let low = u32::from(self.new_state)
-                | (u32::from(self.num_bits) << 16)
-                | (u32::from(self.num_additional_bits) << 24);
-            let words = slot.as_mut_ptr().cast::<u32>();
-            // SAFETY: a `SeqSymbol` is two aligned `u32` words, `new_state`,
-            // `num_bits` and `num_additional_bits` in the first (the layout
-            // assertions above) and `base_value` in the second; `slot` is a
-            // valid, aligned place for one, and every bit pattern is valid.
-            unsafe {
-                core::ptr::write_volatile(words, low);
-                core::ptr::write_volatile(words.add(1), self.base_value);
-            }
-        }
-        #[cfg(not(target_endian = "little"))]
-        slot.write(self);
     }
 }
 
@@ -1654,7 +1623,7 @@ fn fill_decode_entries<E: FseEntry>(
         // state is below `table_size` and fits `u16`.
         let new_state = (next_state << nb) - table_size;
         let entry = E::from_raw(new_state as u16, symbol, nb as u8);
-        with_meta(symbol, entry).store(slot);
+        *slot = core::mem::MaybeUninit::new(with_meta(symbol, entry));
     }
 }
 
