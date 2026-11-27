@@ -1123,15 +1123,13 @@ impl MatchTable {
             self.uncommitted().len(),
         );
         if self.window_size + len > self.max_window_size {
-            // Cap the history mirror near the live window once eviction starts:
-            // reserve exactly (window + window/4 + one block) so it grows
-            // linearly to that ceiling instead of doubling to ~2x window;
-            // `compact_history`'s quarter-window drain keeps the length under
-            // it, so it never moves again. Small frames that never fill the
-            // window keep their tight data-sized buffer.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
+            // Cap the history mirror once eviction starts: reserve exactly
+            // twice the window plus two blocks so it grows linearly to that
+            // ceiling instead of doubling past it; `compact_history`'s window
+            // drain keeps the length under it, so it never moves again. Small
+            // frames that never fill the window keep their tight data-sized
+            // buffer.
+            let target = 2 * self.max_window_size + 2 * crate::common::MAX_BLOCK_SIZE as usize;
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
@@ -1175,20 +1173,22 @@ impl MatchTable {
     }
 
     /// Drain the dead prefix of `history` (already-rolled-out bytes)
-    /// once it reaches a quarter window, or when it accounts for at
+    /// once it reaches a whole window, or when it accounts for at
     /// least half of the mirror. Keeps the contiguous mirror compact
     /// so reallocation costs stay amortised.
     pub(crate) fn compact_history(&mut self) {
         if self.history_start == 0 {
             return;
         }
-        // Drain the dead prefix at a quarter window (paired with the eviction
-        // reserve in `commit_block`) so the mirror stays near `window +
-        // window/4` rather than doubling to ~2x window on long streams.
-        // Compare against the COMMITTED length: `history.len()` also counts
-        // bytes no block has claimed yet, which would delay the trigger by
-        // however much input happens to be read ahead.
-        if self.history_start >= (self.max_window_size >> 2)
+        // Drain the dead prefix at a whole window (paired with the eviction
+        // reserve of twice the window in `commit_block`): one byte copied per
+        // input byte, and the window stays one segment, as each of the zstd
+        // CLI's job sections is, so the tree search reads every candidate off
+        // one base with no segment test. Compare against the COMMITTED length:
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would delay the trigger by however much input happens to be read
+        // ahead.
+        if self.history_start >= self.max_window_size
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain_front(self.history_start);
