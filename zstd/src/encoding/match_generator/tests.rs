@@ -1966,6 +1966,7 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
             0,
             1024,
             CompressionLevel::Level(3),
+            false,
         )
     };
     assert_eq!(
@@ -2030,25 +2031,37 @@ fn restoring_a_snapshot_keeps_the_block_queue_allocation() {
 }
 
 /// A stream that can fill its window lays out the window, what sliding leaves
-/// behind, and one pending block, and that block is the frame's: a target block
-/// size below the format maximum shrinks it, rather than leaving the difference
-/// laid out and never written.
+/// behind, and the pending blocks, and those blocks are the frame's: a target
+/// block size below the format maximum shrinks them, rather than leaving the
+/// difference laid out and never written. A wrapping double-fast history lays
+/// out its ring, and one kept in one segment for long-distance matching the
+/// room a one-segment history drains in.
 #[test]
 fn the_history_ceiling_takes_the_frames_block() {
+    use super::super::strategy::BackendTag;
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let window = 1usize << 20;
     let mut workspace = Workspace::new();
     workspace.begin_layout(1024, no_trailing, IngestPlan::Stream);
-    let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
-        &workspace,
-        false,
-        None,
-        0,
-        window,
-        CompressionLevel::Level(3),
+    let bytes = |backend, long_distance| {
+        super::frame_history_bytes(
+            backend,
+            &workspace,
+            false,
+            None,
+            0,
+            window,
+            CompressionLevel::Level(9),
+            long_distance,
+        )
+    };
+    assert_eq!(bytes(BackendTag::Row, false), 2 * window + 2 * 1024);
+    assert_eq!(bytes(BackendTag::HashChain, false), 2 * window + 2 * 1024);
+    assert_eq!(bytes(BackendTag::Dfast, true), 2 * window + 2 * 1024);
+    assert_eq!(
+        bytes(BackendTag::Dfast, false),
+        crate::encoding::ring::Ring::room(window)
     );
-    assert_eq!(bytes, window + (window >> 2) + 1024);
 }
 
 /// A pledged stream's size is exact, since the context refuses any other
@@ -2080,6 +2093,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
         0,
         window,
         level,
+        false,
     );
     assert_eq!(bytes, pledged, "the pledged input, which is exact");
 
@@ -2094,6 +2108,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
         0,
         window,
         level,
+        false,
     );
     assert_eq!(bytes, level_window + block);
 }

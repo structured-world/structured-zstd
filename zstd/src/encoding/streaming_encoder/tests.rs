@@ -844,6 +844,44 @@ fn a_pledged_stream_past_the_level_window_keeps_its_history_in_the_workspace() {
     assert_eq!(decoded, input);
 }
 
+/// A stream of unknown size that slides its window keeps its history in the
+/// room the context laid out, on every backend that slides by blocks: the
+/// double-fast ring, the double-fast history kept in one segment under
+/// long-distance matching, and the row and tree histories. Laid out smaller
+/// than what the first eviction reserves, the history moved to an allocation
+/// of its own on every frame, beside the workspace room it left unused.
+#[test]
+fn a_sliding_stream_keeps_its_history_in_the_workspace() {
+    let input: Vec<u8> = (0..1u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 & 0x3F)
+        .collect();
+    let mut cases = vec![(3, false), (9, false), (16, false)];
+    #[cfg(feature = "ldm")]
+    cases.push((3, true));
+    for (level, long_distance) in cases {
+        let level = CompressionLevel::Level(level);
+        let params = crate::encoding::CompressionParameters::builder(level)
+            .window_log(18)
+            .enable_long_distance_matching(long_distance)
+            .build()
+            .unwrap();
+        let mut enc = StreamingEncoder::new(Vec::new(), level);
+        enc.set_parameters(&params).unwrap();
+        enc.write_all(&input).unwrap();
+        assert_eq!(
+            enc.context.state.matcher.owned_table_and_history_bytes().1,
+            0,
+            "{level:?}, long distance {long_distance}: the history left the workspace"
+        );
+        let compressed = enc.finish().unwrap();
+        let mut decoded = Vec::with_capacity(input.len());
+        crate::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&compressed, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, input);
+    }
+}
+
 /// Regression: a streamed periodic input at the btlazy2 levels round-trips.
 /// The pre-splitter cuts short mid-stream blocks out of full 128 KiB
 /// buffers; the binary-tree lazy backend must accept those short committed
@@ -2081,6 +2119,45 @@ fn savings_stop_licensing_cuts_after_a_job_span_of_noise() {
         }
         assert_eq!(start, payload.len(), "{path}: blocks cover the input");
     }
+}
+
+/// A block a flush emits once a savings span has gone by is the new span's
+/// first: what it saves counts there, and the next full block's pre-split does
+/// not reset it. Counted to the old span instead, the reset at that next block
+/// dropped it.
+#[test]
+fn a_flushed_block_opens_the_next_savings_span() {
+    let block = crate::common::MAX_BLOCK_SIZE as usize;
+    let mut context = CompressionContext::new(CompressionLevel::Level(3));
+    let mut out = Vec::new();
+    let zeros = vec![0u8; block];
+    let mut span = usize::MAX;
+    while (context.emitted as usize) < span {
+        let mut rest = &zeros[..];
+        while !rest.is_empty() {
+            let n = context.write(&mut out, rest).unwrap();
+            rest = &rest[n..];
+        }
+        span = crate::encoding::frame_compressor::savings_span(context.state.matcher.window_size())
+            as usize;
+    }
+    let old_span_savings = context.savings;
+    let mut rest = &zeros[..block / 2];
+    while !rest.is_empty() {
+        let n = context.write(&mut out, rest).unwrap();
+        rest = &rest[n..];
+    }
+    context.flush(&mut out).unwrap();
+    assert_eq!(
+        context.savings_span_index,
+        context.emitted / span as u64,
+        "the flushed block was counted to the span before it"
+    );
+    assert!(
+        context.savings < old_span_savings && context.savings <= (block / 2) as i64,
+        "savings {} carry the old span's {old_span_savings}",
+        context.savings
+    );
 }
 
 /// Window size a frame header declares (RFC 8878 3.1.1.1.2).

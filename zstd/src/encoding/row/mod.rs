@@ -3365,11 +3365,14 @@ impl RowMatchGenerator {
             // parked, it serves the next frame, which commits it at the front
             // again.
             self.dict_keep.park(&mut self.dict);
-            // Cap the history once eviction starts: grow it linearly to twice
-            // the window plus two blocks rather than doubling past it;
-            // `compact_history`'s window drain keeps the length under it.
-            // Small frames that never fill the window stay data-sized.
-            let target = 2 * self.max_window_size + 2 * crate::common::MAX_BLOCK_SIZE as usize;
+            // Cap the history once eviction starts: grow it linearly to the
+            // most it holds rather than doubling past it; `compact_history`'s
+            // drain keeps the length under it. Small frames that never fill the
+            // window stay data-sized.
+            let target = crate::encoding::ring::one_segment_room(
+                self.max_window_size,
+                crate::encoding::ring::largest_block(self.max_window_size),
+            );
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
@@ -3918,17 +3921,17 @@ impl RowMatchGenerator {
         if self.history_start == 0 {
             return;
         }
-        // Drain the (unreachable) dead prefix once it reaches a whole window:
-        // the drain memmoves the live window, so this copies one byte per
-        // input byte, in a buffer of twice the window (the `reserve_exact` in
-        // `commit_block`). The window stays one segment, as each of the zstd
-        // CLI's job sections is, so the search reads every candidate off one
-        // base with no segment test; a ring would pay that test on every
-        // candidate, which costs a search this heavy more than the copy.
+        // Drain the (unreachable) dead prefix once it reaches a whole window
+        // (`one_segment_drain`): the drain memmoves the live window, so this
+        // copies one byte per input byte, in the room `commit_block` reserves.
+        // The window stays one segment, as each of the zstd CLI's job sections
+        // is, so the search reads every candidate off one base with no segment
+        // test; a ring would pay that test on every candidate, which costs a
+        // search this heavy more than the copy.
         // Compare against the COMMITTED length: `history.len()` also counts
         // bytes no block has claimed yet, which would delay the trigger by
         // however much input happens to be read ahead.
-        if self.history_start >= self.max_window_size
+        if self.history_start >= crate::encoding::ring::one_segment_drain(self.max_window_size)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain_front(self.history_start);

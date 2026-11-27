@@ -320,6 +320,32 @@ fn out_of_bounds_window_log_rejected() {
     );
 }
 
+/// The long-distance hash rate reaches `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`
+/// (25 on a 64-bit target, 24 on a 32-bit one), the value the automatic
+/// derivation gives at the widest window and smallest hash, and stops there.
+#[test]
+fn ldm_hash_rate_log_bound_follows_the_widest_window() {
+    let max = crate::common::MAX_WINDOW_LOG - 6;
+    assert_eq!(
+        CParameter::LdmHashRateLog.bounds().upper_bound,
+        i64::from(max)
+    );
+    assert!(
+        CompressionParameters::builder(CompressionLevel::Default)
+            .enable_long_distance_matching(true)
+            .ldm_hash_rate_log(max)
+            .build()
+            .is_ok()
+    );
+    assert!(
+        CompressionParameters::builder(CompressionLevel::Default)
+            .enable_long_distance_matching(true)
+            .ldm_hash_rate_log(max + 1)
+            .build()
+            .is_err()
+    );
+}
+
 #[test]
 fn out_of_bounds_min_match_rejected() {
     let err = CompressionParameters::builder(CompressionLevel::Default)

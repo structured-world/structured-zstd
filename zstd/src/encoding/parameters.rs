@@ -301,7 +301,7 @@ impl CParameter {
             // ZSTD_LDM_BUCKETSIZELOG_MIN .. ZSTD_LDM_BUCKETSIZELOG_MAX.
             Self::LdmBucketSizeLog => (1, 8),
             // ZSTD_LDM_HASHRATELOG_MIN .. ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN.
-            Self::LdmHashRateLog => (0, 24),
+            Self::LdmHashRateLog => (0, crate::common::MAX_WINDOW_LOG as i64 - 6),
         };
         Bounds {
             lower_bound,

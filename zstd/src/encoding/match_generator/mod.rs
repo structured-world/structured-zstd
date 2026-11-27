@@ -591,9 +591,9 @@ struct PrimedKey {
 /// the history then grows to the most it ever holds, which is laid out from the
 /// start, as upstream sizes its input buffer from the window: for the Fast
 /// backend twice the window grown by the dictionary (it drains back to one
-/// window when an append would pass two), for the others that window plus the
-/// quarter of it compaction leaves behind; either way plus one pending block of
-/// the frame's size.
+/// window when an append would pass two) and a pending block, for a wrapping
+/// double-fast history its ring, for the one-segment histories the window, the
+/// dead history they drain and two blocks (`ring::one_segment_room`).
 ///
 /// A size known exactly (a slice, or a pledge the context enforces) is taken as
 /// it is, and its reads are held to what remains, so nothing past it is ever
@@ -608,26 +608,28 @@ struct PrimedKey {
 /// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
 /// reading, and growing it instead measured no faster.
 /// The most history `backend` keeps for a `window`-byte window with
-/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the
-/// window, the slack it slides in, and the block being read.
+/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the room
+/// its commit reserves once the window slides, so a history laid out to this
+/// ceiling never moves to an allocation of its own. A `long_distance` frame
+/// keeps a double-fast history in one segment instead of a ring.
 pub(crate) fn history_ceiling(
     backend: super::strategy::BackendTag,
     window: usize,
     dict_len: usize,
     block: usize,
+    long_distance: bool,
 ) -> usize {
     use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
+    use super::strategy::BackendTag;
     // A sum past `usize` is past the ceiling too.
     let window = window
         .checked_add(dict_len)
         .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
-    let slack = match backend {
-        super::strategy::BackendTag::Simple => {
-            crate::encoding::simple::fast_matcher::eviction_cap(window) - window
-        }
-        _ => window >> 2,
-    };
-    window + slack + block
+    match backend {
+        BackendTag::Simple => crate::encoding::simple::fast_matcher::eviction_cap(window) + block,
+        BackendTag::Dfast if !long_distance => crate::encoding::ring::Ring::room(window),
+        _ => crate::encoding::ring::one_segment_room(window, block),
+    }
 }
 
 fn frame_history_bytes(
@@ -638,10 +640,11 @@ fn frame_history_bytes(
     dict_len: usize,
     max_window_size: usize,
     level: CompressionLevel,
+    long_distance: bool,
 ) -> usize {
     use crate::encoding::workspace::IngestPlan;
     let block = workspace.block_for_window(max_window_size);
-    let ceiling = history_ceiling(backend, max_window_size, dict_len, block);
+    let ceiling = history_ceiling(backend, max_window_size, dict_len, block, long_distance);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
     // The input and the room past it its last read may ask for.
@@ -1790,6 +1793,7 @@ impl Matcher for MatchGeneratorDriver {
             dict_len + seam_pad,
             max_window_size,
             level,
+            long_distance,
         );
         // The input the frame can write into its tables: the size when known,
         // otherwise the most its history is laid out to hold.

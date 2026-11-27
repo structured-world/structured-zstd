@@ -218,3 +218,39 @@ fn a_dictionary_copy_without_a_block_leaves_the_tables_alone() {
     assert_eq!(matcher.tables[5], 0x77);
     assert_eq!(matcher.position_base, base);
 }
+
+/// The ring mode is the frame's, not the snapshot's: a frame that keeps its
+/// history in one segment (long-distance matching reads the window as one
+/// slice) still does after restoring a dictionary snapshot that a frame with
+/// a wrapping history captured, and input past the window then drains instead
+/// of wrapping.
+#[test]
+fn a_restored_snapshot_keeps_the_frames_ring_mode() {
+    let mut snapshot_workspace = Workspace::new();
+    let mut live_workspace = Workspace::new();
+    let mut snapshot = bound(&mut snapshot_workspace, false);
+    snapshot.set_ring(true);
+    let mut live = bound(&mut live_workspace, false);
+    live.set_ring(false);
+
+    live.restore_snapshot(&mut snapshot);
+
+    assert!(
+        !live.ring.on,
+        "the restore carried the snapshot's ring mode in"
+    );
+    let mut state = 0x9E37_79B9_u32;
+    let block: alloc::vec::Vec<u8> = (0..32 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    // Three windows of input: a ring would have wrapped twice.
+    for _ in 0..96 {
+        live.commit_input(&block);
+        assert_eq!(live.ring.len, 0, "a one-segment history wrapped");
+    }
+}

@@ -595,11 +595,11 @@ pub fn estimated_compression_workspace_bytes_for_run(
     // The long-distance matcher's own table, sized from the window it searches
     // (upstream `ZSTD_ldm_adjustParameters`). Only the `ldm` build has one.
     #[cfg(feature = "ldm")]
-    let ldm = overrides.ldm.map_or(0, |ldm| {
+    let ldm = overrides.ldm.map(|ldm| {
         crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
-    let ldm = 0;
+    let ldm = None;
     workspace_bytes(&params, ldm)
 }
 
@@ -660,11 +660,11 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
 ) -> usize {
     let params = frame_level_params(parameters, src_size_hint, dictionary);
     #[cfg(feature = "ldm")]
-    let ldm = parameters.overrides().ldm.map_or(0, |ldm| {
+    let ldm = parameters.overrides().ldm.map(|ldm| {
         crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
-    let ldm = 0;
+    let ldm = None;
     workspace_bytes(&params, ldm)
 }
 
@@ -679,12 +679,13 @@ fn table_bytes(entry: usize, log: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Everything a compressor keeps for a frame resolved to `params`, plus `ldm`
-/// bytes of long-distance table: the workspace (history, match-finder tables
-/// and block buffers, laid out by the same functions the reset uses), and
-/// what lives beside it (optimal-parser scratch, entropy tables, the block
-/// splitter's state, the window's block deque).
-fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
+/// Everything a compressor keeps for a frame resolved to `params`, plus the
+/// long-distance table's bytes when the frame has one (`ldm`): the workspace
+/// (history, match-finder tables and block buffers, laid out by the same
+/// functions the reset uses), and what lives beside it (optimal-parser
+/// scratch, entropy tables, the block splitter's state, the window's block
+/// deque).
+fn workspace_bytes(params: &LevelParams, ldm: Option<usize>) -> usize {
     use crate::encoding::strategy::{SearchMethod, StrategyTag};
     use crate::encoding::workspace::{ALIGN, region_bytes};
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
@@ -695,7 +696,9 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
         .unwrap_or(usize::MAX);
     let block = (crate::common::MAX_BLOCK_SIZE as usize).min(window);
     let backend = params.backend();
-    let history = crate::encoding::match_generator::history_ceiling(backend, window, 0, block);
+    let history =
+        crate::encoding::match_generator::history_ceiling(backend, window, 0, block, ldm.is_some());
+    let ldm = ldm.unwrap_or(0);
     // Mirror `configure()`: the HC3 short-match side table exists only for a
     // `minMatch` of 3, capped by the window log; the BT pointer-pair layout
     // fits inside the `4 << chain_log` chain term (pairs over `chain_log - 1`

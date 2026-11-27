@@ -9,10 +9,45 @@ use super::opt::types::MatchCandidate;
 use super::workspace::HistoryBuf;
 use crate::common::MAX_BLOCK_SIZE;
 
+#[cfg(test)]
+mod tests;
+
 /// Bytes a key read may run past the ext segment's end: the widest key a
 /// match finder hashes, which the room holds right after the segment as a
 /// copy of the prefix's first bytes (see [`Ring::after_fill`]).
 pub(crate) const KEY_SLACK: usize = 8;
+
+/// Dead history a one-segment window lets build up in front of it before the
+/// window moves to the buffer's front: a whole window, so the move copies one
+/// byte per input byte, as upstream's multithreaded jobs move only their
+/// overlap; a quarter of it where twice the window would not fit one
+/// allocation (a 2^30 window on a 32-bit target, past `isize::MAX` bytes).
+pub(crate) const fn one_segment_drain(max_window: usize) -> usize {
+    if max_window <= (isize::MAX as usize - 2 * MAX_BLOCK_SIZE as usize) / 2 {
+        max_window
+    } else {
+        max_window / 4
+    }
+}
+
+/// The most a one-segment history holds with blocks of up to `block` bytes:
+/// the window, the dead history in front of it ([`one_segment_drain`]), the
+/// block being matched and the input read past it.
+pub(crate) const fn one_segment_room(max_window: usize, block: usize) -> usize {
+    max_window + one_segment_drain(max_window) + 2 * block
+}
+
+/// The largest block a `max_window`-byte window commits: a block never
+/// outgrows the window or the format's maximum, the bound the context's
+/// layout takes for the frame's block (`Workspace::block_for_window`).
+pub(crate) const fn largest_block(max_window: usize) -> usize {
+    let block = MAX_BLOCK_SIZE as usize;
+    if max_window < block {
+        max_window
+    } else {
+        block
+    }
+}
 
 /// The ring bookkeeping of a history: where its older (ext) segment lies.
 ///
@@ -58,9 +93,10 @@ impl Ring {
     /// since plus those read ahead, while eviction has moved the ext
     /// segment's live start by at least the bytes committed once the window
     /// is full; a window not yet full when it wraps grows into the dead room
-    /// ahead of it first, which the slack covers as well.
+    /// ahead of it first, which the slack covers as well. A block and a fill
+    /// are both held to [`largest_block`], so a small window keeps a small ring.
     pub(crate) fn capacity(max_window: usize) -> usize {
-        max_window + 4 * MAX_BLOCK_SIZE as usize
+        max_window + 4 * largest_block(max_window)
     }
 
     /// Room a ring needs: its capacity and the mirror after the ext segment,
@@ -192,7 +228,9 @@ impl Ring {
 ///
 /// Raw pointers from the history's whole room, not slices of each segment:
 /// a key read at one of the ext segment's last positions runs past the
-/// segment's end into the room after it.
+/// segment's end into the room after it. They hold no borrow, so a view is
+/// valid only until the history it was taken from changes; the methods that
+/// read through it are `unsafe` for that reason.
 #[derive(Clone, Copy)]
 pub(crate) struct WindowSegments {
     /// The ext segment's first byte. Up to [`KEY_SLACK`] bytes after its last
@@ -223,10 +261,17 @@ impl WindowSegments {
         }
     }
 
-    /// The byte at `abs`, a position of the window.
+    /// The byte at `abs`.
+    ///
+    /// # Safety
+    ///
+    /// The history this view was taken from is unchanged since, and `abs` is a
+    /// committed window position: `ext_abs <= abs < end_abs`.
     #[inline(always)]
-    pub(crate) fn byte(&self, abs: usize) -> u8 {
-        // SAFETY: a window position names a committed byte of its segment.
+    unsafe fn byte(&self, abs: usize) -> u8 {
+        debug_assert!(abs < self.end_abs);
+        // SAFETY: a committed window position names a byte of its segment,
+        // live while the history is unchanged, by the caller's contract.
         unsafe { *self.ptr(abs) }
     }
 
@@ -270,7 +315,13 @@ impl WindowSegments {
     /// Walk the match of `cand` against `cur` back over at most `lit_len`
     /// bytes, never before the window's floor; `start` of the result is the
     /// cursor's position.
-    pub(crate) fn extend_back(
+    ///
+    /// # Safety
+    ///
+    /// The history this view was taken from is unchanged since, `cand < cur`,
+    /// `cur <= end_abs`, and the `lit_len` bytes before `cur` are committed
+    /// window positions (`cur - lit_len >= ext_abs`).
+    pub(crate) unsafe fn extend_back(
         &self,
         mut cand: usize,
         mut cur: usize,
@@ -278,7 +329,13 @@ impl WindowSegments {
         lit_len: usize,
     ) -> MatchCandidate {
         let min_cur = cur - lit_len;
-        while cur > min_cur && cand > self.ext_abs && self.byte(cand - 1) == self.byte(cur - 1) {
+        // SAFETY: `cand - 1` stays at or above the floor by the loop's test,
+        // and `cur - 1` at or above `min_cur`, a window position by the
+        // caller's contract; both lie below `cur <= end_abs`.
+        while cur > min_cur
+            && cand > self.ext_abs
+            && unsafe { self.byte(cand - 1) == self.byte(cur - 1) }
+        {
             cand -= 1;
             cur -= 1;
             match_len += 1;

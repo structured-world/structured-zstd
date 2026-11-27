@@ -1334,12 +1334,7 @@ impl<M: Matcher> CompressionContext<M> {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             return self.pending_len();
         }
-        let span =
-            crate::encoding::frame_compressor::savings_span(self.state.matcher.window_size());
-        if self.emitted / span != self.savings_span_index {
-            self.savings_span_index = self.emitted / span;
-            self.savings = 0;
-        }
+        self.enter_savings_span();
         let pending = self.state.matcher.uncommitted_input();
         let window = pending.len();
         let cut = crate::encoding::frame_compressor::optimal_block_size_with(
@@ -1359,6 +1354,19 @@ impl<M: Matcher> CompressionContext<M> {
             }
         } else {
             cut
+        }
+    }
+
+    /// Starts the savings over when the next block opens a new savings span
+    /// (`frame_compressor::savings_span`). Run for every block that saves
+    /// anything, flushed ones included, so a block's savings count in the span
+    /// it starts in, and before the pre-split, which reads them.
+    fn enter_savings_span(&mut self) {
+        let span =
+            crate::encoding::frame_compressor::savings_span(self.state.matcher.window_size());
+        if self.emitted / span != self.savings_span_index {
+            self.savings_span_index = self.emitted / span;
+            self.savings = 0;
         }
     }
 
@@ -1443,6 +1451,7 @@ impl<M: Matcher> CompressionContext<M> {
             header.serialize(&mut self.encoded_scratch);
             return drain.write_all(&self.encoded_scratch);
         }
+        self.enter_savings_span();
         let dict_active =
             self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
         compress_block_encoded::<M, K>(
