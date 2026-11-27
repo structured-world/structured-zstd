@@ -180,6 +180,15 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// and [`Self::bits_remaining`] see the same stream. More than 64 bits
     /// read (a corrupt stream) leaves an empty container and a negative
     /// remainder.
+    // Only the AVX2 assembly sequence loop keeps a position outside the reader.
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            feature = "kernel-avx2",
+            not(feature = "fuzz-exports")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn restore_position(&mut self, index: usize, consumed: u64, container: u64) {
         self.index = index;
         if index == 0 && consumed > 8 {
