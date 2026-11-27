@@ -27,7 +27,7 @@ path = "src/lib.rs"
 # bias every Rust-vs-libzstd comparison. Targets that genuinely need them opt
 # in per-target via `required-features` below, so a bench built in isolation
 # (`cargo bench --bench compare_ffi`) never links them.
-structured-zstd = { version = "0.4", path = "../zstd", features = ["dict-builder"] }
+structured-zstd = { version = "0.5", path = "../zstd", features = ["dict-builder"] }
 zstd = { version = "0.14.0", features = ["zdict_builder", "experimental"] }
 # The libzstd the benchmarks and interop tests measure against: its floor is
 # the upstream release the C ABI, the CLI and the conformance scripts track, so
