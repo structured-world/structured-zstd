@@ -1051,15 +1051,14 @@ macro_rules! row_find_best_match {
                 } else {
                     $ctx.base_v.wrapping_add(cand)
                 };
-                let gate = if cand >= prefix_start {
-                    // A gate word past the segment's end (a match at the
-                    // seam) is read where it lies.
-                    let gate_ptr = if ml + 1 <= room {
-                        cand_ptr.add(ml - 3)
-                    } else {
-                        $ctx.ptr(cand + ml - 3)
-                    };
-                    rd32(gate_ptr) == rd32(cur_ptr.add(ml - 3))
+                // An ext candidate is gated at its head, as upstream gates
+                // `dictBase` candidates in extDict mode: the word lies inside
+                // the segment or its mirror, so no seam test. The gate only
+                // filters: a candidate that beats `ml` matches at both words,
+                // and one failing its head is shorter than four, so the
+                // choice of word never changes the match found.
+                let gate = if cand >= prefix_start && !ext_cand {
+                    rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
                     rd32(cand_ptr) == rd32(cur_ptr)
                 };
@@ -1309,15 +1308,14 @@ macro_rules! hc_find_best_match {
                 } else {
                     $ctx.base_v.wrapping_add(cand)
                 };
-                let gate = if cand >= prefix_start {
-                    // A gate word past the segment's end (a match at the
-                    // seam) is read where it lies.
-                    let gate_ptr = if ml + 1 <= room {
-                        cand_ptr.add(ml - 3)
-                    } else {
-                        $ctx.ptr(cand + ml - 3)
-                    };
-                    rd32(gate_ptr) == rd32(cur_ptr.add(ml - 3))
+                // An ext candidate is gated at its head, as upstream gates
+                // `dictBase` candidates in extDict mode: the word lies inside
+                // the segment or its mirror, so no seam test. The gate only
+                // filters: a candidate that beats `ml` matches at both words,
+                // and one failing its head is shorter than four, so the
+                // choice of word never changes the match found.
+                let gate = if cand >= prefix_start && !ext_cand {
+                    rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
                     rd32(cand_ptr) == rd32(cur_ptr)
                 };
