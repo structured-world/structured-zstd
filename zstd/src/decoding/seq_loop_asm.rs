@@ -121,7 +121,7 @@ const INPUT_FLOOR: usize = 16;
 /// runs the last sequences of the block below the floor. A 4 KiB frame of 13
 /// sequences against a dictionary decoded about 5% slower for entering; at 64
 /// the sequences the loop runs pay for the entry several times over.
-const MIN_SEQUENCES: usize = 64;
+const MIN_SEQUENCES: usize = 16;
 
 /// Whether entering the loop for `steps` sequences pays: enough of them, and
 /// the reader above the floor, the assembly's own first test, so a block the
