@@ -188,8 +188,12 @@ pub(super) enum Exit {
 pub(super) struct Out {
     /// Start of the linear output.
     pub(super) base: *mut u8,
-    /// The cursor's `cap_w`: a sequence's write must end at or before it.
+    /// The cursor's `cap_w`: the write limit less the Rust copiers' 31-byte
+    /// overshoot. The loop's own copies overshoot by 15 at most, so it lets
+    /// a write end up to 16 bytes past this, within `cap`.
     pub(super) cap_w: usize,
+    /// The cursor's `cap`, the write limit.
+    pub(super) cap: usize,
     /// The cursor's `live_base`: the live output is `op - live_base`, modular.
     pub(super) live_base: usize,
     /// The cursor's `dict_end`: a dictionary match's literals end below it.
@@ -268,7 +272,17 @@ impl<const WORDS: bool> Loop<WORDS> {
                 ],
                 input_floor: source as usize,
                 lit_end: literals as usize + lit_len,
-                out_end: base + out.cap_w,
+                // Sixteen-byte stores overshoot by 15 at most, where `cap_w`
+                // leaves room for 31; the memory past a nonzero `cap_w` holds
+                // 31 bytes, so 16 more for the write itself still leave the
+                // 15. A zero `cap_w` may stand for memory shorter than the
+                // overshoot, which leaves no write to the loop.
+                out_end: base
+                    + if out.cap_w == 0 {
+                        0
+                    } else {
+                        out.cap.min(out.cap_w + 16)
+                    },
                 out_floor: base.wrapping_add(out.live_base),
                 left,
                 ll: 0,

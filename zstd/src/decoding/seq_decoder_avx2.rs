@@ -498,6 +498,7 @@ unsafe fn run_short_arm_asm<B: BufferBackend, const WORDS: bool>(
     let out = Out {
         base: cur.base,
         cap_w: cur.cap_w,
+        cap: cur.cap,
         live_base: cur.live_base.0,
         dict_end: cur.dict_end,
     };
