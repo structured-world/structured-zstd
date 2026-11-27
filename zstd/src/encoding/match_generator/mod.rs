@@ -607,44 +607,65 @@ struct PrimedKey {
 /// reaches is never written, so it is never resident: a one-byte stream through
 /// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
 /// reading, and growing it instead measured no faster.
-/// The most history `backend` keeps for a `window`-byte window with
+/// How a frame's history slides its window, which decides the most it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HistoryLayout {
+    /// The Fast backend: twice the window, drained back to one.
+    Fast,
+    /// The double-fast backend's ring, which wraps instead of moving.
+    Ring,
+    /// One segment that drains its dead prefix: the row and tree backends,
+    /// and the double-fast backend under long-distance matching, which reads
+    /// the window as one slice.
+    OneSegment,
+}
+
+impl HistoryLayout {
+    /// The layout `backend` keeps, with or without long-distance matching.
+    pub(crate) fn of(backend: super::strategy::BackendTag, long_distance: bool) -> Self {
+        use super::strategy::BackendTag;
+        match backend {
+            BackendTag::Simple => Self::Fast,
+            BackendTag::Dfast if !long_distance => Self::Ring,
+            _ => Self::OneSegment,
+        }
+    }
+}
+
+/// The most history a `layout` keeps for a `window`-byte window with
 /// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the room
 /// its commit reserves once the window slides, so a history laid out to this
-/// ceiling never moves to an allocation of its own. A `long_distance` frame
-/// keeps a double-fast history in one segment instead of a ring.
+/// ceiling never moves to an allocation of its own.
 pub(crate) fn history_ceiling(
-    backend: super::strategy::BackendTag,
+    layout: HistoryLayout,
     window: usize,
     dict_len: usize,
     block: usize,
-    long_distance: bool,
 ) -> usize {
     use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
-    use super::strategy::BackendTag;
     // A sum past `usize` is past the ceiling too.
     let window = window
         .checked_add(dict_len)
         .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
-    match backend {
-        BackendTag::Simple => crate::encoding::simple::fast_matcher::eviction_cap(window) + block,
-        BackendTag::Dfast if !long_distance => crate::encoding::ring::Ring::room(window),
-        _ => crate::encoding::ring::one_segment_room(window, block),
+    match layout {
+        HistoryLayout::Fast => crate::encoding::simple::fast_matcher::eviction_cap(window) + block,
+        HistoryLayout::Ring => crate::encoding::ring::Ring::room(window),
+        HistoryLayout::OneSegment => crate::encoding::ring::one_segment_room(window, block),
     }
 }
 
 fn frame_history_bytes(
-    backend: super::strategy::BackendTag,
+    layout: HistoryLayout,
     workspace: &crate::encoding::workspace::Workspace,
     in_place: bool,
     hint: Option<u64>,
     dict_len: usize,
     max_window_size: usize,
     level: CompressionLevel,
-    long_distance: bool,
 ) -> usize {
     use crate::encoding::workspace::IngestPlan;
     let block = workspace.block_for_window(max_window_size);
-    let ceiling = history_ceiling(backend, max_window_size, dict_len, block, long_distance);
+    let ceiling = history_ceiling(layout, max_window_size, dict_len, block);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
     // The input and the room past it its last read may ask for.
@@ -1786,14 +1807,13 @@ impl Matcher for MatchGeneratorDriver {
             0
         };
         let history_bytes = frame_history_bytes(
-            next_backend,
+            HistoryLayout::of(next_backend, long_distance),
             workspace,
             self.frame_in_place,
             hint,
             dict_len + seam_pad,
             max_window_size,
             level,
-            long_distance,
         );
         // The input the frame can write into its tables: the size when known,
         // otherwise the most its history is laid out to hold.

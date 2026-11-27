@@ -1959,14 +1959,13 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
         let mut workspace = Workspace::new();
         workspace.begin_layout(crate::common::MAX_BLOCK_SIZE as usize, no_trailing, ingest);
         super::frame_history_bytes(
-            super::super::strategy::BackendTag::Dfast,
+            super::HistoryLayout::Ring,
             &workspace,
             false,
             Some(1000),
             0,
             1024,
             CompressionLevel::Level(3),
-            false,
         )
     };
     assert_eq!(
@@ -2039,20 +2038,20 @@ fn restoring_a_snapshot_keeps_the_block_queue_allocation() {
 #[test]
 fn the_history_ceiling_takes_the_frames_block() {
     use super::super::strategy::BackendTag;
+    use super::HistoryLayout;
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let window = 1usize << 20;
     let mut workspace = Workspace::new();
     workspace.begin_layout(1024, no_trailing, IngestPlan::Stream);
     let bytes = |backend, long_distance| {
         super::frame_history_bytes(
-            backend,
+            HistoryLayout::of(backend, long_distance),
             &workspace,
             false,
             None,
             0,
             window,
             CompressionLevel::Level(9),
-            long_distance,
         )
     };
     assert_eq!(bytes(BackendTag::Row, false), 2 * window + 2 * 1024);
@@ -2086,14 +2085,13 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
     let mut workspace = Workspace::new();
     workspace.begin_layout(block, no_trailing, IngestPlan::PledgedStream(pledged));
     let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
+        super::HistoryLayout::Ring,
         &workspace,
         false,
         Some(pledged as u64),
         0,
         window,
         level,
-        false,
     );
     assert_eq!(bytes, pledged, "the pledged input, which is exact");
 
@@ -2101,14 +2099,13 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
     let mut workspace = Workspace::new();
     workspace.begin_layout(block, no_trailing, IngestPlan::Stream);
     let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
+        super::HistoryLayout::Ring,
         &workspace,
         false,
         Some(pledged as u64),
         0,
         window,
         level,
-        false,
     );
     assert_eq!(bytes, level_window + block);
 }

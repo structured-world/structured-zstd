@@ -696,8 +696,8 @@ fn workspace_bytes(params: &LevelParams, ldm: Option<usize>) -> usize {
         .unwrap_or(usize::MAX);
     let block = (crate::common::MAX_BLOCK_SIZE as usize).min(window);
     let backend = params.backend();
-    let history =
-        crate::encoding::match_generator::history_ceiling(backend, window, 0, block, ldm.is_some());
+    let layout = crate::encoding::match_generator::HistoryLayout::of(backend, ldm.is_some());
+    let history = crate::encoding::match_generator::history_ceiling(layout, window, 0, block);
     let ldm = ldm.unwrap_or(0);
     // Mirror `configure()`: the HC3 short-match side table exists only for a
     // `minMatch` of 3, capped by the window log; the BT pointer-pair layout
