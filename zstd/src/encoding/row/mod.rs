@@ -214,12 +214,18 @@ struct RowScan<const MLS: u32 = 0, const EXT: bool = true> {
     base: *const u8,
     len: usize,
     hist_start: usize,
-    /// A wrapped window's older (ext) segment, below `hist_start`: its first
-    /// byte and position (upstream `dictBase` / `lowLimit`). Up to a key's
-    /// width of bytes past its end are readable and equal the prefix's first
-    /// bytes. Equal to `hist_start` (and unread) while the window is one
-    /// segment.
-    ext: *const u8,
+    /// The prefix's base in position space, `base - hist_start`: the byte at
+    /// a prefix position `abs` is `base_v + abs`, one add of the position the
+    /// search already carries (upstream `base + matchIndex`).
+    base_v: *const u8,
+    /// A wrapped window's older (ext) segment, below `hist_start`, in the
+    /// same position space: the byte at an ext position `abs` is `ext_v +
+    /// abs` (upstream `dictBase + matchIndex`). Up to a key's width of bytes
+    /// past its end are readable and equal the prefix's first bytes. Unread
+    /// while the window is one segment.
+    ext_v: *const u8,
+    /// The window's floor (upstream `lowLimit`), the ext segment's first
+    /// position; `hist_start` while the window is one segment.
     ext_abs: usize,
     /// Block-constant search parameters hoisted with the view so the hot
     /// loops never re-read them through `&mut self`: the salt of the live
@@ -255,9 +261,9 @@ impl<const MLS: u32, const EXT: bool> RowScan<MLS, EXT> {
     #[inline(always)]
     fn ptr(&self, abs: usize) -> *const u8 {
         if self.in_prefix(abs) {
-            self.base.wrapping_add(abs - self.hist_start)
+            self.base_v.wrapping_add(abs)
         } else {
-            self.ext.wrapping_add(abs - self.ext_abs)
+            self.ext_v.wrapping_add(abs)
         }
     }
 
@@ -274,7 +280,7 @@ impl<const MLS: u32, const EXT: bool> RowScan<MLS, EXT> {
     #[inline(always)]
     fn prefix_ptr(&self, abs: usize) -> *const u8 {
         debug_assert!(abs >= self.hist_start, "a prefix read below the prefix");
-        self.base.wrapping_add(abs - self.hist_start)
+        self.base_v.wrapping_add(abs)
     }
 
     /// The row key width: the bound constant, or the stored one when unbound.
@@ -911,9 +917,9 @@ macro_rules! row_find_best_match {
     ($m:expr, $ctx:ident, $t:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let hist_start = $ctx.hist_start;
         let cur_idx = $abs_pos - hist_start;
-        // SAFETY: the parse searches only positions >= 16 bytes before the
-        // block end, so `cur_idx + 16 <= $ctx.len`.
-        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
+        // The parse searches only positions >= 16 bytes before the block end,
+        // so `cur_idx + 16 <= $ctx.len`.
+        let cur_ptr = $ctx.prefix_ptr($abs_pos);
         let limit = $ctx.len - cur_idx;
         let row_entries = 1usize << $rl;
         let row_mask = row_entries - 1;
@@ -1009,12 +1015,7 @@ macro_rules! row_find_best_match {
                     // prefetches `base + matchIndex` in extDict mode too: an ext
                     // candidate's hint misses, and no segment is resolved for it.
                     unsafe {
-                        _mm_prefetch(
-                            $ctx.base
-                                .wrapping_add((raw as usize).wrapping_sub(hist_start))
-                                .cast(),
-                            _MM_HINT_T0,
-                        );
+                        _mm_prefetch($ctx.base_v.wrapping_add(raw as usize).cast(), _MM_HINT_T0);
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
@@ -1046,9 +1047,9 @@ macro_rules! row_find_best_match {
                     usize::MAX
                 };
                 let cand_ptr = if ext_cand {
-                    $ctx.ext.wrapping_add(cand - $ctx.ext_abs)
+                    $ctx.ext_v.wrapping_add(cand)
                 } else {
-                    $ctx.base.wrapping_add(cand - $ctx.hist_start)
+                    $ctx.base_v.wrapping_add(cand)
                 };
                 let gate = if cand >= prefix_start {
                     // A gate word past the segment's end (a match at the
@@ -1230,9 +1231,8 @@ macro_rules! hc_find_best_match {
         let hist_start = $ctx.hist_start;
         let chain_mask = $chain.chain_mask;
         let cur_idx = p - hist_start;
-        // SAFETY: the parse searches only positions >= 16 bytes before the
-        // block end.
-        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
+        // The parse searches only positions >= 16 bytes before the block end.
+        let cur_ptr = $ctx.prefix_ptr(p);
         let limit = $ctx.len - cur_idx;
         // The caller keeps at least `ROW_HASH_KEY_LEN` bytes after a chained
         // position, and the hash fits `hash_bits`.
@@ -1305,9 +1305,9 @@ macro_rules! hc_find_best_match {
                     usize::MAX
                 };
                 let cand_ptr = if ext_cand {
-                    $ctx.ext.wrapping_add(cand - $ctx.ext_abs)
+                    $ctx.ext_v.wrapping_add(cand)
                 } else {
-                    $ctx.base.wrapping_add(cand - $ctx.hist_start)
+                    $ctx.base_v.wrapping_add(cand)
                 };
                 let gate = if cand >= prefix_start {
                     // A gate word past the segment's end (a match at the
@@ -4481,15 +4481,19 @@ impl RowMatchGenerator {
         } else {
             (history.as_ptr(), self.history_abs_start)
         };
+        let hist_start = if self.borrowed_block.is_some() {
+            self.history_abs_start
+        } else {
+            self.prefix_abs()
+        };
         RowScan {
             base: history.as_ptr(),
             len: history.len(),
-            hist_start: if self.borrowed_block.is_some() {
-                self.history_abs_start
-            } else {
-                self.prefix_abs()
-            },
-            ext,
+            hist_start,
+            // Pointers outside the history, only ever offset back into it by a
+            // position of their segment.
+            base_v: history.as_ptr().wrapping_sub(hist_start),
+            ext_v: ext.wrapping_sub(ext_abs),
             ext_abs,
             salt: self.hash_salt,
             search_window: self.search_window,
