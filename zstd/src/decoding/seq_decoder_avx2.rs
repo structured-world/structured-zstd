@@ -462,6 +462,43 @@ macro_rules! execute_one_body {
     }};
 }
 
+/// Executes a sequence the assembly loop left decoded: the whole Rust
+/// execution path, out of line, so the loop's caller stays the size of the
+/// loop. A loop leaves a couple of sequences a block this way.
+///
+/// # Safety
+/// The CPU has BMI2 and AVX2, and the arguments are those of
+/// [`run_short_arm_asm`] for the block.
+#[cfg(all(target_pointer_width = "64", not(feature = "fuzz-exports")))]
+#[target_feature(enable = "bmi2,avx2")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn execute_pending<B: BufferBackend>(
+    cur: &mut OutCursor,
+    buffer: &mut DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
+    dict_content: &[u8],
+    literals_buffer: &[u8],
+    lit_cur: &mut usize,
+    literals_buffer_len: usize,
+    seq_ll: u32,
+    seq_ml: u32,
+    resolved_offset: u32,
+) -> Result<(), DecompressBlockError> {
+    execute_one_body!(
+        cur,
+        buffer,
+        dict,
+        dict_content,
+        literals_buffer,
+        lit_cur,
+        literals_buffer_len,
+        seq_ll,
+        seq_ml,
+        resolved_offset
+    )
+}
+
 /// The short arm's common path in assembly (`seq_loop_asm`) for a backend
 /// whose cursor holds for the block: runs `steps` sequences, each advancing
 /// the states, executing here every sequence the loop leaves decoded, and
@@ -542,18 +579,21 @@ unsafe fn run_short_arm_asm<B: BufferBackend, const WORDS: bool>(
             cur.op + seq_ll as usize + seq_ml as usize > cur.cap_w,
             resolved_offset as usize > cur.live() + seq_ll as usize,
         );
-        let r = execute_one_body!(
-            cur,
-            buffer,
-            dict,
-            dict_content,
-            literals_buffer,
-            lit_cur,
-            literals_buffer_len,
-            seq_ll,
-            seq_ml,
-            resolved_offset
-        );
+        // SAFETY: the CPU has BMI2 and AVX2 (this function's own contract).
+        let r = unsafe {
+            execute_pending(
+                cur,
+                buffer,
+                dict,
+                dict_content,
+                literals_buffer,
+                lit_cur,
+                literals_buffer_len,
+                seq_ll,
+                seq_ml,
+                resolved_offset,
+            )
+        };
         if let Err(e) = r {
             result = Err(e);
             break;
@@ -567,6 +607,146 @@ unsafe fn run_short_arm_asm<B: BufferBackend, const WORDS: bool>(
     let left = asm_loop.left();
     asm_loop.finish(br, ll_dec, ml_dec, of_dec, hist);
     result.map(|()| left)
+}
+
+/// The long-pipeline arm (an 8-deep lookahead ring that prefetches each
+/// match's source ahead of executing it), out of line: it runs on blocks whose
+/// offsets reach far, and the short arm's caller keeps only what it runs.
+/// Returns the offset history the block leaves; the caller publishes the
+/// cursor and restores the buffer on an error.
+///
+/// # Safety
+/// The CPU has BMI2 and AVX2; the reader, the states and the cursor come from
+/// the block's `init_sequence_stream` and [`OutCursor::capture`].
+#[target_feature(enable = "bmi2,avx2")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_long_pipeline<B: BufferBackend>(
+    br: &mut crate::bit_io::BitReaderReversed<'_, Avx2Kernel>,
+    ll_dec: &mut crate::fse::SeqFSEDecoder<'_>,
+    ml_dec: &mut crate::fse::SeqFSEDecoder<'_>,
+    of_dec: &mut crate::fse::SeqFSEDecoder<'_>,
+    max_update_bits: u8,
+    old_buffer_size: usize,
+    num_sequences: usize,
+    cur: &mut OutCursor,
+    buffer: &mut DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
+    dict_content: &[u8],
+    literals_buffer: &[u8],
+    literals_buffer_len: usize,
+    lit_cur: &mut usize,
+    seq_sum: &mut u32,
+    offset_hist: &[u32; 3],
+) -> Result<[u32; 3], DecompressBlockError> {
+    let mut prefetch_pos: usize = old_buffer_size;
+    let mut shadow_hist: [u32; 3] = *offset_hist;
+    let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
+        ll: 0,
+        ml: 0,
+        actual_offset: 0,
+    }; ADVANCE];
+
+    // The probe below is bounded by the BACKEND's length, which a carried
+    // cursor leaves behind for the whole block, so every source the block
+    // itself produced is refused. That is deliberate, and it was measured:
+    // addressing the probe through the cursor instead (128 KiB block, one
+    // cold dictionary, so 281 of its 391 probes are the refused ones) cost
+    // 3.0% — 9.07 s against 9.34 s over 20k decodes, ranges disjoint across
+    // three interleaved pairs. A source this block wrote is at most a block
+    // back and microseconds old, so warming it buys nothing while the two
+    // hints and the bound cost per sequence. The probe exists for the long
+    // offsets the arm is gated on, and those sit below the backend's length
+    // already.
+    //
+    // Prefill ring with ADVANCE decoded+prefetched sequences.
+    for slot in ring.iter_mut() {
+        let seq = decode_one_body!(ll_dec, ml_dec, of_dec, br);
+        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+        let source_idx = match_start.wrapping_sub(actual_offset as usize);
+        buffer.prefetch_lookahead_match_source(source_idx);
+        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+        *slot = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
+        br.ensure_bits(max_update_bits);
+        ll_dec.update_state_fast(br);
+        ml_dec.update_state_fast(br);
+        of_dec.update_state_fast(br);
+    }
+
+    // SAFETY: alignment-only asm, no memory or register clobbers.
+    unsafe {
+        core::arch::asm!(
+            ".p2align 6",
+            "nop",
+            ".p2align 5",
+            "nop",
+            ".p2align 3",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    for i in ADVANCE..num_sequences {
+        let seq = decode_one_body!(ll_dec, ml_dec, of_dec, br);
+        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+        let source_idx = match_start.wrapping_sub(actual_offset as usize);
+        buffer.prefetch_lookahead_match_source(source_idx);
+        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+
+        let slot = i & ADVANCE_MASK;
+        let exec_seq = ring[slot];
+        ring[slot] = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
+
+        execute_one_body!(
+            cur,
+            buffer,
+            dict,
+            dict_content,
+            literals_buffer,
+            lit_cur,
+            literals_buffer_len,
+            exec_seq.ll,
+            exec_seq.ml,
+            exec_seq.actual_offset
+        )?;
+        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+
+        if i + 1 < num_sequences {
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(br);
+            ml_dec.update_state_fast(br);
+            of_dec.update_state_fast(br);
+        }
+    }
+
+    // Drain the remaining ADVANCE ring slots.
+    for k in 0..ADVANCE {
+        let slot = (num_sequences + k) & ADVANCE_MASK;
+        let exec_seq = ring[slot];
+        execute_one_body!(
+            cur,
+            buffer,
+            dict,
+            dict_content,
+            literals_buffer,
+            lit_cur,
+            literals_buffer_len,
+            exec_seq.ll,
+            exec_seq.ml,
+            exec_seq.actual_offset
+        )?;
+        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+    }
+    Ok(shadow_hist)
 }
 
 /// AVX2-tier monolithic decode + execute. Outer init, RLE dispatch, FSE
@@ -634,134 +814,37 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     let mut cur = OutCursor::capture(buffer);
 
     if use_long_pipeline {
-        // === Long-pipeline arm (8-deep lookahead ring) ===
-        let mut prefetch_pos: usize = old_buffer_size;
-        let mut shadow_hist: [u32; 3] = *offset_hist;
-        let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
-            ll: 0,
-            ml: 0,
-            actual_offset: 0,
-        }; ADVANCE];
-
-        // The probe below is bounded by the BACKEND's length, which a carried
-        // cursor leaves behind for the whole block, so every source the block
-        // itself produced is refused. That is deliberate, and it was measured:
-        // addressing the probe through the cursor instead (128 KiB block, one
-        // cold dictionary, so 281 of its 391 probes are the refused ones) cost
-        // 3.0% — 9.07 s against 9.34 s over 20k decodes, ranges disjoint across
-        // three interleaved pairs. A source this block wrote is at most a block
-        // back and microseconds old, so warming it buys nothing while the two
-        // hints and the bound cost per sequence. The probe exists for the long
-        // offsets the arm is gated on, and those sit below the backend's length
-        // already.
-        //
-        // Prefill ring with ADVANCE decoded+prefetched sequences.
-        for slot in ring.iter_mut() {
-            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-            let source_idx = match_start.wrapping_sub(actual_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx);
-            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-            *slot = ExecSeq {
-                ll: seq.ll,
-                ml: seq.ml,
-                actual_offset,
-            };
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(&mut br);
-            ml_dec.update_state_fast(&mut br);
-            of_dec.update_state_fast(&mut br);
-        }
-
-        // SAFETY: alignment-only asm, no memory or register clobbers.
-        unsafe {
-            core::arch::asm!(
-                ".p2align 6",
-                "nop",
-                ".p2align 5",
-                "nop",
-                ".p2align 3",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-
-        let mut pipeline_err: Option<DecompressBlockError> = None;
-        for i in ADVANCE..num_sequences {
-            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-            let source_idx = match_start.wrapping_sub(actual_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx);
-            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-
-            let slot = i & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            ring[slot] = ExecSeq {
-                ll: seq.ll,
-                ml: seq.ml,
-                actual_offset,
-            };
-
-            let r = execute_one_body!(
+        // SAFETY: the CPU has BMI2 and AVX2 (this function's own contract).
+        let r = unsafe {
+            run_long_pipeline(
+                &mut br,
+                &mut ll_dec,
+                &mut ml_dec,
+                &mut of_dec,
+                max_update_bits,
+                old_buffer_size,
+                num_sequences,
                 &mut cur,
                 buffer,
                 dict,
                 dict_content,
                 literals_buffer,
-                &mut lit_cur,
                 literals_buffer_len,
-                exec_seq.ll,
-                exec_seq.ml,
-                exec_seq.actual_offset
-            );
-            if let Err(e) = r {
-                pipeline_err = Some(e);
-                break;
-            }
-            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-
-            if i + 1 < num_sequences {
-                br.ensure_bits(max_update_bits);
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
-            }
-        }
-
-        // Drain the remaining ADVANCE ring slots.
-        if pipeline_err.is_none() {
-            for k in 0..ADVANCE {
-                let slot = (num_sequences + k) & ADVANCE_MASK;
-                let exec_seq = ring[slot];
-                let r = execute_one_body!(
-                    &mut cur,
-                    buffer,
-                    dict,
-                    dict_content,
-                    literals_buffer,
-                    &mut lit_cur,
-                    literals_buffer_len,
-                    exec_seq.ll,
-                    exec_seq.ml,
-                    exec_seq.actual_offset
-                );
-                if let Err(e) = r {
-                    pipeline_err = Some(e);
-                    break;
-                }
-                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-            }
-        }
-
+                &mut lit_cur,
+                &mut seq_sum,
+                offset_hist,
+            )
+        };
         cur.publish(buffer);
-        if let Some(e) = pipeline_err {
-            if buffer.try_restore_checkpoint(buffer_checkpoint) {
-                *offset_hist = saved_offset_hist;
+        match r {
+            Ok(shadow_hist) => *offset_hist = shadow_hist,
+            Err(e) => {
+                if buffer.try_restore_checkpoint(buffer_checkpoint) {
+                    *offset_hist = saved_offset_hist;
+                }
+                return Err(e);
             }
-            return Err(e);
         }
-        *offset_hist = shadow_hist;
     } else {
         // === Short-block arm (straight single-pass fused loop) ===
         let mut shadow_hist = *offset_hist;
@@ -897,10 +980,12 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                     }
                 }
             }
-            for _ in 0..rust_steps {
-                short_step!(true, 'short);
+            // One expansion for every sequence, the last leaving the states
+            // alone: the question is one predictable branch, where a second
+            // expansion for the last would double the code this loop holds.
+            for step in 0..=rust_steps {
+                short_step!(step < rust_steps, 'short);
             }
-            short_step!(false, 'short);
         }
         cur.publish(buffer);
         if let Some(e) = fallback_err {
