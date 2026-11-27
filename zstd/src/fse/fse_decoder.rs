@@ -1225,13 +1225,12 @@ fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
 /// many, a field of 3 meaning another follows. Up to 16 fields are read at
 /// once and the run of 3s counted from the trailing ones, as upstream's
 /// `FSE_readNCount` does; the result, the error and its fields are those of
-/// reading them one by one. Out of line, so the description loop around it
-/// keeps its own values in registers.
+/// reading them one by one.
 ///
 /// # Safety
 /// `probs` is writable for `max_symbols + ZERO_CHUNK` entries and
 /// `*len <= max_symbols`.
-#[inline(never)]
+#[inline(always)]
 unsafe fn read_zero_runs(
     source: &[u8],
     total_bits: usize,
