@@ -10,7 +10,7 @@ use core::ffi::{CStr, c_char, c_uint};
 
 use codec::decoding::errors::{ErrorCode, FrameDecoderError, FrameDescriptorError};
 
-/// Error codes from `zstd_errors.h` (upstream v1.5.7), numeric values pinned
+/// Error codes from `zstd_errors.h` (upstream v1.6.0), numeric values pinned
 /// since zstd v1.3.1. Exposed `#[repr(u32)]` so the discriminants are the
 /// exact integers a C consumer compares against the `ZSTD_ErrorCode` enum.
 #[repr(u32)]

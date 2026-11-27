@@ -39,8 +39,8 @@ use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_byte
 /// raw pointer load.
 const HASH_READ_SIZE: usize = 8;
 
-/// Rep-extension minimum match length. The upstream zstd 1.5.7
-/// reference (`zstd_double_fast.c:191`, rep1 emit
+/// Rep-extension minimum match length. Upstream zstd 1.6.0
+/// (`ZSTD_compressBlock_doubleFast_noDict_generic`, rep1 emit
 /// `ZSTD_count(ip+1+4, ip+1+4-offset_1, iend) + 4`) accepts 4-byte
 /// rep hits even though hash-search matches require 5 bytes
 /// (`DFAST_MIN_MATCH_LEN`) — rep coding has no on-wire offset cost,

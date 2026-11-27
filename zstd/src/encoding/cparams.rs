@@ -1,7 +1,7 @@
 //! Faithful port of upstream zstd's compression-parameter selection
 //! (`ZSTD_getCParams` and its helpers in `lib/compress/zstd_compress.c` +
 //! the `ZSTD_defaultCParameters[4][23]` table in `lib/compress/clevels.h`,
-//! pinned to zstd 1.5.7). This drives per-(level, srcSize, dictSize)
+//! as of zstd 1.6.0). This drives per-(level, srcSize, dictSize)
 //! `(windowLog, hashLog, minMatch, strategy, ...)` selection so the encoder
 //! sizes its match-finder tables and picks its strategy the same way the
 //! reference does — including the source-size tier table and the
@@ -25,7 +25,7 @@ pub(crate) struct CParams {
     pub strategy: u32,
 }
 
-// Upstream constants (zstd.h / zstd_internal.h / clevels.h, 1.5.7).
+// Upstream constants (zstd.h / zstd_internal.h / clevels.h, 1.6.0).
 const HASHLOG_MIN: u32 = 6;
 const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 // 64-bit host value; structured-zstd's encoder runs hosted. The 32-bit value
@@ -48,7 +48,7 @@ const KB_256: u64 = 256 * 1024;
 const KB_128: u64 = 128 * 1024;
 const KB_16: u64 = 16 * 1024;
 
-/// `ZSTD_defaultCParameters[4][ZSTD_MAX_CLEVEL+1]` (clevels.h, zstd 1.5.7),
+/// `ZSTD_defaultCParameters[4][ZSTD_MAX_CLEVEL+1]` (clevels.h, zstd 1.6.0),
 /// verbatim. Outer index = source-size tier (0 = `>256 KB`, 1 = `<=256 KB`,
 /// 2 = `<=128 KB`, 3 = `<=16 KB`); inner index = level row (0 = base for
 /// negative levels, 1..=22 = that level). Fields: (W, C, H, S, minMatch,

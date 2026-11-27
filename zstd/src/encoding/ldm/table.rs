@@ -2,7 +2,7 @@
 //!
 //! Direct port of the table portion of `ldmState_t` and the
 //! `ZSTD_ldm_getBucket` / `ZSTD_ldm_insertEntry` helpers from
-//! `lib/compress/zstd_ldm.c` v1.5.7.
+//! `lib/compress/zstd_ldm.c` (zstd 1.6.0).
 //!
 //! Layout (upstream zstd `zstd_ldm.c:188-207`):
 //!

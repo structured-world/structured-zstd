@@ -1,8 +1,8 @@
 //! LDM tuning parameters and upstream zstd-parity defaults.
 //!
 //! Direct port of `ldmParams_t` (`zstd_compress_internal.h`) and the
-//! `ZSTD_ldm_adjustParameters` derivation logic (`zstd_ldm.c:135`),
-//! v1.5.7.
+//! `ZSTD_ldm_adjustParameters` derivation logic (`zstd_ldm.c`), zstd
+//! 1.6.0.
 //!
 //! Upstream zstd flow:
 //!

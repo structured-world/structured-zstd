@@ -29,12 +29,12 @@
 //! (`enable_long_distance_matching`), `ZSTD_c_enableLongDistanceMatching`
 //! through the C ABI, and `zstd --long[=N]`.
 //!
-//! Upstream zstd parity anchors:
-//! * `lib/compress/zstd_ldm.c` v1.5.7
+//! Upstream zstd sources (1.6.0):
+//! * `lib/compress/zstd_ldm.c`
 //! * `lib/compress/zstd_ldm.h`
 //! * `lib/compress/zstd_ldm_geartab.h` — the 256 × `u64` permutation
-//!   table reproduced verbatim in [`gear_hash::GEAR_TAB`] to preserve
-//!   byte-for-byte split-point compatibility.
+//!   table reproduced verbatim in [`gear_hash::GEAR_TAB`], so split points
+//!   land where upstream's do.
 
 use alloc::vec;
 use alloc::vec::Vec;

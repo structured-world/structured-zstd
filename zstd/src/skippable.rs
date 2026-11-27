@@ -2,8 +2,7 @@
 //!
 //! Skippable frames carry an arbitrary application payload alongside
 //! a zstd data stream. Spec layout, byte-compatible with upstream zstd
-//! `ZSTD_writeSkippableFrame`
-//! (`lib/compress/zstd_compress.c:4751-4763` in zstd v1.5.7):
+//! `ZSTD_writeSkippableFrame` (`lib/compress/zstd_compress.c`, zstd 1.6.0):
 //!
 //! ```text
 //! +----------+-----------+----------------+
