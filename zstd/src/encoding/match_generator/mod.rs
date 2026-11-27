@@ -257,7 +257,8 @@ impl MatcherStorage {
         match self {
             Self::Dfast(m) => m.set_ring(ring),
             Self::Row(m) => m.set_ring(ring),
-            _ => {}
+            Self::HashChain(m) => m.table.set_ring(ring),
+            Self::Simple(_) => {}
         }
     }
 

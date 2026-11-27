@@ -4464,9 +4464,122 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     );
 }
 
+impl MatcherStorage {
+    /// Whether the active backend's history holds an ext segment now.
+    fn ring_wrapped(&self) -> bool {
+        match self {
+            Self::Simple(_) => false,
+            Self::Dfast(m) => m.ring.len != 0,
+            Self::Row(m) => m.ring.len != 0,
+            Self::HashChain(m) => m.table.ring.len != 0,
+        }
+    }
+}
+
+/// The sequences `level` finds in `data` at a 2^18 window in 32 KiB blocks, the
+/// stream checked to rebuild from them, and whether the history held an ext
+/// segment after any block; `ring` off keeps the history in one segment.
+fn ring_level_sequences(level: i32, data: &[u8], ring: bool) -> (Vec<(usize, usize, usize)>, bool) {
+    let overrides = crate::encoding::CompressionParameters::builder(CompressionLevel::Level(level))
+        .window_log(18)
+        .build()
+        .unwrap()
+        .overrides();
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
+    driver.set_param_overrides(Some(overrides));
+    driver.reset(CompressionLevel::Level(level));
+    driver.storage.set_ring_history(ring);
+    let mut out = Vec::with_capacity(data.len());
+    let mut sequences = Vec::new();
+    let mut wrapped = false;
+    let mut consumed = 0usize;
+    while consumed < data.len() {
+        // Blocks well under the window, so the ext segment outlives several
+        // of them after a wrap and is searched.
+        let take = (data.len() - consumed).min(32 << 10);
+        let block = &data[consumed..consumed + take];
+        driver.commit_input(block);
+        consumed += take;
+        let mut replay = BlockReplay::new(block);
+        driver.start_matching(|seq| {
+            sequences.push(match seq {
+                Sequence::Triple {
+                    literal_len,
+                    offset,
+                    match_len,
+                } => (literal_len, offset, match_len),
+                Sequence::Literals { len } => (len, 0, 0),
+            });
+            replay.apply(&mut out, seq);
+        });
+        wrapped |= driver.storage.ring_wrapped();
+    }
+    assert_eq!(
+        out, data,
+        "level {level}, ring {ring}: the stream does not rebuild"
+    );
+    (sequences, wrapped)
+}
+
+/// A history kept as a ring finds what one kept in a single segment finds: the
+/// window holds the same bytes either way. A stream past one ring capacity at
+/// a 2^18 window, at a level of each windowed search (double fast,
+/// rows, binary tree in the lazy parse, the optimal parsers with and without
+/// the hash3 table). Catches a candidate read off the wrong segment, a match
+/// counted short or long across the seam, and a position left in the ext
+/// segment hashed or inserted from the wrong bytes.
+#[test]
+fn ring_history_finds_what_one_segment_finds() {
+    // Text from a small vocabulary, with runs copied from up to a window back
+    // so matches reach into the ext segment and across its end.
+    const WORDS: [&[u8]; 12] = [
+        b"lorem ",
+        b"ipsum ",
+        b"dolor ",
+        b"sit ",
+        b"amet, ",
+        b"tempor ",
+        b"magna ",
+        b"aliqua ",
+        b"veniam ",
+        b"nostrud ",
+        b"ullamco ",
+        b"laboris\n",
+    ];
+    let mut data = Vec::with_capacity(1_200_000);
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as usize
+    };
+    while data.len() < 1_100_000 {
+        let r = next();
+        if r % 7 == 0 && data.len() > 260_000 {
+            let back = 1 + next() % 250_000;
+            let len = 16 + next() % 600;
+            let from = data.len() - back;
+            for i in 0..len {
+                data.push(data[from + i]);
+            }
+        } else {
+            data.extend_from_slice(WORDS[r % WORDS.len()]);
+        }
+    }
+    for level in [3, 7, 13, 16, 19, 22] {
+        let (ring, wrapped) = ring_level_sequences(level, &data, true);
+        assert!(wrapped, "level {level}: the history never wrapped");
+        let (one, _) = ring_level_sequences(level, &data, false);
+        assert!(ring == one, "level {level}: the ring found other sequences");
+    }
+}
+
 #[test]
 fn hc_compact_history_drains_when_threshold_crossed() {
     let mut hc = HcMatchGenerator::new(8);
+    // The drain serves a history kept in one segment (a ring wraps instead).
+    hc.table.set_ring(false);
     hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
     hc.table.history_start = 16;
     hc.table.compact_history();

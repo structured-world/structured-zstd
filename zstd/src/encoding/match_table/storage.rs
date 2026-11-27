@@ -15,6 +15,7 @@ use super::super::dict_attach::DictAttach;
 use super::super::fastpath::EncodeTier;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::HcOptimalSequence;
+use super::super::ring::Ring;
 use super::super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 
@@ -178,6 +179,132 @@ pub(crate) struct BtCoords {
     pub(crate) bt_mask: usize,
 }
 
+/// The window as the binary tree's search reads it, indexed from the window's
+/// floor (`history_abs_start`): the ext segment of a wrapped history (upstream
+/// `dictBase`), then the prefix (upstream `base`).
+///
+/// `base + idx` is the byte at index `idx` for every prefix index (`idx >=
+/// ext_len`), the one pointer the hot paths add to; it points outside the
+/// history below that, where `ext + idx` holds the byte, with up to
+/// [`KEY_SLACK`](crate::encoding::ring::KEY_SLACK) bytes past the ext
+/// segment's end readable and equal to the
+/// prefix's first bytes. Both pointers come from the history's whole room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveWindow {
+    pub(crate) base: *const u8,
+    /// Window bytes: the ext segment's and the prefix's committed ones.
+    pub(crate) len: usize,
+    pub(crate) ext: *const u8,
+    /// Bytes of the ext segment; 0 while the window is one segment.
+    pub(crate) ext_len: usize,
+}
+
+impl LiveWindow {
+    const EMPTY: Self = Self {
+        base: core::ptr::null(),
+        len: 0,
+        ext: core::ptr::null(),
+        ext_len: 0,
+    };
+
+    /// Pointer to the byte at window index `idx` (or the window's end).
+    #[inline(always)]
+    pub(crate) fn ptr(&self, idx: usize) -> *const u8 {
+        debug_assert!(idx <= self.len);
+        if idx < self.ext_len {
+            self.ext.wrapping_add(idx)
+        } else {
+            self.base.wrapping_add(idx)
+        }
+    }
+
+    /// The window as one slice, while it is one segment.
+    ///
+    /// # Safety
+    ///
+    /// The history it was taken from must not have changed since.
+    #[inline(always)]
+    pub(crate) unsafe fn one_segment<'a>(&self) -> Option<&'a [u8]> {
+        // SAFETY: with no ext segment, `base` is the prefix's first byte and
+        // `len` its committed length, by the caller's contract still live.
+        (self.ext_len == 0 && !self.base.is_null())
+            .then(|| unsafe { core::slice::from_raw_parts(self.base, self.len) })
+    }
+
+    /// Bytes from window index `idx` to the end of the segment holding it.
+    #[inline(always)]
+    pub(crate) fn segment_room(&self, idx: usize) -> usize {
+        if idx < self.ext_len {
+            self.ext_len - idx
+        } else {
+            usize::MAX
+        }
+    }
+}
+
+/// Length of the match of the window bytes at index `$a` against those at
+/// `$b` of a [`LiveWindow`], up to `$max`, each run counted across from the
+/// ext segment's end into the prefix (upstream `ZSTD_count_2segments`), with
+/// the kernel's `$cpl`.
+///
+/// # Safety
+///
+/// `$a + $max` and `$b + $max` at most the window's length; the caller's
+/// umbrella enables `$cpl`.
+macro_rules! live_count {
+    ($cpl:path, $live:expr, $a:expr, $b:expr, $max:expr) => {{
+        let live: $crate::encoding::match_table::storage::LiveWindow = $live;
+        let (a, b, max): (usize, usize, usize) = ($a, $b, $max);
+        let mut n = 0usize;
+        while n < max {
+            let step = (max - n)
+                .min(live.segment_room(a + n))
+                .min(live.segment_room(b + n));
+            // SAFETY: `step` bytes from each index stay inside its segment.
+            let k = $cpl(live.ptr(a + n), live.ptr(b + n), step);
+            n += k;
+            if k < step {
+                break;
+            }
+        }
+        n
+    }};
+}
+pub(crate) use live_count;
+
+/// [`live_count!`] for a candidate at window index `$cand` in the ext segment
+/// against current bytes at `$cur` in the prefix: one count to the segment's
+/// end and, when it runs through, one on from the prefix's start (upstream
+/// `ZSTD_count_2segments`).
+///
+/// # Safety
+///
+/// `$cand < ext_len`; `$max` window bytes from `$cand` and readable at `$cur`;
+/// the caller's umbrella enables `$cpl`.
+macro_rules! ext_count {
+    ($cpl:path, $live:expr, $cand:expr, $cur:expr, $max:expr) => {{
+        let live: $crate::encoding::match_table::storage::LiveWindow = $live;
+        let (cand, cur, max): (usize, *const u8, usize) = ($cand, $cur, $max);
+        debug_assert!(cand < live.ext_len);
+        let room = live.ext_len - cand;
+        if room >= max {
+            $cpl(live.ext.wrapping_add(cand), cur, max)
+        } else {
+            let n = $cpl(live.ext.wrapping_add(cand), cur, room);
+            if n < room {
+                n
+            } else {
+                n + $cpl(
+                    live.base.wrapping_add(live.ext_len),
+                    cur.add(room),
+                    max - room,
+                )
+            }
+        }
+    }};
+}
+pub(crate) use ext_count;
+
 /// Whether a [`DmsDictTables`] holds a built tree; part of the cache-reuse key
 /// alongside `mls` / `hash_log` / region.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -300,11 +427,13 @@ pub(crate) struct MatchTable {
     /// Tree coordinates of the block being parsed, taken by
     /// [`Self::capture_block_coords`] before the parse.
     pub(crate) block_coords: BtCoords,
-    /// The live history `(ptr, len)` of the block being parsed, taken with the
-    /// coordinates: the parse never changes the history, so a search reads it
-    /// here instead of re-deriving the slice at every position. Null outside a
-    /// pass; see [`Self::block_live_history`].
-    pub(crate) block_live: (*const u8, usize),
+    /// The window of the block being parsed, taken with the coordinates: the
+    /// parse never changes the history, so a search reads it here instead of
+    /// re-deriving it at every position. Null outside a pass; see
+    /// [`Self::block_live_window`].
+    pub(crate) block_live: LiveWindow,
+    /// Where a wrapped history's older (ext) segment lies.
+    pub(crate) ring: Ring,
     /// Immutable dictionary match chain (upstream zstd `ZSTD_dictMatchState`),
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
@@ -367,7 +496,9 @@ impl Clone for MatchTable {
             block_coords: self.block_coords,
             // Points into this table's history, not the copy's; taken again
             // when the copy parses a block.
-            block_live: (core::ptr::null(), 0),
+            block_live: LiveWindow::EMPTY,
+            // Describes the history copied above.
+            ring: self.ring.clone(),
             dms: self.dms.clone(),
             dict_table_hash_log: self.dict_table_hash_log,
             retired: self.retired,
@@ -417,7 +548,9 @@ impl Clone for MatchTable {
         self.search_mls = source.search_mls;
         self.block_coords = source.block_coords;
         // The source's view points into the source's history.
-        self.block_live = (core::ptr::null(), 0);
+        self.block_live = LiveWindow::EMPTY;
+        // Describes the history copied above.
+        self.ring.clone_from(&source.ring);
         self.retired = source.retired;
         self.borrowed_input = None;
         self.borrowed_end = 0;
@@ -441,6 +574,11 @@ macro_rules! build_dms {
         $per_pos:expr,
         |$concat:ident, $ht:ident, $ct:ident, $hlog:ident, $region:ident| $build:block
     ) => {{
+        // A dictionary is primed at a frame's start, on one segment.
+        debug_assert_eq!(
+            $self.ring.len, 0,
+            "a dictionary primed into a wrapped window"
+        );
         let region = $region_len.min($self.live_history().len());
         if region < $min_region {
             $self.dms.invalidate();
@@ -542,7 +680,8 @@ impl MatchTable {
             is_btultra2: false,
             search_mls: 4,
             block_coords: BtCoords::default(),
-            block_live: (core::ptr::null(), 0),
+            block_live: LiveWindow::EMPTY,
+            ring: Ring::new(),
             dms: DictAttach::new(),
             dict_table_hash_log: 0,
             retired: None,
@@ -664,15 +803,17 @@ impl MatchTable {
             return;
         }
         let idx = abs_pos - self.history_abs_start;
-        // `hash3` is the only value needed past the borrow, so it ends before
-        // the table write.
-        let hash3 = {
-            let concat = self.live_history();
-            if idx + 4 > concat.len() {
-                return;
-            }
-            Self::hash_position_at(concat, idx, self.hash3_log, 3)
-        };
+        let live = self.live_window();
+        if idx + 4 > live.len {
+            return;
+        }
+        // SAFETY: four window bytes follow `idx`, through the mirror after the
+        // ext segment for its last positions.
+        let hash3 = Self::hash_value_with_mls(
+            unsafe { Self::read_le_u32_ptr(live.ptr(idx)) },
+            self.hash3_log,
+            3,
+        );
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
@@ -884,6 +1025,23 @@ impl MatchTable {
         Self::hash_value_with_mls(value, hash_log, mls)
     }
 
+    /// [`Self::hash_position_at`] of the bytes at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// Eight bytes readable at `ptr` for `mls >= 5`, four otherwise.
+    #[inline(always)]
+    pub(crate) unsafe fn hash_ptr_with_mls(ptr: *const u8, hash_log: usize, mls: usize) -> usize {
+        if mls >= 5 {
+            // SAFETY: the caller's contract.
+            let value = unsafe { Self::read_le_u64_ptr(ptr) };
+            return Self::hash_value8_with_mls(value, hash_log, mls);
+        }
+        // SAFETY: the caller's contract.
+        let value = unsafe { Self::read_le_u32_ptr(ptr) };
+        Self::hash_value_with_mls(value, hash_log, mls)
+    }
+
     /// 3-byte hash used by the HC3 side table. Test-only — the
     /// production path uses inlined per-kernel variants.
     #[cfg(test)]
@@ -1089,7 +1247,14 @@ impl MatchTable {
         // a block actually claims. Sizing it here off `capacity` (a whole read
         // buffer, not a block) would trip the ceiling on the very first fill and
         // fault in the full window+window/4 mirror for frames that never evict.
-        self.history.reserve(capacity);
+        // A full ring wraps here instead.
+        self.ring.before_fill(
+            &mut self.history,
+            &mut self.history_start,
+            self.uncommitted_len,
+            capacity,
+            self.max_window_size,
+        );
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
         debug_assert_eq!(
@@ -1099,6 +1264,7 @@ impl MatchTable {
             self.history.len() - before,
         );
         self.uncommitted_len += appended;
+        self.ring.after_fill(&mut self.history);
         (appended, eof)
     }
 
@@ -1128,19 +1294,24 @@ impl MatchTable {
             // linearly to that ceiling instead of doubling to ~2x window;
             // `compact_history`'s quarter-window drain keeps the length under
             // it, so it never moves again. Small frames that never fill the
-            // window keep their tight data-sized buffer.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
+            // window keep their tight data-sized buffer. A ring holds the
+            // window, the block, the input read ahead and its wrap slack
+            // instead, and wraps rather than drains.
+            let target = if self.ring.on {
+                Ring::room(self.max_window_size)
+            } else {
+                self.max_window_size
+                    + (self.max_window_size >> 2)
+                    + crate::common::MAX_BLOCK_SIZE as usize
+            };
+            if self.ring.len == 0 && target > self.history.len() && self.history.capacity() < target
+            {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
         while self.window_size + len > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
+            self.evict_front(removed_len);
         }
         // Compact AFTER the eviction that raised `history_start`, so the drain
         // trigger sees the dead prefix this block's eviction created.
@@ -1168,9 +1339,58 @@ impl MatchTable {
     pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
+            self.evict_front(removed_len);
+        }
+        if self.ring.len != 0 {
+            // Back to one segment: the ext bytes go in front of the prefix.
+            self.ring.linearize(&mut self.history, self.history_start);
+        }
+    }
+
+    /// Drops the window's oldest `len` bytes: the ext segment's first, then
+    /// the prefix's.
+    #[inline]
+    fn evict_front(&mut self, len: usize) {
+        self.window_size -= len;
+        self.ring.evict(len, &mut self.history_start);
+        self.history_abs_start += len;
+    }
+
+    /// Absolute position of the prefix segment's first live byte.
+    #[inline(always)]
+    pub(crate) fn prefix_abs(&self) -> usize {
+        self.history_abs_start + self.ring.len
+    }
+
+    /// Lets the history wrap as a ring, or keeps it in one segment; set per
+    /// frame, before its first byte, while the history holds no ext segment.
+    pub(crate) fn set_ring(&mut self, ring: bool) {
+        debug_assert_eq!(self.ring.len, 0, "the ring mode changes mid-wrap");
+        self.ring.on = ring;
+    }
+
+    /// The window as [`LiveWindow`] sees it, indexed from its floor.
+    pub(crate) fn live_window(&self) -> LiveWindow {
+        if self.borrowed_input.is_some() {
+            let live = self.live_history();
+            return LiveWindow {
+                base: live.as_ptr(),
+                len: live.len(),
+                ext: live.as_ptr(),
+                ext_len: 0,
+            };
+        }
+        // Both pointers from the whole written room: an ext key read runs past
+        // the segment into the mirror after it.
+        let room = self.history.room().as_ptr();
+        let prefix_len = self.history.len() - self.uncommitted_len - self.history_start;
+        LiveWindow {
+            base: room
+                .wrapping_add(self.history_start)
+                .wrapping_sub(self.ring.len),
+            len: self.ring.len + prefix_len,
+            ext: room.wrapping_add(self.ring.off),
+            ext_len: self.ring.len,
         }
     }
 
@@ -1179,7 +1399,8 @@ impl MatchTable {
     /// least half of the mirror. Keeps the contiguous mirror compact
     /// so reallocation costs stay amortised.
     pub(crate) fn compact_history(&mut self) {
-        if self.history_start == 0 {
+        // A ring wraps at its capacity instead (see `fill_uncommitted`).
+        if self.history_start == 0 || self.ring.on {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the eviction
@@ -1271,7 +1492,7 @@ impl MatchTable {
 
     /// Absolute position one past the end of the live history.
     pub(crate) fn history_abs_end(&self) -> usize {
-        self.history_abs_start + self.live_history().len()
+        self.prefix_abs() + self.live_history().len()
     }
 
     /// Get a reference to the last committed window slice. Returns
@@ -1399,30 +1620,22 @@ impl MatchTable {
     /// search reads them from [`Self::block_coords`] on every position.
     pub(crate) fn capture_block_coords(&mut self) {
         self.block_coords = self.bt_coords();
-        let live = self.live_history();
-        self.block_live = (live.as_ptr(), live.len());
+        self.block_live = self.live_window();
     }
 
-    /// The live history taken by [`Self::capture_block_coords`], for a search
-    /// inside the pass that took it.
-    ///
-    /// The returned slice holds no borrow of `self`, so the search can write
-    /// the tables while it reads the history.
-    ///
-    /// # Safety
-    ///
-    /// Only between `capture_block_coords` and the end of that pass: the
-    /// history must not have been appended to, trimmed or reallocated since.
+    /// The window taken by [`Self::capture_block_coords`], for a search inside
+    /// the pass that took it. It holds no borrow of `self`, so the search can
+    /// write the tables while it reads the history; its pointers are valid
+    /// only between `capture_block_coords` and the end of that pass, while the
+    /// history is not appended to, trimmed or reallocated.
     #[inline(always)]
-    pub(crate) unsafe fn block_live_history<'a>(&self) -> &'a [u8] {
+    pub(crate) fn block_live_window(&self) -> LiveWindow {
         debug_assert_eq!(
             self.block_live,
-            (self.live_history().as_ptr(), self.live_history().len()),
-            "the block's live history moved since it was taken"
+            self.live_window(),
+            "the block's window moved since it was taken"
         );
-        // SAFETY: the pair was taken from the live history at the start of the
-        // pass, and the caller guarantees the history has not changed since.
-        unsafe { core::slice::from_raw_parts(self.block_live.0, self.block_live.1) }
+        self.block_live
     }
 
     /// The pair index in `chain_table` of the node whose stored index is
@@ -1517,6 +1730,9 @@ impl MatchTable {
         self.borrowed_input = None;
         self.borrowed_end = 0;
         self.borrowed_extent = 0;
+        // The next frame starts on one segment: a wrapped window has no
+        // dictionary at its front to keep.
+        let wrapped = core::mem::take(&mut self.ring.len) != 0;
         // Re-borrow: an ATTACH-mode reused dict frame keeps the dict in the
         // separate cached dms (not the live tables), so the resident dict bytes
         // at the front of history + the cached dms can stay in place — the frame
@@ -1530,7 +1746,11 @@ impl MatchTable {
         // or the search depth change (a level switch). So a primed dms is
         // always one built for the CURRENT search; the reborrow can never
         // reuse a dms whose tree was built under a stale mls or budget.
-        let kept = if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
+        let kept = if self.dictionary_active
+            && self.dms.is_primed()
+            && !wrapped
+            && self.history_start == 0
+        {
             // `checked_sub`, not `-`: after the dict chunk is evicted,
             // `compact_history` can reset `history_start` to 0 while
             // `history_abs_start` has already advanced PAST
@@ -1706,59 +1926,95 @@ impl MatchTable {
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ))]
-        unsafe {
-            self.bt_insert_range_neon::<false>(from, stop, current_abs_end, target_abs)
+        // Whether the window holds an ext segment picks the variant, once per
+        // range.
+        macro_rules! run {
+            ($ext:literal) => {{
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_endian = "little",
+                    feature = "kernel-neon"
+                ))]
+                unsafe {
+                    self.bt_insert_range_neon::<false, $ext>(from, stop, current_abs_end, target_abs)
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    use crate::encoding::fastpath::FastpathKernel;
+                    crate::encoding::fastpath::tier_match!(K {
+                        #[cfg(feature = "kernel-avx2")]
+                        FastpathKernel::Avx2Bmi2 => unsafe {
+                            self.bt_insert_range_avx2_bmi2::<false, $ext>(
+                                from,
+                                stop,
+                                current_abs_end,
+                                target_abs,
+                            )
+                        },
+                        #[cfg(feature = "kernel-sse")]
+                        FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+                            self.bt_insert_range_sse2::<false, $ext>(
+                                from,
+                                stop,
+                                current_abs_end,
+                                target_abs,
+                            )
+                        },
+                        FastpathKernel::Scalar => {
+                            self.bt_insert_range_scalar::<false, $ext>(
+                                from,
+                                stop,
+                                current_abs_end,
+                                target_abs,
+                            )
+                        },
+                    })
+                }
+                // wasm has no runtime CPU detection: `simd128` is resolved at
+                // compile time, so the tier is picked by `cfg` rather than by `K`.
+                #[cfg(all(
+                    target_arch = "wasm32",
+                    target_feature = "simd128",
+                    feature = "kernel-simd128"
+                ))]
+                // SAFETY: the `cfg` above establishes `simd128` at compile time,
+                // which is exactly the umbrella the callee declares.
+                unsafe {
+                    self.bt_insert_range_simd128::<false, $ext>(
+                        from,
+                        stop,
+                        current_abs_end,
+                        target_abs,
+                    )
+                }
+                #[cfg(not(any(
+                    all(
+                        target_arch = "aarch64",
+                        target_endian = "little",
+                        feature = "kernel-neon"
+                    ),
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    all(
+                        target_arch = "wasm32",
+                        target_feature = "simd128",
+                        feature = "kernel-simd128"
+                    )
+                )))]
+                {
+                    self.bt_insert_range_scalar::<false, $ext>(
+                        from,
+                        stop,
+                        current_abs_end,
+                        target_abs,
+                    )
+                }
+            }};
         }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::FastpathKernel;
-            crate::encoding::fastpath::tier_match!(K {
-                #[cfg(feature = "kernel-avx2")]
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_insert_range_avx2_bmi2::<false>(from, stop, current_abs_end, target_abs)
-                },
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_range_sse2::<false>(from, stop, current_abs_end, target_abs)
-                },
-                FastpathKernel::Scalar => {
-                    self.bt_insert_range_scalar::<false>(from, stop, current_abs_end, target_abs)
-                },
-            })
-        }
-        // wasm has no runtime CPU detection: `simd128` is resolved at compile
-        // time, so the tier is picked by `cfg` rather than by `K`.
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        // SAFETY: the `cfg` above establishes `simd128` at compile time, which
-        // is exactly the umbrella the callee declares.
-        unsafe {
-            self.bt_insert_range_simd128::<false>(from, stop, current_abs_end, target_abs)
-        }
-        #[cfg(not(any(
-            all(
-                target_arch = "aarch64",
-                target_endian = "little",
-                feature = "kernel-neon"
-            ),
-            target_arch = "x86",
-            target_arch = "x86_64",
-            all(
-                target_arch = "wasm32",
-                target_feature = "simd128",
-                feature = "kernel-simd128"
-            )
-        )))]
-        {
-            self.bt_insert_range_scalar::<false>(from, stop, current_abs_end, target_abs)
+        if self.ring.len != 0 {
+            run!(true)
+        } else {
+            run!(false)
         }
     }
 
@@ -1772,7 +2028,7 @@ impl MatchTable {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn bt_insert_range_neon<const IN_BLOCK: bool>(
+    pub(crate) unsafe fn bt_insert_range_neon<const IN_BLOCK: bool, const EXT: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1787,7 +2043,8 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            IN_BLOCK
+            IN_BLOCK,
+            EXT
         )
     }
 
@@ -1800,7 +2057,7 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_insert_range_sse2<const IN_BLOCK: bool>(
+    pub(crate) unsafe fn bt_insert_range_sse2<const IN_BLOCK: bool, const EXT: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1815,7 +2072,8 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            IN_BLOCK
+            IN_BLOCK,
+            EXT
         )
     }
 
@@ -1828,7 +2086,7 @@ impl MatchTable {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
-    pub(crate) unsafe fn bt_insert_range_avx2_bmi2<const IN_BLOCK: bool>(
+    pub(crate) unsafe fn bt_insert_range_avx2_bmi2<const IN_BLOCK: bool, const EXT: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1843,7 +2101,8 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            IN_BLOCK
+            IN_BLOCK,
+            EXT
         )
     }
 
@@ -1857,7 +2116,7 @@ impl MatchTable {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    pub(crate) unsafe fn bt_insert_range_simd128<const IN_BLOCK: bool>(
+    pub(crate) unsafe fn bt_insert_range_simd128<const IN_BLOCK: bool, const EXT: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1872,7 +2131,8 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            IN_BLOCK
+            IN_BLOCK,
+            EXT
         )
     }
 
@@ -1884,7 +2144,7 @@ impl MatchTable {
         target_endian = "little",
         feature = "kernel-neon"
     )))]
-    pub(crate) fn bt_insert_range_scalar<const IN_BLOCK: bool>(
+    pub(crate) fn bt_insert_range_scalar<const IN_BLOCK: bool, const EXT: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1899,8 +2159,129 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            IN_BLOCK
+            IN_BLOCK,
+            EXT
         )
+    }
+
+    /// Insert one position of a wrapped window's ext segment into the binary
+    /// tree and return how far the cursor moves: the walk of
+    /// `bt_insert_range_body!`, with the current bytes read across the seam as
+    /// well as the candidates'. Off the hot loop: only the positions before
+    /// the prefix reach it, the previous block's last ones after a wrap and a
+    /// rebase replay's.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn bt_insert_ext_position(
+        &mut self,
+        live: LiveWindow,
+        coords: BtCoords,
+        abs_pos: usize,
+        current_abs_end: usize,
+        window_low: usize,
+        search_depth: usize,
+    ) -> usize {
+        use crate::encoding::fastpath::scalar::common_prefix_len_ptr;
+        let idx = abs_pos - self.history_abs_start;
+        debug_assert!(idx < live.ext_len);
+        if idx + 8 > live.len {
+            return 1;
+        }
+        let tail_limit = current_abs_end - abs_pos;
+        // SAFETY: eight window bytes follow the position, through the mirror
+        // after the ext segment for its last ones.
+        let hash =
+            unsafe { Self::hash_ptr_with_mls(live.ptr(idx), self.hash_log, self.search_mls) };
+        let BtCoords {
+            abs_bias,
+            idx_bias,
+            bt_mask,
+        } = coords;
+        let win_low_stored = window_low.wrapping_sub(abs_bias);
+        let stored = abs_pos.wrapping_sub(abs_bias);
+        // As the range body: a tree floor below the window sits one under it.
+        let bt_low = abs_pos.saturating_sub(bt_mask);
+        let bt_low_stored = if bt_low < window_low {
+            win_low_stored - 1
+        } else {
+            bt_low.wrapping_sub(abs_bias)
+        };
+        let mut match_end_abs = abs_pos + 9;
+        let mut best_len = 8usize;
+        let mut compares_left = search_depth;
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let (hash_ptr, chain_ptr, _) = self.table_bases();
+        let mut closed_side: u32 = 0;
+        // SAFETY: the pair index and the masked hash are inside their tables,
+        // as in the range body.
+        let pair = unsafe { chain_ptr.add(2 * (stored & bt_mask)) };
+        let mut smaller_slot: *mut u32 = pair;
+        let mut larger_slot: *mut u32 = unsafe { pair.add(1) };
+        let mut match_stored = unsafe { *hash_ptr.add(hash) };
+        unsafe { *hash_ptr.add(hash) = stored as u32 };
+        while compares_left > 0 && match_stored as usize >= win_low_stored {
+            compares_left -= 1;
+            let node_stored = match_stored as usize;
+            // SAFETY: as for the pair above.
+            let next_pair = unsafe { chain_ptr.add(2 * (node_stored & bt_mask)) };
+            let seed_len = common_length_smaller.min(common_length_larger);
+            let cand_idx = node_stored.wrapping_add(idx_bias);
+            // SAFETY: both runs hold `tail_limit` window bytes.
+            let match_len = seed_len
+                + unsafe {
+                    live_count!(
+                        common_prefix_len_ptr,
+                        live,
+                        cand_idx + seed_len,
+                        idx + seed_len,
+                        tail_limit - seed_len
+                    )
+                };
+            if match_len > best_len {
+                best_len = match_len;
+                let candidate_end = node_stored.wrapping_add(abs_bias) + match_len;
+                if candidate_end > match_end_abs {
+                    match_end_abs = candidate_end;
+                }
+            }
+            if match_len >= tail_limit {
+                break;
+            }
+            // SAFETY: both bytes after the common part are window bytes.
+            if unsafe { *live.ptr(cand_idx + match_len) < *live.ptr(idx + match_len) } {
+                // SAFETY: an open side points at a pair slot or `closed_side`.
+                unsafe { *smaller_slot = match_stored };
+                common_length_smaller = match_len;
+                if node_stored <= bt_low_stored {
+                    smaller_slot = &raw mut closed_side;
+                    break;
+                }
+                smaller_slot = unsafe { next_pair.add(1) };
+                match_stored = unsafe { *smaller_slot };
+            } else {
+                // SAFETY: as above.
+                unsafe { *larger_slot = match_stored };
+                common_length_larger = match_len;
+                if node_stored <= bt_low_stored {
+                    larger_slot = &raw mut closed_side;
+                    break;
+                }
+                larger_slot = next_pair;
+                match_stored = unsafe { *larger_slot };
+            }
+        }
+        // SAFETY: each side points at a pair slot or at `closed_side`.
+        unsafe {
+            *smaller_slot = HC_EMPTY;
+            *larger_slot = HC_EMPTY;
+        }
+        let speed_positions = if best_len > 384 {
+            (best_len - 384).min(192)
+        } else {
+            0
+        };
+        speed_positions.max(match_end_abs - (abs_pos + 8)).max(1)
     }
 
     /// BT-side history replay after [`Self::begin_rebase`]. Re-walks
@@ -2006,30 +2387,21 @@ impl MatchTable {
         if !self.can_skip_rebase_check(abs_pos) {
             return false;
         }
-        // The slice holds no borrow, so the table write can take `&mut self`
+        // The view holds no borrow, so the table write can take `&mut self`
         // (the same reborrow the collect body uses).
-        let (concat_ptr, concat_len) = {
-            let live = self.live_history();
-            (live.as_ptr(), live.len())
-        };
-        // SAFETY: the pair describes the live history, which this call does
+        let live = self.live_window();
+        // SAFETY: the view describes the live history, which this call does
         // not reallocate.
-        unsafe { self.fill_hash3_from(concat_ptr, concat_len, abs_pos) }
+        unsafe { self.fill_hash3_from(live, abs_pos) }
     }
 
-    /// [`Self::fill_hash3_hoisted`] against a live-history pair the caller
-    /// already holds.
-    ///
-    /// The match finder has both the pointer and the length in registers by
-    /// the time it needs this, and upstream's equivalent is inlined into the
-    /// finder for exactly that reason (`ZSTD_insertAndFindFirstIndexHash3` is
-    /// static, and the parser advances one position at a time, so the loop
-    /// almost always runs once and the call boundary is the whole cost).
+    /// [`Self::fill_hash3_hoisted`] against a window view the caller already
+    /// holds.
     ///
     /// # Safety
     ///
-    /// `concat_ptr` / `concat_len` must describe the current live history, and
-    /// it must not be reallocated for the duration of the call.
+    /// `live` must describe the current history, and it must not be
+    /// reallocated for the duration of the call.
     ///
     /// The hash3 table must also be at its configured width — `hash3_table()`
     /// exactly `1 << hash3_log` slots, which [`Self::ensure_tables`] is what
@@ -2037,12 +2409,7 @@ impl MatchTable {
     /// through a raw pointer, so a caller that reaches here with a table left
     /// at another level's width writes out of bounds in release.
     #[inline]
-    pub(crate) unsafe fn fill_hash3_from(
-        &mut self,
-        concat_ptr: *const u8,
-        concat_len: usize,
-        abs_pos: usize,
-    ) -> bool {
+    unsafe fn fill_hash3_from(&mut self, live: LiveWindow, abs_pos: usize) -> bool {
         // Representability is the CALLER's to settle: the match finder reaches
         // here inside a block that `arm_block_positions` cleared, and asking
         // again is the per-position question this refactor removed. The general
@@ -2066,7 +2433,7 @@ impl MatchTable {
         // stops where the general path would start early-returning; positions
         // past that insert nothing, which is why the cursor still lands on
         // `abs_pos`.
-        let last_insertable = history_abs_start + concat_len.saturating_sub(3);
+        let last_insertable = history_abs_start + live.len.saturating_sub(3);
         let end = abs_pos.min(last_insertable);
         // `rel = cursor - position_base + index_shift`. Wrapping arithmetic is
         // exact here: the true value is in range (the gate above), so the sum
@@ -2077,9 +2444,10 @@ impl MatchTable {
         let table_ptr = table.as_mut_ptr();
         for cursor in start..end {
             let idx = cursor - history_abs_start;
-            // SAFETY: `idx + 4 <= concat_len` by the `end` bound above, so the
-            // four-byte read stays inside the live history.
-            let value = unsafe { Self::read_le_u32_ptr(concat_ptr.add(idx)) };
+            // SAFETY: `idx + 4 <= live.len` by the `end` bound above, so the
+            // four-byte read stays inside the window (through the mirror after
+            // the ext segment for its last positions).
+            let value = unsafe { Self::read_le_u32_ptr(live.ptr(idx)) };
             let hash = Self::hash_value_with_mls(value, hash3_log, 3);
             debug_assert!(hash < 1usize << hash3_log);
             // SAFETY: the hash is masked to `hash3_log` bits and the table
