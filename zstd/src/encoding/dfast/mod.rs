@@ -1049,18 +1049,16 @@ impl DfastMatchGenerator {
             // out of the window, as on the Fast backend). Parked, they serve
             // the next frame, which commits the dictionary at the front again.
             self.dict_keep.park(&mut self.dict);
-            // Cap the history near the live window: once eviction starts, grow
-            // linearly to window + window/4 + one block rather than doubling;
-            // `compact_history`'s quarter-window drain keeps the length under
-            // it. Small frames that never fill the window stay data-sized.
-            // A ring holds the window, the block being matched, the input read
-            // ahead and its wrap slack instead, and wraps rather than drains.
+            // Cap the history once eviction starts. A ring holds the window,
+            // the block being matched, the input read ahead and its wrap slack,
+            // and wraps. One segment (long-distance matching) grows linearly to
+            // twice the window plus two blocks rather than doubling past it,
+            // `compact_history`'s window drain keeping the length under it.
+            // Small frames that never fill the window stay data-sized.
             let target = if self.ring.on {
                 Ring::room(self.max_window_size)
             } else {
-                self.max_window_size
-                    + (self.max_window_size >> 2)
-                    + crate::common::MAX_BLOCK_SIZE as usize
+                2 * self.max_window_size + 2 * crate::common::MAX_BLOCK_SIZE as usize
             };
             if self.ring.len == 0 && target > self.history.len() && self.history.capacity() < target
             {
@@ -2370,13 +2368,13 @@ impl DfastMatchGenerator {
         if self.history_start == 0 || self.ring.on {
             return;
         }
-        // Drain the dead prefix at a quarter window (paired with the one-time
-        // `reserve_exact` in `commit_block`) so the buffer stays near
-        // `window + window/4` instead of doubling to ~2x window on long streams.
+        // Drain the dead prefix at a whole window (paired with the one-time
+        // `reserve_exact` of twice the window in `commit_block`): one byte
+        // copied per input byte, as the row and tree backends drain theirs.
         // Compare against the COMMITTED length: `history.len()` also counts
         // bytes no block has claimed yet, which would delay the trigger by
         // however much input happens to be read ahead.
-        if self.history_start >= (self.max_window_size >> 2)
+        if self.history_start >= self.max_window_size
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain_front(self.history_start);
