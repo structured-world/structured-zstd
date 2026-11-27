@@ -269,6 +269,14 @@ impl<const MLS: u32, const EXT: bool> RowScan<MLS, EXT> {
         (self.ptr(abs), self.hist_start + self.len - abs)
     }
 
+    /// Pointer to the byte at `abs`, a position known to lie in the prefix
+    /// (at or after the cursor), with no segment test.
+    #[inline(always)]
+    fn prefix_ptr(&self, abs: usize) -> *const u8 {
+        debug_assert!(abs >= self.hist_start, "a prefix read below the prefix");
+        self.base.wrapping_add(abs - self.hist_start)
+    }
+
     /// The row key width: the bound constant, or the stored one when unbound.
     #[inline(always)]
     fn key_mls(&self) -> u32 {
@@ -341,7 +349,34 @@ impl RowTables {
     ) -> u32 {
         // A position of the window, in the ext segment for a gap left at the
         // end of the previous block once the history wrapped.
-        let (key_ptr, _) = ctx.key_at(abs_pos);
+        self.packed_hash_of(ctx, ctx.ptr(abs_pos), abs_pos)
+    }
+
+    /// [`Self::packed_hash_at`] of a position ahead of the cursor, nearly
+    /// always in the prefix: the per-position cache refill takes the prefix
+    /// read behind a branch that only the first positions after a wrap leave,
+    /// rather than selecting the segment on every position.
+    #[inline(always)]
+    fn packed_hash_ahead<const MLS: u32, const EXT: bool>(
+        &self,
+        ctx: RowScan<MLS, EXT>,
+        abs_pos: usize,
+    ) -> u32 {
+        if !EXT || abs_pos >= ctx.hist_start {
+            self.packed_hash_of(ctx, ctx.prefix_ptr(abs_pos), abs_pos)
+        } else {
+            self.packed_hash_at(ctx, abs_pos)
+        }
+    }
+
+    /// The packed hash of the key at `key_ptr`, window position `abs_pos`.
+    #[inline(always)]
+    fn packed_hash_of<const MLS: u32, const EXT: bool>(
+        &self,
+        ctx: RowScan<MLS, EXT>,
+        key_ptr: *const u8,
+        abs_pos: usize,
+    ) -> u32 {
         debug_assert!(abs_pos + 8 <= ctx.hist_start + ctx.len);
         // SAFETY: as above, and `ctx` views the live window (an ext key runs
         // into the mirror). The length only chooses the key, so it is passed
@@ -969,10 +1004,17 @@ macro_rules! row_find_best_match {
                     use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
                     #[cfg(target_arch = "x86_64")]
                     use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                    // SAFETY: prefetch is a hint; the candidate lies in the live
-                    // history.
+                    // SAFETY: prefetch is a hint and never faults. Taken off
+                    // the prefix's base whatever the segment, as upstream
+                    // prefetches `base + matchIndex` in extDict mode too: an ext
+                    // candidate's hint misses, and no segment is resolved for it.
                     unsafe {
-                        _mm_prefetch($ctx.ptr(raw as usize).cast(), _MM_HINT_T0);
+                        _mm_prefetch(
+                            $ctx.base
+                                .wrapping_add((raw as usize).wrapping_sub(hist_start))
+                                .cast(),
+                            _MM_HINT_T0,
+                        );
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
@@ -997,12 +1039,17 @@ macro_rules! row_find_best_match {
                 // The candidate's segment, resolved once for the gate and the
                 // count: bytes left in it (unbounded in the prefix) and its
                 // first byte.
-                let room = if $ctx.in_prefix(cand) {
-                    usize::MAX
-                } else {
+                let ext_cand = !$ctx.in_prefix(cand);
+                let room = if ext_cand {
                     $ctx.hist_start - cand
+                } else {
+                    usize::MAX
                 };
-                let cand_ptr = $ctx.ptr(cand);
+                let cand_ptr = if ext_cand {
+                    $ctx.ext.wrapping_add(cand - $ctx.ext_abs)
+                } else {
+                    $ctx.base.wrapping_add(cand - $ctx.hist_start)
+                };
                 let gate = if cand >= prefix_start {
                     // A gate word past the segment's end (a match at the
                     // seam) is read where it lies.
@@ -1251,12 +1298,17 @@ macro_rules! hc_find_best_match {
                 // The candidate's segment, resolved once for the gate and the
                 // count: bytes left in it (unbounded in the prefix) and its
                 // first byte.
-                let room = if $ctx.in_prefix(cand) {
-                    usize::MAX
-                } else {
+                let ext_cand = !$ctx.in_prefix(cand);
+                let room = if ext_cand {
                     $ctx.hist_start - cand
+                } else {
+                    usize::MAX
                 };
-                let cand_ptr = $ctx.ptr(cand);
+                let cand_ptr = if ext_cand {
+                    $ctx.ext.wrapping_add(cand - $ctx.ext_abs)
+                } else {
+                    $ctx.base.wrapping_add(cand - $ctx.hist_start)
+                };
                 let gate = if cand >= prefix_start {
                     // A gate word past the segment's end (a match at the
                     // seam) is read where it lies.
@@ -1789,7 +1841,10 @@ macro_rules! row_cache_next {
         let pos = $pos;
         let slot = pos & (ROW_HASH_CACHE_SIZE - 1);
         let cur = $cache[slot];
-        $cache[slot] = row_cache_hash!($m, $ctx, $rl, pos + ROW_HASH_CACHE_SIZE);
+        // Ahead of the cursor, so in the prefix.
+        let packed = $m.packed_hash_ahead($ctx, pos + ROW_HASH_CACHE_SIZE);
+        $m.prefetch_row::<$rl>($m.row_of(packed));
+        $cache[slot] = packed;
         cur
     }};
 }
