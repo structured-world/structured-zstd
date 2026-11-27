@@ -864,7 +864,7 @@ macro_rules! row_count {
         // `limit` bytes from the cursor are committed.
         let n = $cpl($ctx.ptr(cand), cur_ptr, first);
         if n == first && first < limit {
-            n + $cpl($ctx.base, cur_ptr.add(n), limit - n)
+            n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
         } else {
             n
         }
@@ -1067,7 +1067,7 @@ macro_rules! row_find_best_match {
                     let first = limit.min(room);
                     let n = $cpl(cand_ptr, cur_ptr, first);
                     let cml = if n == first && first < limit {
-                        n + $cpl($ctx.base, cur_ptr.add(n), limit - n)
+                        n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
                     } else {
                         n
                     };
@@ -1094,9 +1094,9 @@ macro_rules! row_find_best_match {
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dcombined = unsafe {
                 RowMatchGenerator::key_hash_raw(
-                    $ctx.base,
-                    $ctx.len,
-                    cur_idx,
+                    cur_ptr,
+                    $ctx.len - cur_idx,
+                    0,
                     $ctx.key_mls(),
                     dict_row_hash_log + ROW_TAG_BITS,
                     0,
@@ -1325,7 +1325,7 @@ macro_rules! hc_find_best_match {
                     let first = limit.min(room);
                     let n = $cpl(cand_ptr, cur_ptr, first);
                     let cml = if n == first && first < limit {
-                        n + $cpl($ctx.base, cur_ptr.add(n), limit - n)
+                        n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
                     } else {
                         n
                     };
@@ -1358,9 +1358,9 @@ macro_rules! hc_find_best_match {
             // dictionary's table.
             let mut dmi = unsafe {
                 *$chain.dict_hash.add(RowMatchGenerator::key_hash_raw(
-                    $ctx.base,
-                    $ctx.len,
-                    cur_idx,
+                    cur_ptr,
+                    $ctx.len - cur_idx,
+                    0,
                     $ctx.key_mls(),
                     $chain.dict_hash_bits,
                     0,
@@ -1493,8 +1493,8 @@ macro_rules! dubt_insert1 {
                 };
                 if m_abs >= hist_start {
                     // Both in the prefix (`cur_abs > m_abs`): one run.
-                    let mptr = $ctx.base.add(m_abs - hist_start);
-                    let ip = $ctx.base.add(cur_abs - hist_start);
+                    let mptr = $ctx.prefix_ptr(m_abs);
+                    let ip = $ctx.prefix_ptr(cur_abs);
                     ml += $cpl(mptr.add(ml), ip.add(ml), sort_end - ml);
                     if ml == sort_end {
                         (false, true)
@@ -1565,9 +1565,9 @@ macro_rules! dubt_find_best_match {
             let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
             let hash_bits = $m.row_hash_log + $m.row_log;
             let cur_idx = p - hist_start;
-            // SAFETY: the parse searches only positions >= 8 bytes before
-            // the block end.
-            let ip = unsafe { $ctx.base.add(cur_idx) };
+            // The parse searches only positions >= 8 bytes before the block
+            // end.
+            let ip = $ctx.prefix_ptr(p);
             let limit = $ctx.len - cur_idx;
             let h = $m.hc_hash_at($ctx, p);
             let curr = p + BT_IDX_BASE;
@@ -1651,7 +1651,7 @@ macro_rules! dubt_find_best_match {
                 // at `limit`.
                 let (smaller, at_end) = unsafe {
                     if m_abs >= hist_start {
-                        let mptr = $ctx.base.add(m_abs - hist_start);
+                        let mptr = $ctx.prefix_ptr(m_abs);
                         ml += $cpl(mptr.add(ml), ip.add(ml), limit - ml);
                         if ml == limit {
                             (false, true)
@@ -1736,9 +1736,9 @@ macro_rules! dubt_find_best_match {
                 // SAFETY: `cur_idx + 8 <= $ctx.len`.
                 let dh = unsafe {
                     RowMatchGenerator::key_hash_raw(
-                        $ctx.base,
-                        $ctx.len,
-                        cur_idx,
+                        ip,
+                        $ctx.len - cur_idx,
+                        0,
                         $ctx.key_mls(),
                         dict.shape.hash_log,
                         0,
@@ -2001,11 +2001,10 @@ macro_rules! lazy_parse_body {
                 let mut off = 0usize;
                 let mut start = ip + 1;
                 {
-                    let base = scan.base;
                     // SAFETY: `ip + 1 + 4 <= block_end` (`ip < ilimit`), and
                     // `offset_1 <= max_rep` keeps the rep source in history.
                     unsafe {
-                        let cur = base.add(ip + 1 - hist_start);
+                        let cur = scan.prefix_ptr(ip + 1);
                         // The rep source may lie in a wrapped window's ext
                         // segment.
                         if rep_ok(ip + 1, offset_1)
@@ -2062,10 +2061,9 @@ macro_rules! lazy_parse_body {
                         while ip < ilimit {
                             ip += 1;
                             {
-                                let base = scan.base;
                                 // SAFETY: `ip + 4 <= block_end`, `offset_1 <= max_rep`.
                                 unsafe {
-                                    let cur = base.add(ip - hist_start);
+                                    let cur = scan.prefix_ptr(ip);
                                     if rep_ok(ip, offset_1)
                                         && rd32(cur) == rd32(scan.ptr(ip - offset_1))
                                     {
@@ -2113,10 +2111,9 @@ macro_rules! lazy_parse_body {
                             if depth == 2 && ip < ilimit {
                                 ip += 1;
                                 {
-                                    let base = scan.base;
                                     // SAFETY: as above.
                                     unsafe {
-                                        let cur = base.add(ip - hist_start);
+                                        let cur = scan.prefix_ptr(ip);
                                         if rep_ok(ip, offset_1)
                                             && rd32(cur) == rd32(scan.ptr(ip - offset_1))
                                         {
@@ -2182,9 +2179,7 @@ macro_rules! lazy_parse_body {
                     // (the source in the ext segment once the history wrapped).
                     while start > anchor
                         && start - off > m_start
-                        && unsafe {
-                            *scan.base.add(start - 1 - hist_start) == *scan.ptr(start - 1 - off)
-                        }
+                        && unsafe { *scan.prefix_ptr(start - 1) == *scan.ptr(start - 1 - off) }
                     {
                         start -= 1;
                         match_length += 1;
@@ -2233,10 +2228,9 @@ macro_rules! lazy_parse_body {
                 // Immediate repcode: `offset_2` right after the stored match,
                 // swapping the two reps on every hit.
                 while ip <= ilimit && rep_ok(ip, offset_2) {
-                    let base = scan.base;
                     // SAFETY: `ip + 4 <= block_end`, `offset_2 <= max_rep`.
                     let rep_len = unsafe {
-                        let cur = base.add(ip - hist_start);
+                        let cur = scan.prefix_ptr(ip);
                         // The source may lie in a wrapped window's ext segment.
                         if rd32(cur) != rd32(scan.ptr(ip - offset_2)) {
                             break;
