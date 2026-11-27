@@ -2003,6 +2003,92 @@ fn a_buffer_filled_by_the_last_write_is_pre_split_where_its_content_changes() {
     assert_eq!(decoded, payload);
 }
 
+/// Regenerated size of every block of a frame made only of raw and RLE blocks
+/// (RFC 8878 3.1.1.2: Block_Size is the regenerated size for both).
+fn raw_and_rle_block_sizes(frame: &[u8]) -> Vec<usize> {
+    let (_, header_len) = crate::decoding::frame::read_frame_header(frame).unwrap();
+    let mut at = usize::from(header_len);
+    let mut sizes = Vec::new();
+    loop {
+        let header = u32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], 0]);
+        let (block_type, size) = ((header >> 1) & 3, (header >> 3) as usize);
+        assert!(
+            block_type < 2,
+            "a compressed block in a frame of zeros and noise"
+        );
+        at += 3 + if block_type == 1 { 1 } else { size };
+        sizes.push(size);
+        if header & 1 == 1 {
+            return sizes;
+        }
+    }
+}
+
+/// What the frame saved stops licensing the pre-splitter once a span of
+/// input as long as upstream's default job has gone by
+/// (`frame_compressor::savings_span`): there each job starts its own
+/// `consumedSrcSize - producedCSize` from zero. Counted over the whole frame
+/// instead, the savings of a run of zeros kept the splitter cutting the noise
+/// after it into its smallest pieces to the end of the frame. Through the
+/// streaming encoder, the reader path and the one-shot slice alike.
+#[test]
+fn savings_stop_licensing_cuts_after_a_job_span_of_noise() {
+    let block = crate::common::MAX_BLOCK_SIZE as usize;
+    let level = CompressionLevel::Level(3);
+    let mut payload = vec![0u8; 8 * block];
+    let mut state = 0x2545_F491_u32;
+    payload.extend((0..96 * block).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }));
+    let mut encoder = StreamingEncoder::new(Vec::new(), level);
+    for chunk in payload.chunks(10_000) {
+        encoder.write_all(chunk).unwrap();
+    }
+    let streamed = encoder.finish().unwrap();
+    // Upstream `ZSTDMT_computeTargetJobLog` without long-distance matching:
+    // `2^max(20, windowLog + 2)`, held to 2^30.
+    let span = (encoder_window_size(&streamed) as usize * 4).clamp(1 << 20, 1 << 30);
+    assert!(
+        span + 4 * block < payload.len(),
+        "the payload outlasts one span"
+    );
+    let mut read = Vec::new();
+    let mut fc: crate::encoding::FrameCompressor<&[u8], &mut Vec<u8>> =
+        crate::encoding::FrameCompressor::new(level);
+    fc.set_source(&payload[..]);
+    fc.set_drain(&mut read);
+    fc.compress();
+    let one_shot = crate::encoding::compress_to_vec(&payload[..], level);
+    for (path, frame) in [
+        ("streaming", &streamed),
+        ("reader", &read),
+        ("one-shot", &one_shot),
+    ] {
+        let mut start = 0usize;
+        for size in raw_and_rle_block_sizes(frame) {
+            // The first block of the next span is the first the splitter
+            // sees without savings; every one after it is whole.
+            if start >= span + block {
+                assert!(
+                    size == block || start + size == payload.len(),
+                    "{path}: noise cut at {start} ({size} bytes) a span past the zeros"
+                );
+            }
+            start += size;
+        }
+        assert_eq!(start, payload.len(), "{path}: blocks cover the input");
+    }
+}
+
+/// Window size a frame header declares (RFC 8878 3.1.1.1.2).
+fn encoder_window_size(frame: &[u8]) -> u64 {
+    let (header, _) = crate::decoding::frame::read_frame_header(frame).unwrap();
+    header.window_size().unwrap()
+}
+
 /// A drain refusing the block a flush or a finish emits fails that call and
 /// leaves the context failed, so a later write reports the failure rather than
 /// continuing a frame with a block missing.
