@@ -89,6 +89,7 @@ pub(crate) mod block_input;
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
+pub(crate) mod ring;
 pub(crate) mod row;
 pub mod sequences;
 pub(crate) mod simple;

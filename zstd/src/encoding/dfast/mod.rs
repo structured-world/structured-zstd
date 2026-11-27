@@ -29,8 +29,7 @@ use super::simple::fast_kernel::count::count_forward_dict_2segment;
 use super::util::hash_top_bits;
 use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
-mod segments;
-use segments::WindowSegments;
+use super::ring::{Ring, WindowSegments};
 
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
@@ -128,19 +127,10 @@ pub(crate) struct DfastMatchGenerator {
     /// first byte when there is one, else the prefix's.
     pub(crate) history_abs_start: usize,
     /// The window's older part once the history has wrapped (upstream's
-    /// extDict, `ZSTD_window_update`): buffer offsets `[ext_off, ext_off +
-    /// ext_len)`, positions `[history_abs_start, history_abs_start +
-    /// ext_len)`. The prefix then starts at offset 0. Empty (`ext_len == 0`)
-    /// while the window is one segment.
-    pub(crate) ext_off: usize,
-    pub(crate) ext_len: usize,
-    /// How many of the prefix's first bytes, up to a key's width, the room
-    /// holds right after the ext segment (see [`Self::mirror_prefix_head`]).
-    ext_mirrored: usize,
-    /// Whether a full history wraps to the buffer's front instead of moving
-    /// the window there. Off while long-distance matching reads the window as
-    /// one slice.
-    ring: bool,
+    /// extDict): positions `[history_abs_start, history_abs_start +
+    /// ring.len)`, the prefix starting at offset 0 after it. Off while
+    /// long-distance matching reads the window as one slice.
+    pub(crate) ring: Ring,
     pub(crate) offset_hist: [u32; 3],
     /// While a dictionary is primed: how far into it the tables start
     /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
@@ -499,10 +489,7 @@ impl DfastMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
-            ext_off: 0,
-            ext_len: 0,
-            ext_mirrored: 0,
-            ring: true,
+            ring: Ring::new(),
             dict_index_floor: 0,
             tables: Table::empty(),
             tagged: false,
@@ -844,11 +831,11 @@ impl DfastMatchGenerator {
         // A dictionary frame scanned in place wrote positions past the history
         // it holds, up to the end of its input.
         let next_floor =
-            (self.history_abs_start + self.ext_len + (self.history.len() - self.history_start))
+            (self.history_abs_start + self.ring.len + (self.history.len() - self.history_start))
                 .max(core::mem::take(&mut self.borrowed_abs_end));
         // The next frame starts on one segment: a wrapped window has no
         // dictionary at its front to keep, and nothing below reads the ext.
-        let wrapped = core::mem::take(&mut self.ext_len) != 0;
+        let wrapped = core::mem::take(&mut self.ring.len) != 0;
         // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
         // the front of history (`[0, region)`) + the cached concat-keyed dict
         // tables, so the per-frame dict re-commit (the dominant ~37% memmove on
@@ -1009,27 +996,13 @@ impl DfastMatchGenerator {
         // off `capacity` (a whole read buffer, not a block) would trip it on the
         // first fill and fault in the full window+window/4 mirror for frames
         // that never evict.
-        let ring = self.ring_capacity();
-        // The room past the ring holds the mirror after the ext segment's end
-        // (`mirror_prefix_head`), which can lie at the ring's edge.
-        if self.ring
-            && self.ext_len == 0
-            && self.history.capacity() >= ring + HASH_READ_SIZE
-            && self.history.len() + capacity > ring
-        {
-            self.wrap_history();
-        }
-        if self.ext_len != 0 {
-            // The prefix grows into the room the ext segment's evicted bytes
-            // left; it must stay below the ext segment's live bytes, which a
-            // write would corrupt (see `ring_capacity`).
-            assert!(
-                self.history.len() + capacity <= self.ext_off,
-                "ring prefix would overwrite the live ext segment",
-            );
-        } else {
-            self.history.reserve(capacity);
-        }
+        self.ring.before_fill(
+            &mut self.history,
+            &mut self.history_start,
+            self.uncommitted_len,
+            capacity,
+            self.max_window_size,
+        );
 
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
@@ -1040,7 +1013,7 @@ impl DfastMatchGenerator {
             self.history.len() - before,
         );
         self.uncommitted_len += appended;
-        self.mirror_prefix_head();
+        self.ring.after_fill(&mut self.history);
         (appended, eof)
     }
 
@@ -1082,14 +1055,14 @@ impl DfastMatchGenerator {
             // it. Small frames that never fill the window stay data-sized.
             // A ring holds the window, the block being matched, the input read
             // ahead and its wrap slack instead, and wraps rather than drains.
-            let target = if self.ring {
-                self.ring_capacity() + HASH_READ_SIZE
+            let target = if self.ring.on {
+                Ring::room(self.max_window_size)
             } else {
                 self.max_window_size
                     + (self.max_window_size >> 2)
                     + crate::common::MAX_BLOCK_SIZE as usize
             };
-            if self.ext_len == 0 && target > self.history.len() && self.history.capacity() < target
+            if self.ring.len == 0 && target > self.history.len() && self.history.capacity() < target
             {
                 self.history.reserve_exact(target - self.history.len());
             }
@@ -1120,9 +1093,9 @@ impl DfastMatchGenerator {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.evict_front(removed_len);
         }
-        if self.ext_len != 0 {
+        if self.ring.len != 0 {
             // Back to one segment: the ext bytes go in front of the prefix.
-            self.linearize_history();
+            self.ring.linearize(&mut self.history, self.history_start);
         }
         if self.history_start != 0 {
             // Drop the dead prefix. Its room is the context's (or the
@@ -2082,17 +2055,14 @@ impl DfastMatchGenerator {
                     self.dict.region_len(),
                 )
             }
-        } else if self.ext_len != 0 {
+        } else if self.ring.len != 0 {
             // A wrapped window's older part runs right before the prefix the
             // same way, so a rep reaching past the prefix counts on from it.
+            let ext = self.ring.ext_bytes(&self.history);
             // SAFETY: the ext segment's bytes are written room nothing writes
-            // while the block is matched.
-            unsafe {
-                core::slice::from_raw_parts(
-                    self.history.room().as_ptr().add(self.ext_off),
-                    self.ext_len,
-                )
-            }
+            // while the block is matched; detached from the borrow of `self`
+            // so the chain below can take `&mut self`.
+            unsafe { core::slice::from_raw_parts(ext.as_ptr(), ext.len()) }
         } else {
             &[]
         };
@@ -2397,7 +2367,7 @@ impl DfastMatchGenerator {
 
     fn compact_history(&mut self) {
         // A ring wraps at its capacity instead (see `fill_uncommitted`).
-        if self.history_start == 0 || self.ring {
+        if self.history_start == 0 || self.ring.on {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the one-time
@@ -2427,82 +2397,25 @@ impl DfastMatchGenerator {
     /// Absolute position of the prefix segment's first live byte.
     #[inline(always)]
     pub(crate) fn prefix_abs(&self) -> usize {
-        self.history_abs_start + self.ext_len
+        self.history_abs_start + self.ring.len
     }
 
     /// The owned window as its two segments, for the paths that read a
     /// candidate by its position.
     fn segments(&self) -> WindowSegments {
-        // Both pointers from the whole written room: an ext key read runs past
-        // the segment into the mirror after it.
-        let room = self.history.room().as_ptr();
-        let committed = self.history.len() - self.uncommitted_len;
-        let prefix_abs = self.prefix_abs();
-        WindowSegments {
-            ext: room.wrapping_add(self.ext_off),
-            ext_abs: self.history_abs_start,
-            prefix: room.wrapping_add(self.history_start),
-            prefix_abs,
-            end_abs: prefix_abs + (committed - self.history_start),
-        }
-    }
-
-    /// History room the window may occupy as a ring: the window, the block
-    /// being matched and the input read ahead of it, with the slack that keeps
-    /// the prefix written after a wrap below the ext segment's live bytes
-    /// until the window has moved past them (see [`Self::wrap_history`]).
-    fn ring_capacity(&self) -> usize {
-        self.max_window_size + 4 * crate::common::MAX_BLOCK_SIZE as usize
-    }
-
-    /// Starts the prefix over at the buffer's front, keeping the committed
-    /// window where it lies as the ext segment and moving only the input read
-    /// but not yet claimed (upstream `ZSTD_window_update` on a non-contiguous
-    /// segment, after the input buffer wrapped).
-    ///
-    /// Taken when a fill would run the prefix past the ring capacity. The
-    /// window is then far shorter than the prefix (the dead part ahead of it
-    /// alone is several blocks), so no older ext segment is live, and the
-    /// slack in [`Self::ring_capacity`] keeps every later fill below the ext
-    /// segment's live start until eviction has moved past it.
-    fn wrap_history(&mut self) {
-        debug_assert_eq!(self.ext_len, 0, "a live ext segment at the next wrap");
-        let committed_end = self.history.len() - self.uncommitted_len;
-        self.ext_off = self.history_start;
-        self.ext_len = committed_end - self.history_start;
-        self.history.wrap_tail(committed_end);
-        self.history_start = 0;
-        // The moved tail's bytes still lie right after the ext segment, where
-        // they were read in.
-        self.ext_mirrored = self.uncommitted_len.min(HASH_READ_SIZE);
-    }
-
-    /// Keeps the prefix's first bytes, up to a key's width, right after the
-    /// ext segment, so a key read at one of the ext segment's last positions
-    /// runs on into the bytes that follow them in the window. The wrap leaves
-    /// the moved read-ahead there; a shorter one is completed as the prefix
-    /// grows. The prefix never reaches that far while the ext segment lives.
-    fn mirror_prefix_head(&mut self) {
-        if self.ext_len == 0 || self.ext_mirrored == HASH_READ_SIZE {
-            return;
-        }
-        let upto = self.history.len().min(HASH_READ_SIZE);
-        if upto <= self.ext_mirrored {
-            return;
-        }
-        let mut head = [0u8; HASH_READ_SIZE];
-        head[..upto - self.ext_mirrored].copy_from_slice(&self.history[self.ext_mirrored..upto]);
-        let at = self.ext_off + self.ext_len + self.ext_mirrored;
-        self.history
-            .write_room(at, &head[..upto - self.ext_mirrored]);
-        self.ext_mirrored = upto;
+        self.ring.segments(
+            &self.history,
+            self.history_start,
+            self.history_abs_start,
+            self.uncommitted_len,
+        )
     }
 
     /// Lets the history wrap as a ring, or keeps it in one segment; set per
     /// frame, before its first byte, while the history holds no ext segment.
     pub(crate) fn set_ring(&mut self, ring: bool) {
-        debug_assert_eq!(self.ext_len, 0, "the ring mode changes mid-wrap");
-        self.ring = ring;
+        debug_assert_eq!(self.ring.len, 0, "the ring mode changes mid-wrap");
+        self.ring.on = ring;
     }
 
     /// Drops the window's oldest `len` bytes: the ext segment's first, then
@@ -2510,22 +2423,8 @@ impl DfastMatchGenerator {
     #[inline]
     fn evict_front(&mut self, len: usize) {
         self.window_size -= len;
-        let from_ext = len.min(self.ext_len);
-        self.ext_off += from_ext;
-        self.ext_len -= from_ext;
-        self.history_start += len - from_ext;
+        self.ring.evict(len, &mut self.history_start);
         self.history_abs_start += len;
-    }
-
-    /// Puts the ext segment back in front of the prefix, making the window one
-    /// segment again, for the paths that hand it out as one slice.
-    fn linearize_history(&mut self) {
-        debug_assert_eq!(
-            self.history_start, 0,
-            "the prefix starts at the front while an ext segment lives"
-        );
-        self.history.prepend_from_room(self.ext_off, self.ext_len);
-        self.ext_len = 0;
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
@@ -2548,7 +2447,7 @@ impl DfastMatchGenerator {
         debug_assert!(step >= 1, "insert_range needs a positive step");
         // Positions in a wrapped window's older segment come first, in order,
         // as the walk over one segment would take them.
-        if self.ext_len != 0 && self.borrowed_input.is_none() && start < self.prefix_abs() {
+        if self.ring.len != 0 && self.borrowed_input.is_none() && start < self.prefix_abs() {
             debug_assert_eq!(
                 step, 1,
                 "only the dense seam re-seed reaches the ext segment"
@@ -2700,7 +2599,7 @@ impl DfastMatchGenerator {
     /// `[start, end)` in the ext segment: both tables where a full key is
     /// readable, the short one alone where only its `mls` bytes are. A key at
     /// one of the segment's last positions runs on into the prefix's first
-    /// bytes, which the room holds right after it (`mirror_prefix_head`).
+    /// bytes, which the room holds right after it (`Ring::after_fill`).
     /// Cold: only the re-seed of the bytes before a block reaches back here.
     fn insert_ext_positions<const TAGGED: bool>(&mut self, start: usize, end: usize) {
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
@@ -4965,7 +4864,7 @@ impl DfastMatchGenerator {
         // and picks one with a single `switch` (zstd_double_fast.c:568-605).
         let mls = self.mls;
         debug_assert!((4..=7).contains(&mls), "dfast key width {mls} out of 4..=7");
-        let ext = self.ext_len != 0;
+        let ext = self.ring.len != 0;
         debug_assert!(
             !(ext && (use_dict || borrowed)),
             "a wrapped window has no dictionary and no borrowed input"
