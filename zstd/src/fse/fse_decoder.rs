@@ -4,7 +4,13 @@ use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
 /// Most probabilities a table description lists: the `u8` alphabet.
-const MAX_PROBABILITIES: usize = 256;
+/// Room for the 256-symbol alphabet and one [`ZERO_CHUNK`] past it, which a
+/// zero run writes whole.
+const MAX_PROBABILITIES: usize = 256 + ZERO_CHUNK;
+
+/// Probabilities a zero run writes at once: one fixed-size store compiles to
+/// vector moves, where a run of its own length is a libc `memset` call.
+const ZERO_CHUNK: usize = 16;
 /// Most states a table spreads: the largest table, `1 << 9`.
 const MAX_SPREAD: usize = 1 << 9;
 
@@ -1086,14 +1092,40 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // zero run written in one go, as upstream fills its zeroed
         // `normalizedCounter`, instead of a push or a resize per field.
         let max_symbols = self.max_symbol as usize + 1;
-        debug_assert!(max_symbols <= MAX_PROBABILITIES);
-        self.symbol_probabilities.reserve(max_symbols);
+        debug_assert!(max_symbols + ZERO_CHUNK <= MAX_PROBABILITIES);
+        self.symbol_probabilities.reserve(max_symbols + ZERO_CHUNK);
         let probs = self
             .symbol_probabilities
             .spare_capacity_mut()
             .as_mut_ptr()
             .cast::<i32>();
         let mut len = 0usize;
+        // Zeros over `[from, from + n)` in whole chunks: the last chunk runs up
+        // to `ZERO_CHUNK - 1` past the run, into room the reservation above
+        // leaves past the alphabet, and later symbols overwrite what it wrote
+        // inside it. `n` may be zero (one chunk of nothing to keep).
+        macro_rules! zero_run {
+            ($from:expr, $n:expr) => {{
+                let from: usize = $from;
+                let n: usize = $n;
+                let mut done = 0usize;
+                loop {
+                    // SAFETY: `from + n <= max_symbols` (the callers' checks),
+                    // so every chunk ends within `max_symbols + ZERO_CHUNK`,
+                    // the room reserved above.
+                    unsafe {
+                        probs
+                            .add(from + done)
+                            .cast::<[i32; ZERO_CHUNK]>()
+                            .write_unaligned([0; ZERO_CHUNK]);
+                    }
+                    done += ZERO_CHUNK;
+                    if done >= n {
+                        break;
+                    }
+                }
+            }};
+        }
         macro_rules! fail {
             ($e:expr) => {{
                 // SAFETY: every slot below `len` was written.
@@ -1201,8 +1233,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                             let got = len + 3 * ((max_symbols - len) / 3 + 1);
                             fail!(FSETableError::TooManySymbols { got });
                         }
-                        // SAFETY: `run_end <= max_symbols`, within the room.
-                        unsafe { core::ptr::write_bytes(probs.add(len), 0, run_end - len) };
+                        zero_run!(len, run_end - len);
                         len = run_end;
                         bit_pos += 2 * threes;
                     }
@@ -1215,8 +1246,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                     if run_end > max_symbols {
                         fail!(FSETableError::TooManySymbols { got: run_end });
                     }
-                    // SAFETY: as above.
-                    unsafe { core::ptr::write_bytes(probs.add(len), 0, last) };
+                    zero_run!(len, last);
                     len = run_end;
                     break;
                 }
