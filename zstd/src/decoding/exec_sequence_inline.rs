@@ -430,11 +430,10 @@ pub(crate) mod x86 {
     /// `PERIOD[offset][lane] = 16 - offset + lane % offset`: a byte shuffle
     /// with this mask spreads the LAST `offset` bytes of a vector over all
     /// sixteen lanes. `static`, not `const`, so a debug build reads it in place
-    /// instead of copying it onto the stack at every use.
-    #[cfg(all(
-        any(feature = "kernel-avx2", test),
-        any(feature = "std", target_feature = "ssse3")
-    ))]
+    /// instead of copying it onto the stack at every use. Plain data, so it
+    /// exists wherever the AVX2 tier does: the assembly sequence loop reads it
+    /// whatever the build's baseline.
+    #[cfg(any(feature = "kernel-avx2", test))]
     pub(crate) static PERIOD: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
@@ -451,10 +450,7 @@ pub(crate) mod x86 {
 
     /// `ROTATE[offset][lane] = (lane + 16) % offset`: turns one 16-byte chunk
     /// of a period-`offset` run into the next one.
-    #[cfg(all(
-        any(feature = "kernel-avx2", test),
-        any(feature = "std", target_feature = "ssse3")
-    ))]
+    #[cfg(any(feature = "kernel-avx2", test))]
     pub(crate) static ROTATE: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;

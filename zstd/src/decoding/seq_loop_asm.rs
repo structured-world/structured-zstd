@@ -8,14 +8,15 @@
 //! and every edit to it so far has moved values to the stack rather than off it.
 //!
 //! The assembly executes only what it can do without asking the buffer: the
-//! literals in bounds, a match from 16 or more bytes back inside the output
-//! written so far or wholly inside the dictionary with sixteen-byte reads to
-//! spare, shorter than 256 bytes, the write and its overshoot inside the
-//! output's room. Anything else leaves the loop with the sequence decoded
-//! and the states advanced ([`Exit::Pending`]), and the caller executes it on
-//! the Rust path, which handles every case. Near the start of the bit stream,
-//! where a refill could reach before it, the loop leaves before decoding
-//! ([`Exit::Boundary`]) and the caller runs that sequence whole.
+//! literals in bounds, a match inside the output written so far (from fewer
+//! than 16 bytes back only with 16 bytes of output before it) or wholly inside
+//! the dictionary with sixteen-byte reads to spare, shorter than 256 bytes,
+//! the write and its overshoot inside the output's room. Anything else leaves
+//! the loop with the sequence decoded and the states advanced
+//! ([`Exit::Pending`]), and the caller executes it on the Rust path, which
+//! handles every case. Near the start of the bit stream the window stops at
+//! its first byte, as upstream's `BIT_reloadDStream` does; a corrupt stream
+//! that consumes past the window leaves before decoding ([`Exit::Boundary`]).
 
 use crate::bit_io::BitReaderReversed;
 use crate::cpu_kernel::Avx2Kernel;
@@ -164,6 +165,11 @@ struct Slots {
     /// assembly holds pointers to entries, and these are where they point
     /// until the first state advance moves them into the tables.
     entries: [u64; 3],
+    /// The byte shuffles of a match from fewer than 16 bytes back, indexed by
+    /// its offset: the one spreading the period over a vector (160) and the
+    /// one rotating it for the next chunk (168).
+    period: *const [u8; 16],
+    rotate: *const [u8; 16],
 }
 
 /// Why the loop stopped.
@@ -276,6 +282,8 @@ impl<const WORDS: bool> Loop<WORDS> {
                 dict_len: dict_content.len(),
                 dict_end: dict_content.as_ptr() as usize + dict_content.len(),
                 entries: [0; 3],
+                period: crate::decoding::exec_sequence_inline::x86::PERIOD.as_ptr(),
+                rotate: crate::decoding::exec_sequence_inline::x86::ROTATE.as_ptr(),
             },
             container: br.bit_container,
             consumed: u64::from(br.bits_consumed),
@@ -439,8 +447,6 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "ja 80f",
                 "cmp rdi, 255",
                 "ja 80f",
-                "cmp rcx, 16",
-                "jb 80f",
                 "lea rax, [r14 + rdx]",
                 "add rax, rdi",
                 "cmp rax, qword ptr [rsi + 64]",
@@ -449,6 +455,8 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "sub rax, qword ptr [rsi + 72]",
                 "cmp rcx, rax",
                 "ja 60f",
+                "cmp rcx, 16",
+                "jb 70f",
                 // Literals: sixteen, then the rest sixteen at a time.
                 "33:",
                 "vmovdqu xmm0, xmmword ptr [r15]",
@@ -555,6 +563,44 @@ impl<const WORDS: bool> Loop<WORDS> {
                 "sub rcx, rdx",
                 "mov rdx, qword ptr [rsi + 88]",
                 "jmp 33b",
+                // A match from fewer than 16 bytes back repeats its own output
+                // with period `rcx`: the literals as above, then one shuffle
+                // spreads the period over a vector from the 16 bytes before the
+                // match, and a second rotates it for each further chunk (the
+                // Rust path's `overlap_match_shuffle`). `rax` is the live output
+                // at the match, which must hold those 16 bytes.
+                "70:",
+                "cmp rax, 16",
+                "jb 80f",
+                "vmovdqu xmm0, xmmword ptr [r15]",
+                "vmovdqu xmmword ptr [r14], xmm0",
+                "cmp rdx, 16",
+                "jbe 72f",
+                "mov eax, 16",
+                "73:",
+                "vmovdqu xmm0, xmmword ptr [r15 + rax]",
+                "vmovdqu xmmword ptr [r14 + rax], xmm0",
+                "add rax, 16",
+                "cmp rax, rdx",
+                "jb 73b",
+                "72:",
+                "add r15, rdx",
+                "add r14, rdx",
+                "mov rdx, rcx",
+                "shl rdx, 4",
+                "mov rax, qword ptr [rsi + 160]",
+                "vmovdqu xmm0, xmmword ptr [r14 - 16]",
+                "vpshufb xmm0, xmm0, xmmword ptr [rax + rdx]",
+                "mov rax, qword ptr [rsi + 168]",
+                "vmovdqu xmm1, xmmword ptr [rax + rdx]",
+                "xor edx, edx",
+                "74:",
+                "vmovdqu xmmword ptr [r14 + rdx], xmm0",
+                "add rdx, 16",
+                "cmp rdx, rdi",
+                "jae 41b",
+                "vpshufb xmm0, xmm0, xmm1",
+                "jmp 74b",
                 "80:",
                 "mov qword ptr [rsi + 96], rdi",
                 "mov qword ptr [rsi + 104], rcx",
@@ -577,6 +623,7 @@ impl<const WORDS: bool> Loop<WORDS> {
                 out("rdx") _,
                 out("rdi") _,
                 out("xmm0") _,
+                out("xmm1") _,
                 options(nostack),
             )
             };
