@@ -320,9 +320,11 @@ impl<const WORDS: bool> Loop<WORDS> {
         of_dec: &mut SeqFSEDecoder<'_>,
         hist: &mut [u32; 3],
     ) {
-        br.bit_container = self.container;
-        br.bits_consumed = self.consumed as u8;
-        br.index = self.ip as usize - self.source as usize;
+        br.restore_position(
+            self.ip as usize - self.source as usize,
+            self.consumed,
+            self.container,
+        );
         let [ll, ml, of] = if self.at[0].is_null() {
             [self.ll_e, self.ml_e, self.of_e]
         } else {

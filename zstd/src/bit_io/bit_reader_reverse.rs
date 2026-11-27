@@ -173,6 +173,26 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         }
     }
 
+    /// Takes over a position kept outside the reader: the eight-byte window
+    /// at `index`, `consumed` bits of it read. A window at the stream's start
+    /// read past eight bits is held the way [`Self::refill_slow`] holds it,
+    /// the read bits shifted out and counted as extra, so every later read
+    /// and [`Self::bits_remaining`] see the same stream. More than 64 bits
+    /// read (a corrupt stream) leaves an empty container and a negative
+    /// remainder.
+    pub(crate) fn restore_position(&mut self, index: usize, consumed: u64, container: u64) {
+        self.index = index;
+        if index == 0 && consumed > 8 {
+            self.bit_container = container.checked_shl(consumed as u32).unwrap_or(0);
+            self.extra_bits += consumed as usize;
+            self.bits_consumed = 0;
+        } else {
+            debug_assert!(consumed <= 64);
+            self.bit_container = container;
+            self.bits_consumed = consumed as u8;
+        }
+    }
+
     /// End-of-stream refill paths — runs when the next 8-byte window would
     /// underflow the source buffer. Keep it cold but inline: an out-of-line
     /// mutable borrow forces the reader's fields into memory across the
