@@ -22,7 +22,6 @@ use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
-use super::ring::{Ring, WindowSegments};
 use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
 /// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
@@ -203,30 +202,11 @@ enum LazyFinder {
 /// `MLS` is the row key width (upstream's `mls` template argument), bound by
 /// the per-tier parse monoliths so the hot loops hash with a constant width;
 /// `0` reads it from `mls` instead, for the cold callers.
-///
-/// `EXT` says whether the window may hold an ext segment (upstream's
-/// `dictMode == ZSTD_extDict` template); without one every segment test
-/// drops out at codegen time.
 #[derive(Clone, Copy)]
-struct RowScan<const MLS: u32 = 0, const EXT: bool = true> {
-    /// The prefix segment: its first byte, committed length and position.
-    /// It is the whole window unless the history has wrapped.
+struct RowScan<const MLS: u32 = 0> {
     base: *const u8,
     len: usize,
     hist_start: usize,
-    /// The prefix's base in position space, `base - hist_start`: the byte at
-    /// a prefix position `abs` is `base_v + abs`, one add of the position the
-    /// search already carries (upstream `base + matchIndex`).
-    base_v: *const u8,
-    /// A wrapped window's older (ext) segment, below `hist_start`, in the
-    /// same position space: the byte at an ext position `abs` is `ext_v +
-    /// abs` (upstream `dictBase + matchIndex`). Up to a key's width of bytes
-    /// past its end are readable and equal the prefix's first bytes. Unread
-    /// while the window is one segment.
-    ext_v: *const u8,
-    /// The window's floor (upstream `lowLimit`), the ext segment's first
-    /// position; `hist_start` while the window is one segment.
-    ext_abs: usize,
     /// Block-constant search parameters hoisted with the view so the hot
     /// loops never re-read them through `&mut self`: the salt of the live
     /// row hash, the match-distance bound (upstream `maxDist`), the lowest
@@ -245,44 +225,7 @@ struct RowScan<const MLS: u32 = 0, const EXT: bool = true> {
     mls: u32,
 }
 
-impl<const MLS: u32, const EXT: bool> RowScan<MLS, EXT> {
-    /// Whether the window position `abs` lies in the prefix.
-    #[inline(always)]
-    fn in_prefix(&self, abs: usize) -> bool {
-        debug_assert!(
-            EXT || abs >= self.hist_start,
-            "an ext position on the one-segment path"
-        );
-        !EXT || abs >= self.hist_start
-    }
-
-    /// Pointer to the window byte at `abs` (or the window's end), in whichever
-    /// segment holds it (upstream `matchIndex < dictLimit ? dictBase : base`).
-    #[inline(always)]
-    fn ptr(&self, abs: usize) -> *const u8 {
-        if self.in_prefix(abs) {
-            self.base_v.wrapping_add(abs)
-        } else {
-            self.ext_v.wrapping_add(abs)
-        }
-    }
-
-    /// Where a key at window position `abs` starts and how many window bytes
-    /// follow it, for `key_hash_raw(ptr, len, 0, ..)`: a key at one of the ext
-    /// segment's last positions runs on into the prefix through the mirror.
-    #[inline(always)]
-    fn key_at(&self, abs: usize) -> (*const u8, usize) {
-        (self.ptr(abs), self.hist_start + self.len - abs)
-    }
-
-    /// Pointer to the byte at `abs`, a position known to lie in the prefix
-    /// (at or after the cursor), with no segment test.
-    #[inline(always)]
-    fn prefix_ptr(&self, abs: usize) -> *const u8 {
-        debug_assert!(abs >= self.hist_start, "a prefix read below the prefix");
-        self.base_v.wrapping_add(abs)
-    }
-
+impl<const MLS: u32> RowScan<MLS> {
     /// The row key width: the bound constant, or the stored one when unbound.
     #[inline(always)]
     fn key_mls(&self) -> u32 {
@@ -348,50 +291,16 @@ impl RowTables {
     /// position it reaches, and the one a cache's width ahead of it, has its
     /// full 8 bytes: neither that bound nor a short key is tested per position.
     #[inline(always)]
-    fn packed_hash_at<const MLS: u32, const EXT: bool>(
-        &self,
-        ctx: RowScan<MLS, EXT>,
-        abs_pos: usize,
-    ) -> u32 {
-        // A position of the window, in the ext segment for a gap left at the
-        // end of the previous block once the history wrapped.
-        self.packed_hash_of(ctx, ctx.ptr(abs_pos), abs_pos)
-    }
-
-    /// [`Self::packed_hash_at`] of a position ahead of the cursor, nearly
-    /// always in the prefix: the per-position cache refill takes the prefix
-    /// read behind a branch that only the first positions after a wrap leave,
-    /// rather than selecting the segment on every position.
-    #[inline(always)]
-    fn packed_hash_ahead<const MLS: u32, const EXT: bool>(
-        &self,
-        ctx: RowScan<MLS, EXT>,
-        abs_pos: usize,
-    ) -> u32 {
-        if !EXT || abs_pos >= ctx.hist_start {
-            self.packed_hash_of(ctx, ctx.prefix_ptr(abs_pos), abs_pos)
-        } else {
-            self.packed_hash_at(ctx, abs_pos)
-        }
-    }
-
-    /// The packed hash of the key at `key_ptr`, window position `abs_pos`.
-    #[inline(always)]
-    fn packed_hash_of<const MLS: u32, const EXT: bool>(
-        &self,
-        ctx: RowScan<MLS, EXT>,
-        key_ptr: *const u8,
-        abs_pos: usize,
-    ) -> u32 {
-        debug_assert!(abs_pos + 8 <= ctx.hist_start + ctx.len);
-        // SAFETY: as above, and `ctx` views the live window (an ext key runs
-        // into the mirror). The length only chooses the key, so it is passed
-        // as unbounded to choose the full one.
+    fn packed_hash_at<const MLS: u32>(&self, ctx: RowScan<MLS>, abs_pos: usize) -> u32 {
+        let idx = abs_pos - ctx.hist_start;
+        debug_assert!(idx + 8 <= ctx.len);
+        // SAFETY: as above, and `ctx` views the live history. The length only
+        // chooses the key, so it is passed as unbounded to choose the full one.
         unsafe {
             RowMatchGenerator::key_hash_raw(
-                key_ptr,
+                ctx.base,
                 usize::MAX,
-                0,
+                idx,
                 ctx.key_mls(),
                 self.hash_bits,
                 ctx.salt,
@@ -842,69 +751,6 @@ macro_rules! dispatch_tag_kernel {
     }};
 }
 
-/// Match length of the window bytes at `$cand` (a position) against those at
-/// `$cur_ptr` (the cursor, in the prefix), up to `$limit`, counted across from
-/// a wrapped window's ext segment into the prefix as the window runs
-/// (upstream `ZSTD_count_2segments`).
-macro_rules! row_count {
-    ($cpl:path, $ctx:ident, $cand:expr, $cur_ptr:expr, $limit:expr) => {{
-        let cand: usize = $cand;
-        let cur_ptr: *const u8 = $cur_ptr;
-        let limit: usize = $limit;
-        // The run to count first: up to the limit, or for an ext candidate to
-        // the segment's end. A selected bound rather than a branch on the
-        // segment, which is a coin toss while an ext segment lives; only a
-        // match that runs through the seam takes the second count.
-        let first = if $ctx.in_prefix(cand) {
-            limit
-        } else {
-            limit.min($ctx.hist_start - cand)
-        };
-        // SAFETY (caller): `$cand` precedes the cursor in the window and
-        // `limit` bytes from the cursor are committed.
-        let n = $cpl($ctx.ptr(cand), cur_ptr, first);
-        if n == first && first < limit {
-            n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
-        } else {
-            n
-        }
-    }};
-}
-
-/// Match length of the window bytes at positions `$a` and `$b`, up to `$max`,
-/// either of which may start in a wrapped window's ext segment and run on into
-/// the prefix (a sorted tree node of the previous block against an earlier
-/// one): counted in runs that end where either side changes segment.
-macro_rules! row_count_both {
-    ($cpl:path, $ctx:ident, $a:expr, $b:expr, $max:expr) => {{
-        let (mut a, mut b, mut rem): (usize, usize, usize) = ($a, $b, $max);
-        let mut total = 0usize;
-        loop {
-            let room_a = if $ctx.in_prefix(a) {
-                usize::MAX
-            } else {
-                $ctx.hist_start - a
-            };
-            let room_b = if $ctx.in_prefix(b) {
-                usize::MAX
-            } else {
-                $ctx.hist_start - b
-            };
-            let run = rem.min(room_a).min(room_b);
-            // SAFETY (caller): both runs lie inside the window.
-            let n = $cpl($ctx.ptr(a), $ctx.ptr(b), run);
-            total += n;
-            if n < run || run == rem {
-                break;
-            }
-            a += n;
-            b += n;
-            rem -= n;
-        }
-        total
-    }};
-}
-
 /// Upstream zstd `ZSTD_RowFindBestMatch` (zstd_lazy.c:1141) at one position:
 /// the row is walked newest-first until the first entry below the window
 /// floor, the in-window candidates are buffered (and their data prefetched),
@@ -917,9 +763,9 @@ macro_rules! row_find_best_match {
     ($m:expr, $ctx:ident, $t:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let hist_start = $ctx.hist_start;
         let cur_idx = $abs_pos - hist_start;
-        // The parse searches only positions >= 16 bytes before the block end,
-        // so `cur_idx + 16 <= $ctx.len`.
-        let cur_ptr = $ctx.prefix_ptr($abs_pos);
+        // SAFETY: the parse searches only positions >= 16 bytes before the
+        // block end, so `cur_idx + 16 <= $ctx.len`.
+        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
         let limit = $ctx.len - cur_idx;
         let row_entries = 1usize << $rl;
         let row_mask = row_entries - 1;
@@ -1010,12 +856,10 @@ macro_rules! row_find_best_match {
                     use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
                     #[cfg(target_arch = "x86_64")]
                     use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                    // SAFETY: prefetch is a hint and never faults. Taken off
-                    // the prefix's base whatever the segment, as upstream
-                    // prefetches `base + matchIndex` in extDict mode too: an ext
-                    // candidate's hint misses, and no segment is resolved for it.
+                    // SAFETY: prefetch is a hint; the candidate lies in the live
+                    // history.
                     unsafe {
-                        _mm_prefetch($ctx.base_v.wrapping_add(raw as usize).cast(), _MM_HINT_T0);
+                        _mm_prefetch($ctx.base.add(raw as usize - hist_start).cast(), _MM_HINT_T0);
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
@@ -1031,45 +875,19 @@ macro_rules! row_find_best_match {
         for i in 0..n {
             // SAFETY: the first `n` entries were written above.
             let raw = unsafe { buf.get_unchecked(i).assume_init() };
-            let cand = raw as usize;
-            // SAFETY: the candidate precedes the cursor; the gate reads 4 bytes
-            // at `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
-            // loop at `ml == limit`), so both reads stay inside the window (a
-            // read straddling the ext segment's end runs into the mirror).
+            let cand_idx = raw as usize - hist_start;
+            // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
+            // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
+            // loop at `ml == limit`), so both reads stay inside `concat`.
             unsafe {
-                // The candidate's segment, resolved once for the gate and the
-                // count: bytes left in it (unbounded in the prefix) and its
-                // first byte.
-                let ext_cand = !$ctx.in_prefix(cand);
-                let room = if ext_cand {
-                    $ctx.hist_start - cand
-                } else {
-                    usize::MAX
-                };
-                let cand_ptr = if ext_cand {
-                    $ctx.ext_v.wrapping_add(cand)
-                } else {
-                    $ctx.base_v.wrapping_add(cand)
-                };
-                // An ext candidate is gated at its head, as upstream gates
-                // `dictBase` candidates in extDict mode: the word lies inside
-                // the segment or its mirror, so no seam test. The gate only
-                // filters: a candidate that beats `ml` matches at both words,
-                // and one failing its head is shorter than four, so the
-                // choice of word never changes the match found.
-                let gate = if cand >= prefix_start && !ext_cand {
+                let cand_ptr = $ctx.base.add(cand_idx);
+                let gate = if (raw as usize) >= prefix_start {
                     rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
                     rd32(cand_ptr) == rd32(cur_ptr)
                 };
                 if gate {
-                    let first = limit.min(room);
-                    let n = $cpl(cand_ptr, cur_ptr, first);
-                    let cml = if n == first && first < limit {
-                        n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
-                    } else {
-                        n
-                    };
+                    let cml = $cpl(cand_ptr, cur_ptr, limit);
                     if cml > ml {
                         ml = cml;
                         best_off = $abs_pos - raw as usize;
@@ -1093,9 +911,9 @@ macro_rules! row_find_best_match {
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dcombined = unsafe {
                 RowMatchGenerator::key_hash_raw(
-                    cur_ptr,
-                    $ctx.len - cur_idx,
-                    0,
+                    $ctx.base,
+                    $ctx.len,
+                    cur_idx,
                     $ctx.key_mls(),
                     dict_row_hash_log + ROW_TAG_BITS,
                     0,
@@ -1230,22 +1048,20 @@ macro_rules! hc_find_best_match {
         let hist_start = $ctx.hist_start;
         let chain_mask = $chain.chain_mask;
         let cur_idx = p - hist_start;
-        // The parse searches only positions >= 16 bytes before the block end.
-        let cur_ptr = $ctx.prefix_ptr(p);
+        // SAFETY: the parse searches only positions >= 16 bytes before the
+        // block end.
+        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
         let limit = $ctx.len - cur_idx;
         // The caller keeps at least `ROW_HASH_KEY_LEN` bytes after a chained
         // position, and the hash fits `hash_bits`.
-        // Keyed by window position: a gap left at the end of the previous
-        // block lies in the ext segment once the history wrapped.
-        let bucket = |abs: usize| -> *mut u32 {
-            let (key_ptr, key_room) = $ctx.key_at(abs);
-            debug_assert!(ROW_HASH_KEY_LEN <= key_room);
+        let bucket = |idx: usize| -> *mut u32 {
+            debug_assert!(idx + ROW_HASH_KEY_LEN <= $ctx.len);
             // SAFETY: as above.
             unsafe {
                 let key = RowMatchGenerator::key_hash_raw(
-                    key_ptr,
-                    key_room,
-                    0,
+                    $ctx.base,
+                    $ctx.len,
+                    idx,
                     $ctx.key_mls(),
                     $chain.hash_bits,
                     0,
@@ -1256,7 +1072,7 @@ macro_rules! hc_find_best_match {
         {
             let mut idx = $ntu;
             while idx < p {
-                let slot = bucket(idx);
+                let slot = bucket(idx - hist_start);
                 // SAFETY: the slot is in the hash table and the link is masked
                 // to the chain's length.
                 unsafe {
@@ -1279,7 +1095,7 @@ macro_rules! hc_find_best_match {
         // are gated at the match head instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
         // SAFETY: the slot is in the hash table.
-        let mut match_index = unsafe { *bucket(p) };
+        let mut match_index = unsafe { *bucket(cur_idx) };
         // One test for the floor and the empty slot, which wraps to 0, and no
         // branch of its own for the attempts (upstream `(matchIndex>=lowLimit)
         // & (nbAttempts>0)`, zstd_lazy.c:708). Positions fit a slot, so the
@@ -1291,42 +1107,16 @@ macro_rules! hc_find_best_match {
             // so a link never points at or past the searched position.
             debug_assert!(cand < p);
             // SAFETY: `cand < p`; the gate reads 4 bytes at `+ ml - 3` with
-            // `ml + 1 <= limit` (the count breaks out at `ml == limit`), a read
-            // straddling the ext segment's end running into the mirror.
+            // `ml + 1 <= limit` (the count breaks out at `ml == limit`).
             unsafe {
-                // The candidate's segment, resolved once for the gate and the
-                // count: bytes left in it (unbounded in the prefix) and its
-                // first byte.
-                let ext_cand = !$ctx.in_prefix(cand);
-                let room = if ext_cand {
-                    $ctx.hist_start - cand
-                } else {
-                    usize::MAX
-                };
-                let cand_ptr = if ext_cand {
-                    $ctx.ext_v.wrapping_add(cand)
-                } else {
-                    $ctx.base_v.wrapping_add(cand)
-                };
-                // An ext candidate is gated at its head, as upstream gates
-                // `dictBase` candidates in extDict mode: the word lies inside
-                // the segment or its mirror, so no seam test. The gate only
-                // filters: a candidate that beats `ml` matches at both words,
-                // and one failing its head is shorter than four, so the
-                // choice of word never changes the match found.
-                let gate = if cand >= prefix_start && !ext_cand {
+                let cand_ptr = $ctx.base.add(cand - hist_start);
+                let gate = if cand >= prefix_start {
                     rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
                     rd32(cand_ptr) == rd32(cur_ptr)
                 };
                 if gate {
-                    let first = limit.min(room);
-                    let n = $cpl(cand_ptr, cur_ptr, first);
-                    let cml = if n == first && first < limit {
-                        n + $cpl($ctx.prefix_ptr($ctx.hist_start), cur_ptr.add(n), limit - n)
-                    } else {
-                        n
-                    };
+                    let cml = $cpl(cand_ptr, cur_ptr, limit);
                     if cml > ml {
                         ml = cml;
                         best_off = p - cand;
@@ -1356,9 +1146,9 @@ macro_rules! hc_find_best_match {
             // dictionary's table.
             let mut dmi = unsafe {
                 *$chain.dict_hash.add(RowMatchGenerator::key_hash_raw(
-                    cur_ptr,
-                    $ctx.len - cur_idx,
-                    0,
+                    $ctx.base,
+                    $ctx.len,
+                    cur_idx,
                     $ctx.key_mls(),
                     $chain.dict_hash_bits,
                     0,
@@ -1403,14 +1193,19 @@ macro_rules! dubt_update {
             ($hash, $chain, $bt_mask, $hash_bits);
         let mut idx = $from;
         while idx < $to {
-            // Keyed by window position: a gap at the end of the previous block
-            // lies in the ext segment once the history wrapped.
-            let (key_ptr, key_room) = $ctx.key_at(idx);
-            debug_assert!(ROW_HASH_KEY_LEN <= key_room);
+            let i = idx - $ctx.hist_start;
+            debug_assert!(i + ROW_HASH_KEY_LEN <= $ctx.len);
             // SAFETY: a linked position lies at least `ROW_HASH_KEY_LEN` bytes
             // before the block end; the hash is narrowed to the table's width.
             let h = unsafe {
-                RowMatchGenerator::key_hash_raw(key_ptr, key_room, 0, $ctx.key_mls(), hash_bits, 0)
+                RowMatchGenerator::key_hash_raw(
+                    $ctx.base,
+                    $ctx.len,
+                    i,
+                    $ctx.key_mls(),
+                    hash_bits,
+                    0,
+                )
             } as usize;
             let ci = idx + BT_IDX_BASE;
             let node = 2 * (ci & bt_mask);
@@ -1443,16 +1238,16 @@ macro_rules! dubt_insert1 {
         // The node's bytes must still be resident: eviction raises
         // `low_limit` past everything it drops, and the sort floors on it.
         debug_assert!(
-            cur_abs >= $ctx.ext_abs && cur_abs <= hist_start + $ctx.len,
-            "sorting a node whose bytes were evicted (abs {cur_abs}, window starts {})",
-            $ctx.ext_abs,
+            cur_abs >= hist_start && cur_abs - hist_start <= $ctx.len,
+            "sorting a node whose bytes were evicted (abs {cur_abs}, history starts {hist_start})",
         );
-        // `cur_abs` was linked by `dubt_update!` from a searched position of
-        // this or an earlier block, so it lies in the live window at least 9
-        // bytes before the block end (in the ext segment once the history
-        // wrapped after it was linked); every compare below stops at
-        // `iend_rem`.
-        let iend_rem = hist_start + $ctx.len - cur_abs;
+        let cur_idx = cur_abs - hist_start;
+        // SAFETY: `cur_abs` was linked by `dubt_update!` from a searched
+        // position of this or an earlier block, so it lies in the live
+        // history at least 9 bytes before the block end; every compare
+        // below stops at `iend_rem`.
+        let ip = unsafe { $ctx.base.add(cur_idx) };
+        let iend_rem = $ctx.len - cur_idx;
         // Where a compare stops, resolved once: it does not vary with the
         // candidate, only with how far the carried common prefix already
         // reached, which the loop handles.
@@ -1474,10 +1269,11 @@ macro_rules! dubt_insert1 {
             debug_assert!(match_index < curr, "sort walk reached a future node");
             let next_ptr = 2 * (match_index & bt_mask);
             let mut ml = common_smaller.min(common_larger);
-            let m_abs = match_index - BT_IDX_BASE;
-            // SAFETY: `m_abs < cur_abs` (an older node above the window
+            let m_idx = match_index - BT_IDX_BASE - hist_start;
+            // SAFETY: `m_idx < cur_idx` (an older node above the window
             // floor); the reads stop at `iend_rem`.
             let (smaller, at_end) = unsafe {
+                let mptr = $ctx.base.add(m_idx);
                 let seed = ml;
                 // Bounded by the cap as well as by the input: past it the
                 // ordering question is unanswerable in any useful sense and
@@ -1489,26 +1285,11 @@ macro_rules! dubt_insert1 {
                     // is all the ordering can still ask for.
                     (seed + 1).min(iend_rem)
                 };
-                if m_abs >= hist_start {
-                    // Both in the prefix (`cur_abs > m_abs`): one run.
-                    let mptr = $ctx.prefix_ptr(m_abs);
-                    let ip = $ctx.prefix_ptr(cur_abs);
-                    ml += $cpl(mptr.add(ml), ip.add(ml), sort_end - ml);
-                    if ml == sort_end {
-                        (false, true)
-                    } else {
-                        (*mptr.add(ml) < *ip.add(ml), false)
-                    }
+                ml += $cpl(mptr.add(ml), ip.add(ml), sort_end - ml);
+                if ml == sort_end {
+                    (false, true)
                 } else {
-                    ml += row_count_both!($cpl, $ctx, m_abs + ml, cur_abs + ml, sort_end - ml);
-                    if ml == sort_end {
-                        (false, true)
-                    } else {
-                        // The bytes after the common part, each in its segment
-                        // (upstream re-points `match` at `base` once the count
-                        // crosses `dictLimit`).
-                        (*$ctx.ptr(m_abs + ml) < *$ctx.ptr(cur_abs + ml), false)
-                    }
+                    (*mptr.add(ml) < *ip.add(ml), false)
                 }
             };
             if at_end {
@@ -1563,9 +1344,9 @@ macro_rules! dubt_find_best_match {
             let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
             let hash_bits = $m.row_hash_log + $m.row_log;
             let cur_idx = p - hist_start;
-            // The parse searches only positions >= 8 bytes before the block
-            // end.
-            let ip = $ctx.prefix_ptr(p);
+            // SAFETY: the parse searches only positions >= 8 bytes before
+            // the block end.
+            let ip = unsafe { $ctx.base.add(cur_idx) };
             let limit = $ctx.len - cur_idx;
             let h = $m.hc_hash_at($ctx, p);
             let curr = p + BT_IDX_BASE;
@@ -1643,26 +1424,16 @@ macro_rules! dubt_find_best_match {
                 debug_assert!(match_index < curr, "tree walk reached a future node");
                 let next_ptr = 2 * (match_index & bt_mask);
                 let mut ml = common_smaller.min(common_larger);
-                let m_abs = match_index - BT_IDX_BASE;
-                // SAFETY: `m_abs < p` (an older node above the window floor,
-                // in the ext segment once the history wrapped); the reads stop
-                // at `limit`.
+                let m_idx = match_index - BT_IDX_BASE - hist_start;
+                // SAFETY: `m_idx < cur_idx` (an older node above the window
+                // floor); the reads stop at `limit`.
                 let (smaller, at_end) = unsafe {
-                    if m_abs >= hist_start {
-                        let mptr = $ctx.prefix_ptr(m_abs);
-                        ml += $cpl(mptr.add(ml), ip.add(ml), limit - ml);
-                        if ml == limit {
-                            (false, true)
-                        } else {
-                            (*mptr.add(ml) < *ip.add(ml), false)
-                        }
+                    let mptr = $ctx.base.add(m_idx);
+                    ml += $cpl(mptr.add(ml), ip.add(ml), limit - ml);
+                    if ml == limit {
+                        (false, true)
                     } else {
-                        ml += row_count!($cpl, $ctx, m_abs + ml, ip.add(ml), limit - ml);
-                        if ml == limit {
-                            (false, true)
-                        } else {
-                            (*$ctx.ptr(m_abs + ml) < *ip.add(ml), false)
-                        }
+                        (*mptr.add(ml) < *ip.add(ml), false)
                     }
                 };
                 if ml > best_len {
@@ -1734,9 +1505,9 @@ macro_rules! dubt_find_best_match {
                 // SAFETY: `cur_idx + 8 <= $ctx.len`.
                 let dh = unsafe {
                     RowMatchGenerator::key_hash_raw(
-                        ip,
-                        $ctx.len - cur_idx,
-                        0,
+                        $ctx.base,
+                        $ctx.len,
+                        cur_idx,
                         $ctx.key_mls(),
                         dict.shape.hash_log,
                         0,
@@ -1822,7 +1593,7 @@ macro_rules! row_cache_fill {
     ($t:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr) => {{
         let from = $from;
         for pos in from..from + ROW_HASH_CACHE_SIZE {
-            if pos + 8 > $ctx.hist_start + $ctx.len {
+            if pos - $ctx.hist_start + 8 > $ctx.len {
                 break;
             }
             $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($t, $ctx, $rl, pos);
@@ -1839,10 +1610,7 @@ macro_rules! row_cache_next {
         let pos = $pos;
         let slot = pos & (ROW_HASH_CACHE_SIZE - 1);
         let cur = $cache[slot];
-        // Ahead of the cursor, so in the prefix.
-        let packed = $m.packed_hash_ahead($ctx, pos + ROW_HASH_CACHE_SIZE);
-        $m.prefetch_row::<$rl>($m.row_of(packed));
-        $cache[slot] = packed;
+        $cache[slot] = row_cache_hash!($m, $ctx, $rl, pos + ROW_HASH_CACHE_SIZE);
         cur
     }};
 }
@@ -1867,7 +1635,7 @@ macro_rules! row_cache_insert_range {
 /// chosen match only, immediate-repcode loop after every stored sequence,
 /// `>> 8` miss acceleration with lazy skipping past step 8.
 macro_rules! lazy_parse_body {
-    ($m:expr, $handle:expr, $rl:expr, $finder:expr, $mls:ident, $ext:ident, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $handle:expr, $rl:expr, $finder:expr, $mls:ident, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
         'parse: {
             debug_assert!($finder != FINDER_ROWS || $rl == $m.row_log);
@@ -1887,7 +1655,7 @@ macro_rules! lazy_parse_body {
             }
             let block_end = current_abs_start + current_len;
             $m.enter_block(current_abs_start, block_end);
-            let scan = $m.scan_ctx_with::<$mls, $ext>();
+            let scan = $m.scan_ctx_with::<$mls>();
             let chain_scan = $m.chain_scan(scan.attached);
             let row_tables = $m.row_tables(scan.attached);
             let hist_start = scan.hist_start;
@@ -1904,12 +1672,10 @@ macro_rules! lazy_parse_body {
             // == 0)` on a plain / attached-dictionary frame (nothing precedes it),
             // `ip += (ip == prefixStart)` on a copied-dictionary frame (upstream
             // `extDict`, the dictionary being the segment below the prefix).
-            // The window's floor, not the prefix's start: after a wrap a block
-            // starts the prefix while the window runs on behind it.
             let first_byte = if scan.dict_frame && !scan.attached {
                 scan.prefix_start
             } else {
-                scan.ext_abs
+                hist_start
             };
             let mut ip = current_abs_start + usize::from(current_abs_start == first_byte);
             // Upstream `nextToUpdate`: resume where the previous block
@@ -1999,22 +1765,15 @@ macro_rules! lazy_parse_body {
                 let mut off = 0usize;
                 let mut start = ip + 1;
                 {
+                    let base = scan.base;
                     // SAFETY: `ip + 1 + 4 <= block_end` (`ip < ilimit`), and
                     // `offset_1 <= max_rep` keeps the rep source in history.
                     unsafe {
-                        let cur = scan.prefix_ptr(ip + 1);
-                        // The rep source may lie in a wrapped window's ext
-                        // segment.
-                        if rep_ok(ip + 1, offset_1)
-                            && rd32(scan.ptr(ip + 1 - offset_1)) == rd32(cur)
-                        {
-                            match_length = row_count!(
-                                $cpl,
-                                scan,
-                                ip + 5 - offset_1,
-                                cur.add(4),
-                                block_end - (ip + 5)
-                            ) + 4;
+                        let cur = base.add(ip + 1 - hist_start);
+                        if rep_ok(ip + 1, offset_1) && rd32(cur.sub(offset_1)) == rd32(cur) {
+                            match_length =
+                                $cpl(cur.add(4).sub(offset_1), cur.add(4), block_end - (ip + 5))
+                                    + 4;
                         }
                     }
                 }
@@ -2059,18 +1818,16 @@ macro_rules! lazy_parse_body {
                         while ip < ilimit {
                             ip += 1;
                             {
+                                let base = scan.base;
                                 // SAFETY: `ip + 4 <= block_end`, `offset_1 <= max_rep`.
                                 unsafe {
-                                    let cur = scan.prefix_ptr(ip);
-                                    if rep_ok(ip, offset_1)
-                                        && rd32(cur) == rd32(scan.ptr(ip - offset_1))
+                                    let cur = base.add(ip - hist_start);
+                                    if rep_ok(ip, offset_1) && rd32(cur) == rd32(cur.sub(offset_1))
                                     {
-                                        let ml_rep = row_count!(
-                                            $cpl,
-                                            scan,
-                                            ip + 4 - offset_1,
+                                        let ml_rep = $cpl(
+                                            cur.add(4).sub(offset_1),
                                             cur.add(4),
-                                            block_end - (ip + 4)
+                                            block_end - (ip + 4),
                                         ) + 4;
                                         let gain2 = (ml_rep * 3) as i64;
                                         let gain1 =
@@ -2109,18 +1866,17 @@ macro_rules! lazy_parse_body {
                             if depth == 2 && ip < ilimit {
                                 ip += 1;
                                 {
+                                    let base = scan.base;
                                     // SAFETY: as above.
                                     unsafe {
-                                        let cur = scan.prefix_ptr(ip);
+                                        let cur = base.add(ip - hist_start);
                                         if rep_ok(ip, offset_1)
-                                            && rd32(cur) == rd32(scan.ptr(ip - offset_1))
+                                            && rd32(cur) == rd32(cur.sub(offset_1))
                                         {
-                                            let ml_rep = row_count!(
-                                                $cpl,
-                                                scan,
-                                                ip + 4 - offset_1,
+                                            let ml_rep = $cpl(
+                                                cur.add(4).sub(offset_1),
                                                 cur.add(4),
-                                                block_end - (ip + 4)
+                                                block_end - (ip + 4),
                                             ) + 4;
                                             let gain2 = (ml_rep * 4) as i64;
                                             let gain1 = (match_length * 4) as i64
@@ -2173,11 +1929,13 @@ macro_rules! lazy_parse_body {
                         hist_start
                     };
                     // SAFETY: `start - 1 >= anchor` and `start - off - 1 >=
-                    // m_start`, both window positions before the block's end
-                    // (the source in the ext segment once the history wrapped).
+                    // m_start >= hist_start`, both before the block's end.
                     while start > anchor
                         && start - off > m_start
-                        && unsafe { *scan.prefix_ptr(start - 1) == *scan.ptr(start - 1 - off) }
+                        && unsafe {
+                            *scan.base.add(start - 1 - hist_start)
+                                == *scan.base.add(start - 1 - off - hist_start)
+                        }
                     {
                         start -= 1;
                         match_length += 1;
@@ -2226,20 +1984,14 @@ macro_rules! lazy_parse_body {
                 // Immediate repcode: `offset_2` right after the stored match,
                 // swapping the two reps on every hit.
                 while ip <= ilimit && rep_ok(ip, offset_2) {
+                    let base = scan.base;
                     // SAFETY: `ip + 4 <= block_end`, `offset_2 <= max_rep`.
                     let rep_len = unsafe {
-                        let cur = scan.prefix_ptr(ip);
-                        // The source may lie in a wrapped window's ext segment.
-                        if rd32(cur) != rd32(scan.ptr(ip - offset_2)) {
+                        let cur = base.add(ip - hist_start);
+                        if rd32(cur) != rd32(cur.sub(offset_2)) {
                             break;
                         }
-                        row_count!(
-                            $cpl,
-                            scan,
-                            ip + 4 - offset_2,
-                            cur.add(4),
-                            block_end - (ip + 4)
-                        ) + 4
+                        $cpl(cur.add(4).sub(offset_2), cur.add(4), block_end - (ip + 4)) + 4
                     };
                     core::mem::swap(&mut offset_1, &mut offset_2);
                     $handle(Sequence::Triple {
@@ -2302,27 +2054,11 @@ macro_rules! gen_lazy_monolith {
             allow(dead_code)
         )]
         #[allow(unused_unsafe)]
-        unsafe fn $name<
-            K: RowTags,
-            const ROW_LOG: usize,
-            const FINDER: u8,
-            const MLS: u32,
-            const EXT: bool,
-        >(
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize, const FINDER: u8, const MLS: u32>(
             &mut self,
             mut handle_sequence: impl FnMut(Sequence),
         ) {
-            lazy_parse_body!(
-                self,
-                handle_sequence,
-                ROW_LOG,
-                FINDER,
-                MLS,
-                EXT,
-                $use_mask,
-                $maskmac,
-                $cpl
-            )
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, FINDER, MLS, $use_mask, $maskmac, $cpl)
         }
     };
 }
@@ -2330,35 +2066,27 @@ macro_rules! gen_lazy_monolith {
 /// Bind the runtime finder, (for rows) `row_log` and the key width to the
 /// const parameters of a lazy monolith: rows per `ROW_LOG` 4..=6, the chain
 /// and the tree once each (they ignore `ROW_LOG`), each per `MLS` 4..=6, as
-/// upstream instantiates its searches per `(rowLog, mls)`, and whether the
-/// window holds an ext segment, as upstream per `dictMode`. Cold, once per
+/// upstream instantiates its searches per `(rowLog, mls)`. Cold, once per
 /// block.
 macro_rules! dispatch_lazy {
     ($self:ident . $m:ident :: <$k:ty> ( $($arg:expr),* )) => {
-        if $self.window_has_ext() {
-            dispatch_lazy!(@mls $self . $m :: <$k, true> ( $($arg),* ))
-        } else {
-            dispatch_lazy!(@mls $self . $m :: <$k, false> ( $($arg),* ))
-        }
-    };
-    (@mls $self:ident . $m:ident :: <$k:ty, $ext:literal> ( $($arg:expr),* )) => {
         match $self.row_hash_mls {
-            4 => dispatch_lazy!(@finder $self . $m :: <$k, 4, $ext> ( $($arg),* )),
-            5 => dispatch_lazy!(@finder $self . $m :: <$k, 5, $ext> ( $($arg),* )),
-            6 => dispatch_lazy!(@finder $self . $m :: <$k, 6, $ext> ( $($arg),* )),
+            4 => dispatch_lazy!(@finder $self . $m :: <$k, 4> ( $($arg),* )),
+            5 => dispatch_lazy!(@finder $self . $m :: <$k, 5> ( $($arg),* )),
+            6 => dispatch_lazy!(@finder $self . $m :: <$k, 6> ( $($arg),* )),
             _ => unreachable!("row_hash_mls is clamped to 4..=6 in configure()"),
         }
     };
-    (@finder $self:ident . $m:ident :: <$k:ty, $mls:literal, $ext:literal> ( $($arg:expr),* )) => {
+    (@finder $self:ident . $m:ident :: <$k:ty, $mls:literal> ( $($arg:expr),* )) => {
         match $self.finder {
             LazyFinder::Rows => match $self.row_log {
-                4 => $self.$m::<$k, 4, FINDER_ROWS, $mls, $ext>($($arg),*),
-                5 => $self.$m::<$k, 5, FINDER_ROWS, $mls, $ext>($($arg),*),
-                6 => $self.$m::<$k, 6, FINDER_ROWS, $mls, $ext>($($arg),*),
+                4 => $self.$m::<$k, 4, FINDER_ROWS, $mls>($($arg),*),
+                5 => $self.$m::<$k, 5, FINDER_ROWS, $mls>($($arg),*),
+                6 => $self.$m::<$k, 6, FINDER_ROWS, $mls>($($arg),*),
                 _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
             },
-            LazyFinder::Chain => $self.$m::<$k, 4, FINDER_CHAIN, $mls, $ext>($($arg),*),
-            LazyFinder::Tree => $self.$m::<$k, 4, FINDER_TREE, $mls, $ext>($($arg),*),
+            LazyFinder::Chain => $self.$m::<$k, 4, FINDER_CHAIN, $mls>($($arg),*),
+            LazyFinder::Tree => $self.$m::<$k, 4, FINDER_TREE, $mls>($($arg),*),
         }
     };
 }
@@ -2965,16 +2693,8 @@ pub(crate) struct RowMatchGenerator {
     /// dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
     pub(crate) history: HistoryBuf,
-    /// Buffer offset of the prefix segment's first live byte.
     pub(crate) history_start: usize,
-    /// Position of the window's first live byte: the ext segment's first
-    /// byte when there is one, else the prefix's.
     pub(crate) history_abs_start: usize,
-    /// The window's older part once the history has wrapped (upstream's
-    /// extDict): positions `[history_abs_start, history_abs_start +
-    /// ring.len)`, the prefix starting at offset 0 after it. Off while
-    /// long-distance matching reads the window as one slice.
-    pub(crate) ring: Ring,
     pub(crate) offset_hist: [u32; 3],
     /// The finder the lazy parse searches: rows, the hash chain (upstream
     /// `ZSTD_resolveRowMatchFinderMode`: a window of 2^14 or less) or the
@@ -3137,7 +2857,6 @@ impl RowMatchGenerator {
             uncommitted_len: 0,
             history: HistoryBuf::new(),
             history_start: 0,
-            ring: Ring::new(),
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
             finder: LazyFinder::Rows,
@@ -3397,15 +3116,11 @@ impl RowMatchGenerator {
         // Past everything the previous frame indexed: its owned history, or
         // the extent of its borrowed input.
         let next_floor = self.history_abs_start
-            + (self.ring.len + self.history.len() - self.history_start).max(self.borrowed_extent);
+            + (self.history.len() - self.history_start).max(self.borrowed_extent);
         self.borrowed_extent = 0;
-        // The next frame starts on one segment: a wrapped window has no
-        // dictionary at its front to keep.
-        let wrapped = core::mem::take(&mut self.ring.len) != 0;
         // The dictionary prefix a re-borrow would keep; the reset still asks
         // whether the tables it is indexed in survived the layout.
         let kept = if self.dict.is_primed()
-            && !wrapped
             && self.history_start == 0
             && next_floor <= REBASE_RESET_FLOOR_CEILING
         {
@@ -3576,14 +3291,7 @@ impl RowMatchGenerator {
         // ceiling here off `capacity` (a whole read buffer, not a block) would
         // trip it on the first fill and fault in the full window+window/4 mirror
         // for frames that never evict.
-        let ring_window = self.ring_window();
-        self.ring.before_fill(
-            &mut self.history,
-            &mut self.history_start,
-            self.uncommitted_len,
-            capacity,
-            ring_window,
-        );
+        self.history.reserve(capacity);
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
         debug_assert_eq!(
@@ -3593,7 +3301,6 @@ impl RowMatchGenerator {
             self.history.len() - before,
         );
         self.uncommitted_len += appended;
-        self.ring.after_fill(&mut self.history);
         (appended, eof)
     }
 
@@ -3636,10 +3343,12 @@ impl RowMatchGenerator {
         // everything between those two distances unreachable however the floor
         // was computed. The mirror therefore holds up to a block more than the
         // window, which is the shape upstream's buffer has.
-        let evicted_from = self.history_abs_start;
+        let evicted_from = self.history_start;
         while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.evict_front(removed_len);
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         // Only once history actually left the window. Asking whether it WOULD
         // leave once this block is added is a wider question than the eviction
@@ -3647,7 +3356,7 @@ impl RowMatchGenerator {
         // where the dictionary index was dropped although nothing had moved —
         // and a dictionary match starting at the block's first byte is exactly
         // what is legal there.
-        if self.history_abs_start != evicted_from {
+        if self.history_start != evicted_from {
             // The index's concat positions no longer address the dictionary;
             // parked, it serves the next frame, which commits it at the front
             // again.
@@ -3655,18 +3364,12 @@ impl RowMatchGenerator {
             // Cap the history near the live window: once eviction starts, grow
             // it linearly to (window + window/4 + one block) rather than
             // doubling; `compact_history`'s quarter-window drain keeps the
-            // length under it. A ring holds its window, block, read-ahead and
-            // wrap slack instead, and wraps rather than drains. Small frames
-            // that never fill the window stay data-sized.
-            let target = if self.ring.on {
-                Ring::room(self.ring_window())
-            } else {
-                self.max_window_size
-                    + (self.max_window_size >> 2)
-                    + crate::common::MAX_BLOCK_SIZE as usize
-            };
-            if self.ring.len == 0 && target > self.history.len() && self.history.capacity() < target
-            {
+            // length under it. Small frames that never fill the window stay
+            // data-sized.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
@@ -3709,7 +3412,9 @@ impl RowMatchGenerator {
         }
         while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.evict_front(removed_len);
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         // Same valid-data floor raise as `commit_block`'s eviction loop.
         if self.low_limit < self.history_abs_start {
@@ -4209,8 +3914,7 @@ impl RowMatchGenerator {
     }
 
     fn compact_history(&mut self) {
-        // A ring wraps at its capacity instead (see `fill_uncommitted`).
-        if self.history_start == 0 || self.ring.on {
+        if self.history_start == 0 {
             return;
         }
         // Drain the (unreachable) dead prefix once it reaches a quarter window
@@ -4257,48 +3961,7 @@ impl RowMatchGenerator {
 
     #[cfg(test)]
     fn history_abs_end(&self) -> usize {
-        self.prefix_abs() + self.live_history().len()
-    }
-
-    /// Position of the prefix segment's first live byte; `live_history`
-    /// starts there.
-    #[inline(always)]
-    pub(crate) fn prefix_abs(&self) -> usize {
-        self.history_abs_start + self.ring.len
-    }
-
-    /// The bytes the committed window may hold, as the ring sizes itself for:
-    /// eviction runs before a block joins, so the window carries up to one
-    /// block more than its size.
-    fn ring_window(&self) -> usize {
-        self.max_window_size + crate::common::MAX_BLOCK_SIZE as usize
-    }
-
-    /// Lets the history wrap as a ring, or keeps it in one segment; set per
-    /// frame, before its first byte, while the history holds no ext segment.
-    pub(crate) fn set_ring(&mut self, ring: bool) {
-        debug_assert_eq!(self.ring.len, 0, "the ring mode changes mid-wrap");
-        self.ring.on = ring;
-    }
-
-    /// Drops the window's oldest `len` bytes: the ext segment's first, then
-    /// the prefix's.
-    #[inline]
-    fn evict_front(&mut self, len: usize) {
-        self.window_size -= len;
-        self.ring.evict(len, &mut self.history_start);
-        self.history_abs_start += len;
-    }
-
-    /// The owned window as its two segments, for the paths that read a
-    /// candidate by its position.
-    fn segments(&self) -> WindowSegments {
-        self.ring.segments(
-            &self.history,
-            self.history_start,
-            self.history_abs_start,
-            self.uncommitted_len,
-        )
+        self.history_abs_start + self.live_history().len()
     }
 
     /// Register the borrowed input window (the whole caller slice). Borrowed
@@ -4427,66 +4090,32 @@ impl RowMatchGenerator {
     /// Hash-chain bucket of `abs_pos` (upstream `ZSTD_hashPtr(p, hashLog, mls)`).
     /// Callers pass positions at least `ROW_HASH_KEY_LEN` bytes before the end.
     #[inline(always)]
-    fn hc_hash_at<const MLS: u32, const EXT: bool>(
-        &self,
-        ctx: RowScan<MLS, EXT>,
-        abs_pos: usize,
-    ) -> usize {
-        // A window position, in the ext segment once the history wrapped.
-        let (key_ptr, key_room) = ctx.key_at(abs_pos);
-        debug_assert!(ROW_HASH_KEY_LEN <= key_room);
+    fn hc_hash_at<const MLS: u32>(&self, ctx: RowScan<MLS>, abs_pos: usize) -> usize {
+        let idx = abs_pos - ctx.hist_start;
+        debug_assert!(idx + ROW_HASH_KEY_LEN <= ctx.len);
         let bits = self.row_hash_log + self.row_log;
-        // SAFETY: caller contract, `ctx` views the live window.
-        unsafe { Self::key_hash_raw(key_ptr, key_room, 0, ctx.key_mls(), bits, 0) as usize }
+        // SAFETY: caller contract, `ctx` views the live history.
+        unsafe { Self::key_hash_raw(ctx.base, ctx.len, idx, ctx.key_mls(), bits, 0) as usize }
     }
 
     /// The live history as a [`RowScan`] for one parse, its key width read at
     /// run time.
     #[inline(always)]
     fn scan_ctx(&self) -> RowScan {
-        self.scan_ctx_with::<0, true>()
-    }
-
-    /// Whether the window holds an ext segment the search reads.
-    #[inline(always)]
-    fn window_has_ext(&self) -> bool {
-        // Borrowed input never wraps.
-        self.ring.len != 0 && self.borrowed_block.is_none()
+        self.scan_ctx_with::<0>()
     }
 
     /// The live history as a [`RowScan`] whose key width is the constant
-    /// `MLS` (`0`: read at run time), which must be this matcher's; `EXT`
-    /// false only for a window without an ext segment.
+    /// `MLS` (`0`: read at run time), which must be this matcher's.
     #[inline(always)]
-    fn scan_ctx_with<const MLS: u32, const EXT: bool>(&self) -> RowScan<MLS, EXT> {
+    fn scan_ctx_with<const MLS: u32>(&self) -> RowScan<MLS> {
         debug_assert!(MLS == 0 || MLS == self.row_hash_mls);
-        debug_assert!(
-            EXT || !self.window_has_ext(),
-            "an ext segment on the one-segment path"
-        );
         let history = self.live_history();
         let dict_frame = self.loaded_dict_end != 0;
-        // Borrowed input never wraps; its view is the one segment it has.
-        let (ext, ext_abs) = if self.window_has_ext() {
-            let seg = self.segments();
-            (seg.ext, seg.ext_abs)
-        } else {
-            (history.as_ptr(), self.history_abs_start)
-        };
-        let hist_start = if self.borrowed_block.is_some() {
-            self.history_abs_start
-        } else {
-            self.prefix_abs()
-        };
         RowScan {
             base: history.as_ptr(),
             len: history.len(),
-            hist_start,
-            // Pointers outside the history, only ever offset back into it by a
-            // position of their segment.
-            base_v: history.as_ptr().wrapping_sub(hist_start),
-            ext_v: ext.wrapping_sub(ext_abs),
-            ext_abs,
+            hist_start: self.history_abs_start,
             salt: self.hash_salt,
             search_window: self.search_window,
             low_limit: self.low_limit,
@@ -4572,21 +4201,19 @@ impl RowMatchGenerator {
     /// `(row, tag)` of `abs_pos` through a hoisted [`RowScan`]; `None` when
     /// fewer than `ROW_HASH_KEY_LEN` bytes follow the position.
     #[inline(always)]
-    fn row_hash_at<const MLS: u32, const EXT: bool>(
+    fn row_hash_at<const MLS: u32>(
         &self,
-        ctx: RowScan<MLS, EXT>,
+        ctx: RowScan<MLS>,
         abs_pos: usize,
     ) -> Option<(usize, u8)> {
-        // A window position, in the ext segment once the history wrapped.
-        if abs_pos + ROW_HASH_KEY_LEN > ctx.hist_start + ctx.len {
+        let idx = abs_pos - ctx.hist_start;
+        if idx + ROW_HASH_KEY_LEN > ctx.len {
             return None;
         }
-        let (key_ptr, key_room) = ctx.key_at(abs_pos);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
-        // SAFETY: `ROW_HASH_KEY_LEN` window bytes follow the position, `ctx`
-        // views the live window.
+        // SAFETY: `idx + ROW_HASH_KEY_LEN <= ctx.len`, `ctx` views the live history.
         let combined = unsafe {
-            Self::key_hash_raw(key_ptr, key_room, 0, ctx.key_mls(), total_bits, ctx.salt)
+            Self::key_hash_raw(ctx.base, ctx.len, idx, ctx.key_mls(), total_bits, ctx.salt)
         };
         let row_mask = (1usize << self.row_hash_log) - 1;
         let row = ((combined >> ROW_TAG_BITS) as usize) & row_mask;
@@ -4659,7 +4286,7 @@ impl RowMatchGenerator {
     ) -> Option<MatchCandidate> {
         repcode_candidate_shared::<T>(
             self.live_history(),
-            self.prefix_abs(),
+            self.history_abs_start,
             self.offset_hist,
             abs_pos,
             lit_len,
@@ -5009,7 +4636,7 @@ impl RowMatchGenerator {
     ) -> MatchCandidate {
         extend_backwards_shared(
             self.live_history(),
-            self.prefix_abs(),
+            self.history_abs_start,
             candidate_pos,
             abs_pos,
             match_len,
@@ -5026,24 +4653,15 @@ impl RowMatchGenerator {
         // by the inserts skipped and making those last ones leaves the row
         // exactly as the whole walk does.
         let row_mask = (1usize << ROW_LOG) - 1;
-        // Positions in a wrapped window's ext segment (the seam before a block)
-        // one by one, in order; the shortcut reads the prefix, which
-        // `live_history` is.
-        let prefix_abs = self.prefix_abs();
-        let mut start = start;
-        while start < end.min(prefix_abs) {
-            self.insert_position::<ROW_LOG>(start);
-            start += 1;
-        }
         // Up to here every position has eight bytes ahead and hashes them
         // whole; the last few hash four (`key_hash_raw`), a key of their own,
         // and are inserted one by one after the shortcut, in their order.
-        let whole_key_end = (prefix_abs + self.live_history().len() + 1)
+        let whole_key_end = (self.history_abs_start + self.live_history().len() + 1)
             .saturating_sub(8)
             .min(end);
         let mut pos = start;
-        if whole_key_end > start + row_mask && start >= prefix_abs {
-            let from = start - prefix_abs;
+        if whole_key_end > start + row_mask && start >= self.history_abs_start {
+            let from = start - self.history_abs_start;
             if crate::encoding::repeated_byte(&self.live_history()[from..]).is_some()
                 && let Some((row, tag)) = self.hash_and_row(whole_key_end - 1)
             {

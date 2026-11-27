@@ -254,11 +254,8 @@ impl MatcherStorage {
     /// Whether the backend's history may wrap as a ring once full rather than
     /// move its window to the front (see `DfastMatchGenerator::wrap_history`).
     fn set_ring_history(&mut self, ring: bool) {
-        match self {
-            Self::Dfast(m) => m.set_ring(ring),
-            Self::Row(m) => m.set_ring(ring),
-            Self::HashChain(m) => m.table.set_ring(ring),
-            Self::Simple(_) => {}
+        if let Self::Dfast(m) = self {
+            m.set_ring(ring);
         }
     }
 

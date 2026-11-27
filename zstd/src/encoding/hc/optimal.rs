@@ -1123,23 +1123,13 @@ macro_rules! optimal_block_body {
         // for it is chosen once here and every position calls it directly, as
         // upstream picks `ZSTD_btGetAllMatches_<dictMode>_<mls>` per block
         // (`ZSTD_selectBtGetAllMatches`).
-        // So is whether the window holds an ext segment (upstream's
-        // `dictMode` template, `ZSTD_extDict`): a one-segment block searches
-        // with no segment test at all.
-        let collect: OptimalCollectFn = match ($self.table.opt_search_mls(), $self.table.block_live.ext_len != 0) {
-            (3, false) => HcMatchGenerator::$collect::<$strategy_ty, 3, false>,
-            (5, false) => HcMatchGenerator::$collect::<$strategy_ty, 5, false>,
-            (6, false) => HcMatchGenerator::$collect::<$strategy_ty, 6, false>,
-            (3, true) => HcMatchGenerator::$collect::<$strategy_ty, 3, true>,
-            (5, true) => HcMatchGenerator::$collect::<$strategy_ty, 5, true>,
-            (6, true) => HcMatchGenerator::$collect::<$strategy_ty, 6, true>,
-            (mls, ext) => {
+        let collect: OptimalCollectFn = match $self.table.opt_search_mls() {
+            3 => HcMatchGenerator::$collect::<$strategy_ty, 3>,
+            5 => HcMatchGenerator::$collect::<$strategy_ty, 5>,
+            6 => HcMatchGenerator::$collect::<$strategy_ty, 6>,
+            mls => {
                 debug_assert_eq!(mls, 4, "the binary tree searches with mls three to six");
-                if ext {
-                    HcMatchGenerator::$collect::<$strategy_ty, 4, true>
-                } else {
-                    HcMatchGenerator::$collect::<$strategy_ty, 4, false>
-                }
+                HcMatchGenerator::$collect::<$strategy_ty, 4>
             }
         };
         // Everything the pass carries between segments lives in `$buffers.pass`,
@@ -1233,10 +1223,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $mls:expr,
         $bt_insert_range:ident,
         $cpl:path,
-        $cmf:path,
-        // The search's const generic: whether the window may hold an ext
-        // segment (upstream's `dictMode == ZSTD_extDict` template).
-        $ext:ident $(,)?
+        $cmf:path $(,)?
     ) => {{
         // `$mls` is upstream's template `BOUNDED(3, minMatch, 6)`
         // (`ZSTD_selectBtGetAllMatches`): a 3 keys the tree on four bytes, as
@@ -1283,7 +1270,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 // SAFETY: caller is in the same target_feature umbrella as
                 // `$bt_insert_range`; the runtime kernel detector gated entry.
                 let _ = unsafe {
-                    $self.table.$bt_insert_range::<true, $ext>(
+                    $self.table.$bt_insert_range::<true>(
                         update_abs,
                         $abs_pos,
                         $current_abs_end,
@@ -1297,7 +1284,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         // Every probe below reads up to eight bytes at the position; the parser
         // searches only positions with that much of the block left, so this is
         // the one length check the search needs.
-        if current_idx + 8 > $self.table.block_live.len {
+        if current_idx + 8 > $self.table.block_live.1 {
             return;
         }
         let mut best_len_for_skip = 0usize;
@@ -1327,7 +1314,6 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 key_mls,
                 $cpl,
                 $cmf,
-                $ext,
             );
         }
     }};
@@ -2207,30 +2193,21 @@ impl HcMatchGenerator {
         // without setting a matching `strategy_tag` is no longer
         // allowed.
         // The key width picks the search the way the block's pass picks it.
-        macro_rules! search_ext {
-            ($strategy:ty, $ext:literal) => {
-                match self.table.opt_search_mls() {
-                    3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3, $ext>(
-                        abs_pos, reps, ll0, &mut found,
-                    ),
-                    5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5, $ext>(
-                        abs_pos, reps, ll0, &mut found,
-                    ),
-                    6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6, $ext>(
-                        abs_pos, reps, ll0, &mut found,
-                    ),
-                    _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4, $ext>(
-                        abs_pos, reps, ll0, &mut found,
-                    ),
-                }
-            };
-        }
         macro_rules! search {
             ($strategy:ty) => {
-                if self.table.block_live.ext_len != 0 {
-                    search_ext!($strategy, true)
-                } else {
-                    search_ext!($strategy, false)
+                match self.table.opt_search_mls() {
+                    3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
+                        abs_pos, reps, ll0, &mut found,
+                    ),
+                    5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
+                        abs_pos, reps, ll0, &mut found,
+                    ),
+                    6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
+                        abs_pos, reps, ll0, &mut found,
+                    ),
+                    _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
+                        abs_pos, reps, ll0, &mut found,
+                    ),
                 }
             };
         }
@@ -2283,7 +2260,6 @@ impl HcMatchGenerator {
         S: crate::encoding::strategy::Strategy,
         K: EncodeTier,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2297,7 +2273,7 @@ impl HcMatchGenerator {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S, MLS, EXT>(abs_pos, reps, ll0, out)
+            self.collect_optimal_candidates_initialized_neon::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -2305,7 +2281,7 @@ impl HcMatchGenerator {
             crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS, EXT>(
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(
                         abs_pos,
                         reps,
                         ll0,
@@ -2314,7 +2290,7 @@ impl HcMatchGenerator {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse2::<S, MLS, EXT>(
+                    self.collect_optimal_candidates_initialized_sse2::<S, MLS>(
                         abs_pos,
                         reps,
                         ll0,
@@ -2323,7 +2299,7 @@ impl HcMatchGenerator {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse42::<S, MLS, EXT>(
+                    self.collect_optimal_candidates_initialized_sse42::<S, MLS>(
                         abs_pos,
                         reps,
                         ll0,
@@ -2331,7 +2307,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Scalar => self
-                    .collect_optimal_candidates_initialized_scalar::<S, MLS, EXT>(
+                    .collect_optimal_candidates_initialized_scalar::<S, MLS>(
                         abs_pos,
                         reps,
                         ll0,
@@ -2349,9 +2325,7 @@ impl HcMatchGenerator {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.collect_optimal_candidates_initialized_simd128::<S, MLS, EXT>(
-                abs_pos, reps, ll0, out,
-            )
+            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(abs_pos, reps, ll0, out)
         }
         #[cfg(not(any(
             all(
@@ -2368,9 +2342,7 @@ impl HcMatchGenerator {
             )
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S, MLS, EXT>(
-                abs_pos, reps, ll0, out,
-            )
+            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(abs_pos, reps, ll0, out)
         }
     }
 
@@ -2388,7 +2360,6 @@ impl HcMatchGenerator {
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2412,7 +2383,6 @@ impl HcMatchGenerator {
             bt_insert_range_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
-            EXT,
         )
     }
 
@@ -2425,7 +2395,6 @@ impl HcMatchGenerator {
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2449,7 +2418,6 @@ impl HcMatchGenerator {
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
-            EXT,
         )
     }
 
@@ -2468,7 +2436,6 @@ impl HcMatchGenerator {
     unsafe fn collect_optimal_candidates_initialized_sse2<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2492,7 +2459,6 @@ impl HcMatchGenerator {
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
-            EXT,
         )
     }
 
@@ -2505,7 +2471,6 @@ impl HcMatchGenerator {
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2529,7 +2494,6 @@ impl HcMatchGenerator {
             bt_insert_range_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
-            EXT,
         )
     }
 
@@ -2549,7 +2513,6 @@ impl HcMatchGenerator {
     unsafe fn collect_optimal_candidates_initialized_simd128<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2573,7 +2536,6 @@ impl HcMatchGenerator {
             bt_insert_range_simd128,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
             crate::encoding::fastpath::simd128::count_match_from_indices,
-            EXT,
         )
     }
 
@@ -2589,7 +2551,6 @@ impl HcMatchGenerator {
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
         const MLS: usize,
-        const EXT: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2613,7 +2574,6 @@ impl HcMatchGenerator {
             bt_insert_range_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
-            EXT,
         )
     }
 }

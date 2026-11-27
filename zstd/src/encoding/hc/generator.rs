@@ -66,31 +66,32 @@ pub(crate) struct HcMatchGenerator {
 /// modules via `$crate::...`, so it is unusable downstream and is
 /// re-exported only inside this crate via `pub(crate) use` below.
 macro_rules! bt_insert_range_body {
-    // `$ext`: a const, whether the window may hold an ext segment; without
-    // one every segment test below drops out at codegen time.
-    ($table:expr, $search_depth:expr, $from:ident, $stop:ident, $current_abs_end:ident, $target_abs:ident, $in_block:expr, $ext:expr) => {{
+    ($table:expr, $search_depth:expr, $from:ident, $stop:ident, $current_abs_end:ident, $target_abs:ident, $in_block:expr) => {{
         // The live region `history[history_start..]` and the tree's
         // coordinates. Inside a block's parse (`$in_block`) both were taken
         // when the pass began, and the search's catch-up, which calls this a
         // position or two at a time, reads them from there instead of deriving
         // them again. The slice holds no borrow, so it coexists with the
         // `&mut $table` tree writes below.
-        let (live, coords): (
-            $crate::encoding::match_table::storage::LiveWindow,
-            $crate::encoding::match_table::storage::BtCoords,
-        ) = if $in_block {
-            debug_assert_eq!(
-                $table.block_coords,
-                $table.bt_coords(),
-                "block coordinates are stale"
-            );
-            // Called from the search, inside the pass that took them; nothing
-            // in the pass changes the history.
-            ($table.block_live_window(), $table.block_coords)
-        } else {
-            // A raw view of the history; the tree writes below never touch it.
-            ($table.live_window(), $table.bt_coords())
-        };
+        let (concat, coords): (&[u8], $crate::encoding::match_table::storage::BtCoords) =
+            if $in_block {
+                debug_assert_eq!(
+                    $table.block_coords,
+                    $table.bt_coords(),
+                    "block coordinates are stale"
+                );
+                // SAFETY: called from the search, inside the pass that took
+                // them; nothing in the pass changes the history.
+                (unsafe { $table.block_live_history() }, $table.block_coords)
+            } else {
+                // SAFETY: a raw reborrow of the live history; the tree writes
+                // below never touch it.
+                let concat = unsafe {
+                    let lh = $table.live_history();
+                    core::slice::from_raw_parts(lh.as_ptr(), lh.len())
+                };
+                (concat, $table.bt_coords())
+            };
         let hist_start = $table.history_abs_start;
         let hash_log = $table.hash_log;
         let search_mls = $table.search_mls;
@@ -121,33 +122,15 @@ macro_rules! bt_insert_range_body {
         // it, as its own stored index is.
         let win_low_stored = window_low.wrapping_sub(abs_bias);
         debug_assert!(win_low_stored >= 1);
-        // A node's bytes sit at `cand_base + stored` from the prefix's first
-        // node on, and at `ext_cand_base + stored` before it; only nodes the
-        // window gate admits are read, and those lie inside the window.
-        let cand_base = live.base.wrapping_add(idx_bias);
-        // The prefix's first node in stored space; with no ext segment it is
-        // the window floor's, below which no node is read.
-        let prefix_stored = (hist_start + live.ext_len).wrapping_sub(abs_bias);
+        // A node's bytes sit at `cand_base + stored`; only nodes the window
+        // gate admits are read, and those lie inside the history.
+        let cand_base = concat.as_ptr().wrapping_add(idx_bias);
         let mut pos = $from;
-        debug_assert!($ext || live.ext_len == 0, "an ext segment on the one-segment path");
-        // Positions in a wrapped window's ext segment (a rebase replay, or the
-        // last positions of the block before a wrap) read the current bytes
-        // across the seam too; one by one, off the hot loop.
-        while $ext && pos < $stop && pos - hist_start < live.ext_len {
-            pos += $table.bt_insert_ext_position(
-                live,
-                coords,
-                pos,
-                $current_abs_end,
-                window_low,
-                search_depth,
-            );
-        }
         while pos < $stop {
             let forward: usize = 'insert: {
                 let abs_pos = pos;
                 let idx = abs_pos - hist_start;
-                if idx + 8 > live.len {
+                if idx + 8 > concat.len() {
                     break 'insert 1;
                 }
                 debug_assert!(
@@ -155,14 +138,9 @@ macro_rules! bt_insert_range_body {
                     "BT walker called past current block end"
                 );
                 let tail_limit = $current_abs_end - abs_pos;
-                // SAFETY: a prefix position (`idx >= live.ext_len`) with eight
-                // bytes of the window after it.
-                let cur_ptr = live.base.wrapping_add(idx);
-                let hash = unsafe {
-                    $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                        cur_ptr, hash_log, search_mls,
-                    )
-                };
+                let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                    concat, idx, hash_log, search_mls,
+                );
                 debug_assert!(hash < 1usize << hash_log);
                 // Prefetch the hash bucket now. For the large L16+ hash table over
                 // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
@@ -190,16 +168,17 @@ macro_rules! bt_insert_range_body {
                     // full BT walk plus the next iteration's pre-collect work ahead of
                     // the collect that will read it — far more lead than the same-call
                     // hint above, enough to hide the full DRAM latency.
-                    if idx + 1 + 8 <= live.len {
-                        // SAFETY: eight window bytes follow the next prefix
-                        // position; a prefetch never faults.
+                    if idx + 1 + 8 <= concat.len() {
+                        let hash_next =
+                            $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                                concat,
+                                idx + 1,
+                                hash_log,
+                                search_mls,
+                            );
+                        // SAFETY: prefetch never faults; an out-of-range index is a
+                        // harmless no-op hint.
                         unsafe {
-                            let hash_next =
-                                $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                                    cur_ptr.add(1),
-                                    hash_log,
-                                    search_mls,
-                                );
                             _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                         }
                     }
@@ -224,6 +203,8 @@ macro_rules! bt_insert_range_body {
                 } else {
                     bt_low.wrapping_sub(abs_bias)
                 };
+                // SAFETY: `idx + 8 <= concat.len()`, checked above.
+                let cur_ptr = unsafe { concat.as_ptr().add(idx) };
                 // `abs_pos + 9` is safe in raw form: `MatchTable::fill_uncommitted` caps
                 // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
                 // `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16`), so every
@@ -272,41 +253,16 @@ macro_rules! bt_insert_range_body {
                     // Each side's common length is a match the walk did not stop
                     // at, so it is below the tail limit.
                     debug_assert!(seed_len < tail_limit);
-                    // `cand_ptr + n` is the candidate's byte `n` for every `n`
-                    // from the match's length on, the byte the order compare
-                    // below reads.
-                    let (cand_ptr, match_len) = if !$ext || node_stored + seed_len >= prefix_stored
-                    {
-                        let cand_ptr = cand_base.wrapping_add(node_stored);
-                        // SAFETY: BT walk invariant: the candidate and the current
-                        // position both have `tail_limit` readable bytes, `seed_len`
-                        // of them already known equal. Counted a word at a time, as
-                        // upstream's `ZSTD_count`: these compares part within a word
-                        // or two.
-                        let match_len = unsafe {
-                            $crate::encoding::fastpath::scalar::common_prefix_len_scalar_ptr(
-                                cand_ptr, cur_ptr, seed_len, tail_limit,
-                            )
-                        };
-                        (cand_ptr, match_len)
-                    } else {
-                        // In the ext segment: counted across into the prefix, then
-                        // read where its byte at the length lies (upstream re-points
-                        // `match` at `base` once the count crosses `dictLimit`).
-                        let cand_idx = node_stored.wrapping_add(idx_bias);
-                        // SAFETY: both runs hold `tail_limit` window bytes, the
-                        // candidate's from an ext index on (`node + seed < prefix`).
-                        let match_len = seed_len
-                            + unsafe {
-                                $crate::encoding::match_table::storage::ext_count!(
-                                    $crate::encoding::fastpath::scalar::common_prefix_len_ptr,
-                                    live,
-                                    cand_idx + seed_len,
-                                    cur_ptr.add(seed_len),
-                                    tail_limit - seed_len
-                                )
-                            };
-                        (live.ptr(cand_idx + match_len).wrapping_sub(match_len), match_len)
+                    let cand_ptr = cand_base.wrapping_add(node_stored);
+                    // SAFETY: BT walk invariant: the candidate and the current
+                    // position both have `tail_limit` readable bytes, `seed_len` of
+                    // them already known equal. Counted a word at a time, as
+                    // upstream's `ZSTD_count`: these compares part within a word or
+                    // two.
+                    let match_len = unsafe {
+                        $crate::encoding::fastpath::scalar::common_prefix_len_scalar_ptr(
+                            cand_ptr, cur_ptr, seed_len, tail_limit,
+                        )
                     };
 
                     if match_len > best_len {
@@ -327,7 +283,7 @@ macro_rules! bt_insert_range_body {
                     // SAFETY: the first differing bytes after a `match_len`-long
                     // prefix; `match_len < tail_limit` (break above) keeps both in
                     // range.
-                    if unsafe { *cand_ptr.wrapping_add(match_len) < *cur_ptr.add(match_len) } {
+                    if unsafe { *cand_ptr.add(match_len) < *cur_ptr.add(match_len) } {
                         // SAFETY: an open side points at a pair slot (initial pair or
                         // the descended node's), or at `closed_side`.
                         unsafe { *smaller_slot = match_stored };
@@ -443,8 +399,6 @@ macro_rules! rep_probe_slot {
         $rep:expr,
         $abs_pos:ident,
         $rbase:ident,
-        $live:ident,
-        $ext:expr,
         $idx:ident,
         $cur_gate:ident,
         $rep_scan_limit:ident,
@@ -466,19 +420,15 @@ macro_rules! rep_probe_slot {
                 break 'slot;
             }
             let candidate_idx = $idx - rep;
-            // A candidate in a wrapped window's ext segment reads off it and
-            // counts on into the prefix; the prefix's are one run with the
-            // current bytes.
-            let in_prefix = !$ext || candidate_idx >= $live.ext_len;
-            let cand_ptr = if in_prefix {
-                $rbase.wrapping_add(candidate_idx)
-            } else {
-                $live.ext.wrapping_add(candidate_idx)
-            };
             // SAFETY: `candidate_idx < idx` (rep >= 1) and `idx + 4 <= rlen`,
-            // so the 4-byte read stays inside the window (through the mirror
-            // after the ext segment for its last positions).
-            let cand_word = unsafe { cand_ptr.cast::<u32>().read_unaligned().to_le() };
+            // so the 4-byte read stays inside `concat`.
+            let cand_word = unsafe {
+                $rbase
+                    .add(candidate_idx)
+                    .cast::<u32>()
+                    .read_unaligned()
+                    .to_le()
+            };
             let cand_gate = if $min_match_len == 3 {
                 cand_word & 0x00FF_FFFF
             } else {
@@ -488,27 +438,15 @@ macro_rules! rep_probe_slot {
                 break 'slot;
             }
             // SAFETY: same umbrella as `$cpl`; `candidate_idx < idx` and
-            // `rep_scan_limit <= rlen - idx`, so both runs hold
-            // `rep_scan_limit` window bytes.
-            let match_len = if in_prefix {
-                unsafe {
-                    $crate::encoding::hc::generator::prefix_len_first_word!(
-                        $cpl,
-                        cand_ptr,
-                        $rbase.wrapping_add($idx),
-                        $rep_scan_limit
-                    )
-                }
-            } else {
-                unsafe {
-                    $crate::encoding::match_table::storage::ext_count!(
-                        $cpl,
-                        $live,
-                        candidate_idx,
-                        $rbase.wrapping_add($idx),
-                        $rep_scan_limit
-                    )
-                }
+            // `rep_scan_limit <= rlen - idx`, so both reads stay inside
+            // `concat` for `rep_scan_limit` bytes.
+            let match_len = unsafe {
+                $crate::encoding::hc::generator::prefix_len_first_word!(
+                    $cpl,
+                    $rbase.add(candidate_idx),
+                    $rbase.add($idx),
+                    $rep_scan_limit
+                )
             };
             if match_len < $min_match_len {
                 break 'slot;
@@ -556,22 +494,16 @@ macro_rules! bt_insert_and_collect_matches_body {
         // The tree's key width, a const of the search the block chose.
         $mls:expr,
         $cpl:path,
-        $cmf:path,
-        // A const, whether the window may hold an ext segment; without one
-        // every segment test below drops out at codegen time.
-        $ext:expr $(,)?
+        $cmf:path $(,)?
     ) => {{
         let idx = $abs_pos - $table.history_abs_start;
-        // The block's window (owned: the history's segments; borrowed: the
-        // in-place input `[0, block_end)`), taken once for the pass rather than
-        // re-derived per position. It holds no borrow, so it coexists with the
-        // `&mut $table` tree writes below. This body runs inside an
-        // optimal-parser pass, after `capture_block_coords`, and nothing in the
-        // pass changes the history. The position is a prefix one, so `cbase +
-        // idx` and every read at or after it are plain.
-        let live = $table.block_live_window();
-        debug_assert!(idx >= live.ext_len);
-        debug_assert!($ext || live.ext_len == 0, "an ext segment on the one-segment path");
+        // The block's live history (owned: `history[history_start..]`;
+        // borrowed: the in-place input `[0, block_end)`), taken once for the
+        // pass rather than re-sliced per position. It holds no borrow, so it
+        // coexists with the `&mut $table` tree writes below.
+        // SAFETY: this body runs inside an optimal-parser pass, after
+        // `capture_block_coords`, and nothing in the pass changes the history.
+        let concat: &[u8] = unsafe { $table.block_live_history() };
         debug_assert!(
             $abs_pos <= $current_abs_end,
             "BT collect called past current block end"
@@ -591,8 +523,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         // table, which the tree walk further down writes through, so each
         // reader was fetching them again.
         let hist_start = $table.history_abs_start;
-        let cbase = live.base;
-        let clen = live.len;
+        let cbase = concat.as_ptr();
+        let clen = concat.len();
         // The caller searches only positions with eight bytes of the block
         // left, which every read below relies on.
         debug_assert!(idx + 8 <= clen);
@@ -618,13 +550,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // pointer nothing aliases, which is what hoisting these amounts to.
             let cur_tail = rlen - idx;
             // SAFETY: `idx + 4 <= rlen` from the guard above.
-            let cur_word = unsafe {
-                rbase
-                    .wrapping_add(idx)
-                    .cast::<u32>()
-                    .read_unaligned()
-                    .to_le()
-            };
+            let cur_word = unsafe { rbase.add(idx).cast::<u32>().read_unaligned().to_le() };
             let cur_gate = if $min_match_len == 3 {
                 cur_word & 0x00FF_FFFF
             } else {
@@ -657,8 +583,6 @@ macro_rules! bt_insert_and_collect_matches_body {
                         $slot_rep,
                         $abs_pos,
                         rbase,
-                        live,
-                        $ext,
                         idx,
                         cur_gate,
                         rep_scan_limit,
@@ -708,15 +632,15 @@ macro_rules! bt_insert_and_collect_matches_body {
             use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
             #[cfg(target_arch = "x86_64")]
             use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            // SAFETY: the next position's four bytes are window bytes (`idx +
-            // 8 <= clen`); a prefetch never faults, and `hh_next` is masked to
+            let hh_next = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                concat,
+                idx + 1,
+                $table.hash3_log,
+                3,
+            );
+            // SAFETY: a prefetch never faults, and `hh_next` is masked to
             // `hash3_log` bits, so it indexes inside the table anyway.
             unsafe {
-                let hh_next = $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                    cbase.wrapping_add(idx + 1),
-                    $table.hash3_log,
-                    3,
-                );
                 _mm_prefetch(table3_base.add(hh_next).cast(), _MM_HINT_T0);
             }
         }
@@ -747,24 +671,19 @@ macro_rules! bt_insert_and_collect_matches_body {
                 debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
                 let table3 = table3_base;
                 let insert = |cursor: usize| {
+                    let hh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        cursor - hist_start,
+                        h3_log,
+                        3,
+                    );
                     // SAFETY: the caller passes `cursor < abs_pos`, so its four
-                    // bytes end before `idx + 4 <= clen` (a cursor in the ext
-                    // segment reads on into its mirror); the hash is masked to
+                    // bytes end before `idx + 4 <= clen`; the hash is masked to
                     // `h3_log` bits and the table holds that many slots.
                     // `cursor - abs_bias` is the stored index the table keeps for
                     // it (`position_base - 1 - index_shift` is the bias), which
                     // the armed block makes representable.
-                    unsafe {
-                        let key = if $ext {
-                            live.ptr(cursor - hist_start)
-                        } else {
-                            cbase.wrapping_add(cursor - hist_start)
-                        };
-                        let hh = $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                            key, h3_log, 3,
-                        );
-                        *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32;
-                    }
+                    unsafe { *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32 };
                 };
                 // A cursor at or past this position inserts nothing and is set
                 // back to it, as the general catch-up's fill does. The first
@@ -792,14 +711,10 @@ macro_rules! bt_insert_and_collect_matches_body {
             let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
                 {
                     'h3: {
-                        // SAFETY: four window bytes follow the position.
-                        let hh = unsafe {
-                            $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                                cbase.wrapping_add(idx),
-                                h3_log,
-                                3,
-                            )
-                        };
+                        let hh =
+                            $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                                concat, idx, h3_log, 3,
+                            );
                         // SAFETY: `hh` is masked to `h3_log` bits, inside the
                         // table `h3_ptr` points at; upstream indexes
                         // `hashTable3[hash3]` directly for the same reason.
@@ -853,48 +768,25 @@ macro_rules! bt_insert_and_collect_matches_body {
                         // that mismatches immediately costs more than the
                         // answer. Upstream reaches the same early exit through
                         // the first word its `ZSTD_count` loads.
-                        // A candidate in a wrapped window's ext segment reads
-                        // off it and counts on into the prefix.
-                        let cand_in_prefix = !$ext || cand_idx >= live.ext_len;
-                        let cand_ptr = if cand_in_prefix {
-                            cbase.wrapping_add(cand_idx)
-                        } else {
-                            live.ext.wrapping_add(cand_idx)
-                        };
-                        let cur_ptr = cbase.wrapping_add(idx);
                         // SAFETY: `cand_idx < idx` and `idx + 4 <= clen`, so
-                        // both four-byte reads stay inside the window (through
-                        // the mirror after the ext segment for its last
-                        // positions).
+                        // both four-byte reads stay inside the live history.
                         let (cand_head, cur_head) = unsafe {
                             (
-                                cand_ptr.cast::<u32>().read_unaligned().to_le(),
-                                cur_ptr.cast::<u32>().read_unaligned().to_le(),
+                                cbase.add(cand_idx).cast::<u32>().read_unaligned().to_le(),
+                                cbase.add(idx).cast::<u32>().read_unaligned().to_le(),
                             )
                         };
                         if (cand_head ^ cur_head) & 0x00FF_FFFF != 0 {
                             break 'h3 None;
                         }
-                        // SAFETY: both runs hold `tail_limit` window bytes.
-                        let ml = if cand_in_prefix {
-                            unsafe {
-                                $crate::encoding::hc::generator::prefix_len_first_word!(
-                                    $cpl,
-                                    cand_ptr,
-                                    cur_ptr,
-                                    tail_limit
-                                )
-                            }
-                        } else {
-                            unsafe {
-                                $crate::encoding::match_table::storage::ext_count!(
-                                    $cpl,
-                                    live,
-                                    cand_idx,
-                                    cur_ptr,
-                                    tail_limit
-                                )
-                            }
+                        // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
+                        let ml = unsafe {
+                            $crate::encoding::hc::generator::prefix_len_first_word!(
+                                $cpl,
+                                cbase.add(cand_idx),
+                                cbase.add(idx),
+                                tail_limit
+                            )
                         };
                         (ml >= $min_match_len).then_some(
                             $crate::encoding::opt::types::MatchCandidate {
@@ -933,14 +825,12 @@ macro_rules! bt_insert_and_collect_matches_body {
         if skip_further_match_search {
             return;
         }
-        // SAFETY: eight window bytes follow the position.
-        let hash = unsafe {
-            $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                cbase.wrapping_add(idx),
-                $table.hash_log,
-                $mls,
-            )
-        };
+        let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+            concat,
+            idx,
+            $table.hash_log,
+            $mls,
+        );
         // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
         // `bt` for the whole body (zstd_opt.c:607); the walk below indexes the
         // bases taken at the top the same way. Its indices are in bounds by the
@@ -975,16 +865,17 @@ macro_rules! bt_insert_and_collect_matches_body {
             // full BT walk plus the next iteration's pre-collect work ahead of
             // the collect that will read it — far more lead than the same-call
             // hint above, enough to hide the full DRAM latency.
-            if idx + 1 + 8 <= clen {
-                // SAFETY: eight window bytes follow the next position; a
-                // prefetch never faults.
+            if idx + 1 + 8 <= concat.len() {
+                let hash_next =
+                    $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        idx + 1,
+                        $table.hash_log,
+                        $mls,
+                    );
+                // SAFETY: prefetch never faults; an out-of-range index is a
+                // harmless no-op hint.
                 unsafe {
-                    let hash_next =
-                        $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                            cbase.wrapping_add(idx + 1),
-                            $table.hash_log,
-                            $mls,
-                        );
                     _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                 }
             }
@@ -1023,14 +914,9 @@ macro_rules! bt_insert_and_collect_matches_body {
         // `cand_base` may lie outside the history; only the candidate it is
         // offset to is ever read, and the window gate proves that one inside.
         debug_assert!(win_low_stored >= 1);
-        // A prefix position with `idx + 8 <= clen`, which the search's entry
-        // checks.
-        let cur_ptr = cbase.wrapping_add(idx);
+        // SAFETY: `idx + 8 <= concat.len()`, which the search's entry checks.
+        let cur_ptr = unsafe { cbase.add(idx) };
         let cand_base = cbase.wrapping_add(coords.idx_bias);
-        // The prefix's first node in stored space: a node below it lies in a
-        // wrapped window's ext segment. With no ext segment it is the window
-        // floor's, below which the walk reads no node.
-        let prefix_stored = (hist_start + live.ext_len).wrapping_sub(coords.abs_bias);
         // Raw `+ 9` is safe here — see `bt_insert_range_body!`
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::fill_uncommitted`.
@@ -1106,41 +992,18 @@ macro_rules! bt_insert_and_collect_matches_body {
             // so it is below the tail limit and the compare below has bytes
             // left to read.
             debug_assert!(seed_len < tail_limit);
-            // `cand_ptr + n` is the candidate's byte `n` for every `n` from the
-            // match's length on, the byte the order compare below reads.
-            let (cand_ptr, match_len) = if !$ext || node_stored + seed_len >= prefix_stored {
-                let cand_ptr = cand_base.wrapping_add(node_stored);
-                // SAFETY: BT walk invariant: the candidate and the current
-                // position both have `tail_limit` readable bytes, `seed_len` of
-                // them already known equal.
-                let match_len = seed_len
-                    + unsafe {
-                        $cpl(
-                            cand_ptr.wrapping_add(seed_len),
-                            cur_ptr.add(seed_len),
-                            tail_limit - seed_len,
-                        )
-                    };
-                (cand_ptr, match_len)
-            } else {
-                // In the ext segment: counted across into the prefix, then read
-                // where its byte at the length lies (upstream re-points `match`
-                // at `base` once the count crosses `dictLimit`).
-                let cand_idx = node_stored.wrapping_add(coords.idx_bias);
-                // SAFETY: both runs hold `tail_limit` window bytes, the
-                // candidate's from an ext index on (`node + seed < prefix`).
-                let match_len = seed_len
-                    + unsafe {
-                        $crate::encoding::match_table::storage::ext_count!(
-                            $cpl,
-                            live,
-                            cand_idx + seed_len,
-                            cur_ptr.add(seed_len),
-                            tail_limit - seed_len
-                        )
-                    };
-                (live.ptr(cand_idx + match_len).wrapping_sub(match_len), match_len)
-            };
+            let cand_ptr = cand_base.wrapping_add(node_stored);
+            // SAFETY: BT walk invariant: the candidate and the current position
+            // both have `tail_limit` readable bytes, `seed_len` of them already
+            // known equal.
+            let match_len = seed_len
+                + unsafe {
+                    $cpl(
+                        cand_ptr.add(seed_len),
+                        cur_ptr.add(seed_len),
+                        tail_limit - seed_len,
+                    )
+                };
 
             if match_len > best_len {
                 // `best_len` is `max(best_len_for_skip, min_match_len - 1)`,
@@ -1183,7 +1046,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // SAFETY: the first differing bytes after a `match_len`-long
             // prefix; `match_len < tail_limit` (asserted above) keeps both in
             // range.
-            if unsafe { *cand_ptr.wrapping_add(match_len) < *cur_ptr.add(match_len) } {
+            if unsafe { *cand_ptr.add(match_len) < *cur_ptr.add(match_len) } {
                 // SAFETY: an open side points at a pair slot (initial pair or
                 // the descended node's), or at `closed_side`.
                 unsafe { *smaller_slot = match_stored };
@@ -1237,24 +1100,13 @@ macro_rules! bt_insert_and_collect_matches_body {
         if compares_left > 0 && $table.dms.is_primed() {
             let dms = $table.dms.table().expect("is_primed() guarantees a DMS table");
             let region = $table.dms.region_len();
-            // SAFETY: eight window bytes follow the position.
-            let dh = unsafe {
-                $crate::encoding::match_table::storage::MatchTable::hash_ptr_with_mls(
-                    cbase.wrapping_add(idx),
-                    dms.hash_log,
-                    dms.mls,
-                )
-            };
+            let dh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                concat,
+                idx,
+                dms.hash_log,
+                dms.mls,
+            );
             let mut dcur = dms.hash_table[dh];
-            // The window as one slice for `$cmf`; a wrapped one is counted
-            // across its two segments instead.
-            // SAFETY: the pass's window, unchanged since it was taken; on the
-            // one-segment path `base` is its first byte.
-            let one_segment = if $ext {
-                unsafe { live.one_segment() }
-            } else {
-                Some(unsafe { core::slice::from_raw_parts(live.base, live.len) })
-            };
             // DUBT seed lengths: bytes already known common on each side, so
             // `$cmf` resumes from there (upstream zstd commonLengthSmaller/Larger).
             let mut common_smaller = 0usize;
@@ -1274,23 +1126,10 @@ macro_rules! bt_insert_and_collect_matches_body {
                 compares_left -= 1;
                 let pair = 2 * dict_idx;
                 let seed = common_smaller.min(common_larger);
-                // SAFETY: `dict_idx < idx` and `idx + tail_limit <= clen`
-                // (checked at entry); same umbrella as the live walk's `$cmf`.
-                // `seed <= prior match_len <= tail_limit`.
-                let match_len = match one_segment {
-                    Some(concat) => unsafe { $cmf(concat, idx, dict_idx, tail_limit, seed) },
-                    None => {
-                        seed + unsafe {
-                            $crate::encoding::match_table::storage::live_count!(
-                                $cpl,
-                                live,
-                                dict_idx + seed,
-                                idx + seed,
-                                tail_limit - seed
-                            )
-                        }
-                    }
-                };
+                // SAFETY: `dict_idx < idx` and `idx + tail_limit <=
+                // concat.len()` (checked at entry); same umbrella as the live
+                // walk's `$cmf`. `seed <= prior match_len <= tail_limit`.
+                let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, seed) };
                 if match_len > best_len {
                     // Same ladder invariant as the live walk: a match longer
                     // than `best_len` is always kept.
@@ -1349,9 +1188,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 }
                 // Descend the DUBT (upstream zstd zstd_opt.c:806-811): dict candidate
                 // smaller than input → its larger child is closer to `idx`.
-                // SAFETY: `match_len < tail_limit`, so both bytes are window
-                // bytes.
-                if unsafe { *live.ptr(dict_idx + match_len) < *live.ptr(idx + match_len) } {
+                if concat[dict_idx + match_len] < concat[idx + match_len] {
                     common_smaller = match_len;
                     dcur = dms.chain_table[pair + 1];
                 } else {
