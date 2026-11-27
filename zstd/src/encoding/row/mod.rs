@@ -994,13 +994,35 @@ macro_rules! row_find_best_match {
             // loop at `ml == limit`), so both reads stay inside the window (a
             // read straddling the ext segment's end runs into the mirror).
             unsafe {
-                let gate = if cand >= prefix_start {
-                    rd32($ctx.ptr(cand + ml - 3)) == rd32(cur_ptr.add(ml - 3))
+                // The candidate's segment, resolved once for the gate and the
+                // count: bytes left in it (unbounded in the prefix) and its
+                // first byte.
+                let room = if $ctx.in_prefix(cand) {
+                    usize::MAX
                 } else {
-                    rd32($ctx.ptr(cand)) == rd32(cur_ptr)
+                    $ctx.hist_start - cand
+                };
+                let cand_ptr = $ctx.ptr(cand);
+                let gate = if cand >= prefix_start {
+                    // A gate word past the segment's end (a match at the
+                    // seam) is read where it lies.
+                    let gate_ptr = if ml + 1 <= room {
+                        cand_ptr.add(ml - 3)
+                    } else {
+                        $ctx.ptr(cand + ml - 3)
+                    };
+                    rd32(gate_ptr) == rd32(cur_ptr.add(ml - 3))
+                } else {
+                    rd32(cand_ptr) == rd32(cur_ptr)
                 };
                 if gate {
-                    let cml = row_count!($cpl, $ctx, cand, cur_ptr, limit);
+                    let first = limit.min(room);
+                    let n = $cpl(cand_ptr, cur_ptr, first);
+                    let cml = if n == first && first < limit {
+                        n + $cpl($ctx.base, cur_ptr.add(n), limit - n)
+                    } else {
+                        n
+                    };
                     if cml > ml {
                         ml = cml;
                         best_off = $abs_pos - raw as usize;
@@ -1226,13 +1248,35 @@ macro_rules! hc_find_best_match {
             // `ml + 1 <= limit` (the count breaks out at `ml == limit`), a read
             // straddling the ext segment's end running into the mirror.
             unsafe {
-                let gate = if cand >= prefix_start {
-                    rd32($ctx.ptr(cand + ml - 3)) == rd32(cur_ptr.add(ml - 3))
+                // The candidate's segment, resolved once for the gate and the
+                // count: bytes left in it (unbounded in the prefix) and its
+                // first byte.
+                let room = if $ctx.in_prefix(cand) {
+                    usize::MAX
                 } else {
-                    rd32($ctx.ptr(cand)) == rd32(cur_ptr)
+                    $ctx.hist_start - cand
+                };
+                let cand_ptr = $ctx.ptr(cand);
+                let gate = if cand >= prefix_start {
+                    // A gate word past the segment's end (a match at the
+                    // seam) is read where it lies.
+                    let gate_ptr = if ml + 1 <= room {
+                        cand_ptr.add(ml - 3)
+                    } else {
+                        $ctx.ptr(cand + ml - 3)
+                    };
+                    rd32(gate_ptr) == rd32(cur_ptr.add(ml - 3))
+                } else {
+                    rd32(cand_ptr) == rd32(cur_ptr)
                 };
                 if gate {
-                    let cml = row_count!($cpl, $ctx, cand, cur_ptr, limit);
+                    let first = limit.min(room);
+                    let n = $cpl(cand_ptr, cur_ptr, first);
+                    let cml = if n == first && first < limit {
+                        n + $cpl($ctx.base, cur_ptr.add(n), limit - n)
+                    } else {
+                        n
+                    };
                     if cml > ml {
                         ml = cml;
                         best_off = p - cand;
