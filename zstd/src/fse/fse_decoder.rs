@@ -1033,24 +1033,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // wall on table-dense btopt frames.
         let total_bits = source.len() * 8;
         let mut bit_pos: usize = 0;
-        #[inline(always)]
-        fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
-            debug_assert!(n <= 32);
-            let byte = bit_pos >> 3;
-            // Eight bytes in the source: one unaligned load with no slice
-            // check, as upstream's `MEM_readLE32` on its fast path; only the
-            // last few bytes take the padded copy.
-            let window = if byte + 8 <= source.len() {
-                // SAFETY: `byte + 8 <= source.len()`.
-                u64::from_le(unsafe { source.as_ptr().add(byte).cast::<u64>().read_unaligned() })
-            } else {
-                let remaining = &source[byte..];
-                let mut window = [0u8; 8];
-                window[..remaining.len()].copy_from_slice(remaining);
-                u64::from_le_bytes(window)
-            };
-            (window >> (bit_pos & 7)) & ((1u64 << n) - 1)
-        }
         macro_rules! read_bits {
             ($n:expr) => {{
                 let n: usize = $n;
@@ -1100,32 +1082,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             .as_mut_ptr()
             .cast::<i32>();
         let mut len = 0usize;
-        // Zeros over `[from, from + n)` in whole chunks: the last chunk runs up
-        // to `ZERO_CHUNK - 1` past the run, into room the reservation above
-        // leaves past the alphabet, and later symbols overwrite what it wrote
-        // inside it. `n` may be zero (one chunk of nothing to keep).
-        macro_rules! zero_run {
-            ($from:expr, $n:expr) => {{
-                let from: usize = $from;
-                let n: usize = $n;
-                let mut done = 0usize;
-                loop {
-                    // SAFETY: `from + n <= max_symbols` (the callers' checks),
-                    // so every chunk ends within `max_symbols + ZERO_CHUNK`,
-                    // the room reserved above.
-                    unsafe {
-                        probs
-                            .add(from + done)
-                            .cast::<[i32; ZERO_CHUNK]>()
-                            .write_unaligned([0; ZERO_CHUNK]);
-                    }
-                    done += ZERO_CHUNK;
-                    if done >= n {
-                        break;
-                    }
-                }
-            }};
-        }
         macro_rules! fail {
             ($e:expr) => {{
                 // SAFETY: every slot below `len` was written.
@@ -1206,49 +1162,20 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                     remaining -= 1;
                 }
             } else {
-                // A zero probability is followed by 2-bit repeat fields, each
-                // adding that many zeros, a field of 3 meaning another follows.
-                // Up to 16 fields are read at once and the run of 3s counted
-                // from the trailing ones, as upstream's `FSE_readNCount` does;
-                // the result, the error and its fields are those of reading
-                // them one by one.
-                loop {
-                    let avail = total_bits - bit_pos;
-                    if avail < 2 {
-                        fail!(FSETableError::GetBitsError(
-                            crate::bit_io::GetBitsError::NotEnoughRemainingBits {
-                                requested: 2,
-                                remaining: avail,
-                            },
-                        ));
-                    }
-                    let fields = (avail / 2).min(16);
-                    let window = field_at(source, bit_pos, 2 * fields);
-                    let threes =
-                        (((!window) | (1u64 << (2 * fields))).trailing_zeros() / 2) as usize;
-                    if threes > 0 {
-                        let run_end = len + 3 * threes;
-                        if run_end > max_symbols {
-                            // The first field that passed the alphabet.
-                            let got = len + 3 * ((max_symbols - len) / 3 + 1);
-                            fail!(FSETableError::TooManySymbols { got });
-                        }
-                        zero_run!(len, run_end - len);
-                        len = run_end;
-                        bit_pos += 2 * threes;
-                    }
-                    if threes == fields {
-                        continue;
-                    }
-                    let last = ((window >> (2 * threes)) & 3) as usize;
-                    bit_pos += 2;
-                    let run_end = len + last;
-                    if run_end > max_symbols {
-                        fail!(FSETableError::TooManySymbols { got: run_end });
-                    }
-                    zero_run!(len, last);
-                    len = run_end;
-                    break;
+                // SAFETY: `probs` has room for `max_symbols + ZERO_CHUNK`
+                // entries, reserved above.
+                let r = unsafe {
+                    read_zero_runs(
+                        source,
+                        total_bits,
+                        &mut bit_pos,
+                        probs,
+                        &mut len,
+                        max_symbols,
+                    )
+                };
+                if let Err(e) = r {
+                    fail!(e);
                 }
             }
         }
@@ -1271,6 +1198,104 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         };
 
         Ok(bytes_read)
+    }
+}
+
+/// The `n <= 32` bits of a table description at `bit_pos`, little-endian.
+#[inline(always)]
+fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
+    debug_assert!(n <= 32);
+    let byte = bit_pos >> 3;
+    // Eight bytes in the source: one unaligned load with no slice check, as
+    // upstream's `MEM_readLE32` on its fast path; only the last few bytes take
+    // the padded copy.
+    let window = if byte + 8 <= source.len() {
+        // SAFETY: `byte + 8 <= source.len()`.
+        u64::from_le(unsafe { source.as_ptr().add(byte).cast::<u64>().read_unaligned() })
+    } else {
+        let remaining = &source[byte..];
+        let mut window = [0u8; 8];
+        window[..remaining.len()].copy_from_slice(remaining);
+        u64::from_le_bytes(window)
+    };
+    (window >> (bit_pos & 7)) & ((1u64 << n) - 1)
+}
+
+/// The zeros after a zero probability: 2-bit repeat fields, each adding that
+/// many, a field of 3 meaning another follows. Up to 16 fields are read at
+/// once and the run of 3s counted from the trailing ones, as upstream's
+/// `FSE_readNCount` does; the result, the error and its fields are those of
+/// reading them one by one. Out of line, so the description loop around it
+/// keeps its own values in registers.
+///
+/// # Safety
+/// `probs` is writable for `max_symbols + ZERO_CHUNK` entries and
+/// `*len <= max_symbols`.
+#[inline(never)]
+unsafe fn read_zero_runs(
+    source: &[u8],
+    total_bits: usize,
+    bit_pos: &mut usize,
+    probs: *mut i32,
+    len: &mut usize,
+    max_symbols: usize,
+) -> Result<(), FSETableError> {
+    // Zeros over `[from, from + n)` in whole chunks: the last chunk runs up to
+    // `ZERO_CHUNK - 1` past the run, into the room past the alphabet, and later
+    // symbols overwrite what it wrote inside it. `n` may be zero.
+    let zero_run = |from: usize, n: usize| {
+        let mut done = 0usize;
+        loop {
+            // SAFETY: `from + n <= max_symbols` (the checks below), so every
+            // chunk ends within `max_symbols + ZERO_CHUNK`, the caller's room.
+            unsafe {
+                probs
+                    .add(from + done)
+                    .cast::<[i32; ZERO_CHUNK]>()
+                    .write_unaligned([0; ZERO_CHUNK]);
+            }
+            done += ZERO_CHUNK;
+            if done >= n {
+                break;
+            }
+        }
+    };
+    loop {
+        let avail = total_bits - *bit_pos;
+        if avail < 2 {
+            return Err(FSETableError::GetBitsError(
+                crate::bit_io::GetBitsError::NotEnoughRemainingBits {
+                    requested: 2,
+                    remaining: avail,
+                },
+            ));
+        }
+        let fields = (avail / 2).min(16);
+        let window = field_at(source, *bit_pos, 2 * fields);
+        let threes = (((!window) | (1u64 << (2 * fields))).trailing_zeros() / 2) as usize;
+        if threes > 0 {
+            let run_end = *len + 3 * threes;
+            if run_end > max_symbols {
+                // The first field that passed the alphabet.
+                let got = *len + 3 * ((max_symbols - *len) / 3 + 1);
+                return Err(FSETableError::TooManySymbols { got });
+            }
+            zero_run(*len, run_end - *len);
+            *len = run_end;
+            *bit_pos += 2 * threes;
+        }
+        if threes == fields {
+            continue;
+        }
+        let last = ((window >> (2 * threes)) & 3) as usize;
+        *bit_pos += 2;
+        let run_end = *len + last;
+        if run_end > max_symbols {
+            return Err(FSETableError::TooManySymbols { got: run_end });
+        }
+        zero_run(*len, last);
+        *len = run_end;
+        return Ok(());
     }
 }
 
