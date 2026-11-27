@@ -1260,6 +1260,70 @@ impl HistoryBuf {
         self.len -= count;
     }
 
+    /// Every byte of the room written since it became this buffer's, `len`
+    /// and beyond: a ring keeps its older segment past `len` after it wraps
+    /// (see [`Self::wrap_tail`]).
+    pub(crate) fn room(&self) -> &[u8] {
+        // SAFETY: the first `written` bytes of the room are initialized, and
+        // `written <= capacity`.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.written) }
+    }
+
+    /// Moves the bytes from `from` to the end to the front and keeps only
+    /// them, leaving the bytes after them in the room as they are, readable
+    /// through [`Self::room`] until a later append writes over them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `from` exceeds the length.
+    pub(crate) fn wrap_tail(&mut self, from: usize) {
+        assert!(from <= self.len, "wrapping past the history's end");
+        let tail = self.len - from;
+        // SAFETY: both ranges lie within the written bytes; `copy` handles an
+        // overlap.
+        unsafe { core::ptr::copy(self.ptr.as_ptr().add(from), self.ptr.as_ptr(), tail) };
+        self.len = tail;
+    }
+
+    /// Writes `bytes` into the room at `at`, at or past the length, where a
+    /// ring keeps bytes of its own (see [`Self::wrap_tail`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bytes would start below the length or past the bytes
+    /// already written (which would leave unwritten bytes inside
+    /// [`Self::room`]), or run past the room.
+    pub(crate) fn write_room(&mut self, at: usize, bytes: &[u8]) {
+        assert!(
+            at >= self.len && at <= self.written && at + bytes.len() <= self.capacity,
+            "room write outside the written room past the length",
+        );
+        // SAFETY: the range lies inside the room (asserted) and past the held
+        // bytes, and `bytes` is borrowed from elsewhere.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(at), bytes.len());
+        }
+        self.written = self.written.max(at + bytes.len());
+    }
+
+    /// Puts `len` bytes the room holds past the length, from `at`, in front of
+    /// the bytes held: the ring's older segment rejoining its newer one.
+    pub(crate) fn prepend_from_room(&mut self, at: usize, len: usize) {
+        // Copied out first: the held bytes move up over the room they occupy.
+        let older: Vec<u8> = self.room()[at..at + len].to_vec();
+        let held = self.len;
+        self.reserve(len);
+        // SAFETY: `reserve` left room for `held + len` bytes; `copy` handles
+        // the overlap of the held bytes with their new place, and `older` is
+        // a separate allocation.
+        unsafe {
+            core::ptr::copy(self.ptr.as_ptr(), self.ptr.as_ptr().add(len), held);
+            core::ptr::copy_nonoverlapping(older.as_ptr(), self.ptr.as_ptr(), len);
+        }
+        self.len = held + len;
+        self.written = self.written.max(self.len);
+    }
+
     /// Moves the written bytes into an owned room of `capacity` bytes.
     fn move_room(&mut self, capacity: usize) {
         let mut own: Vec<u8> = Vec::with_capacity(capacity);

@@ -29,6 +29,9 @@ use super::simple::fast_kernel::count::count_forward_dict_2segment;
 use super::util::hash_top_bits;
 use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
+mod segments;
+use segments::WindowSegments;
+
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
 /// Loop guards must stop scanning when fewer than `HASH_READ_SIZE` bytes
@@ -119,8 +122,25 @@ pub(crate) struct DfastMatchGenerator {
     // the matcher state from disjoint block buffers on every block. In the
     // context's workspace when a context drives the matcher.
     pub(crate) history: HistoryBuf,
+    /// Buffer offset of the prefix segment's first live byte.
     pub(crate) history_start: usize,
+    /// Absolute position of the window's first live byte: the ext segment's
+    /// first byte when there is one, else the prefix's.
     pub(crate) history_abs_start: usize,
+    /// The window's older part once the history has wrapped (upstream's
+    /// extDict, `ZSTD_window_update`): buffer offsets `[ext_off, ext_off +
+    /// ext_len)`, positions `[history_abs_start, history_abs_start +
+    /// ext_len)`. The prefix then starts at offset 0. Empty (`ext_len == 0`)
+    /// while the window is one segment.
+    pub(crate) ext_off: usize,
+    pub(crate) ext_len: usize,
+    /// How many of the prefix's first bytes, up to a key's width, the room
+    /// holds right after the ext segment (see [`Self::mirror_prefix_head`]).
+    ext_mirrored: usize,
+    /// Whether a full history wraps to the buffer's front instead of moving
+    /// the window there. Off while long-distance matching reads the window as
+    /// one slice.
+    ring: bool,
     pub(crate) offset_hist: [u32; 3],
     /// While a dictionary is primed: how far into it the tables start
     /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
@@ -479,6 +499,10 @@ impl DfastMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
+            ext_off: 0,
+            ext_len: 0,
+            ext_mirrored: 0,
+            ring: true,
             dict_index_floor: 0,
             tables: Table::empty(),
             tagged: false,
@@ -819,8 +843,12 @@ impl DfastMatchGenerator {
         self.uncommitted_len = 0;
         // A dictionary frame scanned in place wrote positions past the history
         // it holds, up to the end of its input.
-        let next_floor = (self.history_abs_start + (self.history.len() - self.history_start))
-            .max(core::mem::take(&mut self.borrowed_abs_end));
+        let next_floor =
+            (self.history_abs_start + self.ext_len + (self.history.len() - self.history_start))
+                .max(core::mem::take(&mut self.borrowed_abs_end));
+        // The next frame starts on one segment: a wrapped window has no
+        // dictionary at its front to keep, and nothing below reads the ext.
+        let wrapped = core::mem::take(&mut self.ext_len) != 0;
         // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
         // the front of history (`[0, region)`) + the cached concat-keyed dict
         // tables, so the per-frame dict re-commit (the dominant ~37% memmove on
@@ -831,6 +859,7 @@ impl DfastMatchGenerator {
         // Gated on the dict being fully resident at `history_start == 0` and the
         // floor-advance staying bounded.
         let kept = if self.dict.is_primed()
+            && !wrapped
             && self.history_start == 0
             && next_floor <= REBASE_RESET_FLOOR_CEILING
         {
@@ -980,7 +1009,27 @@ impl DfastMatchGenerator {
         // off `capacity` (a whole read buffer, not a block) would trip it on the
         // first fill and fault in the full window+window/4 mirror for frames
         // that never evict.
-        self.history.reserve(capacity);
+        let ring = self.ring_capacity();
+        // The room past the ring holds the mirror after the ext segment's end
+        // (`mirror_prefix_head`), which can lie at the ring's edge.
+        if self.ring
+            && self.ext_len == 0
+            && self.history.capacity() >= ring + HASH_READ_SIZE
+            && self.history.len() + capacity > ring
+        {
+            self.wrap_history();
+        }
+        if self.ext_len != 0 {
+            // The prefix grows into the room the ext segment's evicted bytes
+            // left; it must stay below the ext segment's live bytes, which a
+            // write would corrupt (see `ring_capacity`).
+            assert!(
+                self.history.len() + capacity <= self.ext_off,
+                "ring prefix would overwrite the live ext segment",
+            );
+        } else {
+            self.history.reserve(capacity);
+        }
 
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
@@ -991,6 +1040,7 @@ impl DfastMatchGenerator {
             self.history.len() - before,
         );
         self.uncommitted_len += appended;
+        self.mirror_prefix_head();
         (appended, eof)
     }
 
@@ -1030,18 +1080,23 @@ impl DfastMatchGenerator {
             // linearly to window + window/4 + one block rather than doubling;
             // `compact_history`'s quarter-window drain keeps the length under
             // it. Small frames that never fill the window stay data-sized.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
+            // A ring holds the window, the block being matched, the input read
+            // ahead and its wrap slack instead, and wraps rather than drains.
+            let target = if self.ring {
+                self.ring_capacity() + HASH_READ_SIZE
+            } else {
+                self.max_window_size
+                    + (self.max_window_size >> 2)
+                    + crate::common::MAX_BLOCK_SIZE as usize
+            };
+            if self.ext_len == 0 && target > self.history.len() && self.history.capacity() < target
+            {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
         while self.window_size + len > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
+            self.evict_front(removed_len);
         }
         // Compact AFTER the eviction that raised `history_start`, so the drain
         // trigger sees the dead prefix this block's eviction created.
@@ -1063,9 +1118,11 @@ impl DfastMatchGenerator {
         }
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
+            self.evict_front(removed_len);
+        }
+        if self.ext_len != 0 {
+            // Back to one segment: the ext bytes go in front of the prefix.
+            self.linearize_history();
         }
         if self.history_start != 0 {
             // Drop the dead prefix. Its room is the context's (or the
@@ -1804,8 +1861,11 @@ impl DfastMatchGenerator {
                 .saturating_sub(self.max_window_size)
                 .max(history_abs_start)
         } else {
-            history_abs_start
+            // The window's floor, in the ext segment once the history wrapped.
+            self.history_abs_start
         };
+        // Owned candidates are read by position across the two segments.
+        let seg = self.segments();
 
         let concat_idx0 = abs_ip0 - history_abs_start;
 
@@ -1874,34 +1934,43 @@ impl DfastMatchGenerator {
         if idxl0 != DFAST_EMPTY_SLOT {
             let cand_pos = position_base + (idxl0 as usize) - 1;
             if cand_pos >= wlow && cand_pos < abs_ip0 {
-                let cand_idx = cand_pos - history_abs_start;
-                let cand_v8 = unsafe {
-                    (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
-                        .read_unaligned()
+                let cand_ptr = if borrowed {
+                    unsafe {
+                        history_base_ptr.add(history_start_offset + (cand_pos - history_abs_start))
+                    }
+                } else {
+                    seg.ptr(cand_pos)
                 };
+                let cand_v8 = unsafe { (cand_ptr as *const u64).read_unaligned() };
                 if cand_v8 == v8_0 {
                     let mut match_len = 8usize;
                     let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
-                    unsafe {
-                        let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
-                        let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 8);
-                        let ext = K::common_prefix_len_ptr(lhs, rhs, max_fwd);
-                        match_len += ext;
+                    if borrowed {
+                        unsafe {
+                            let lhs = cand_ptr.add(8);
+                            let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                            match_len += K::common_prefix_len_ptr(lhs, rhs, max_fwd);
+                        }
+                        let concat = unsafe {
+                            core::slice::from_raw_parts(
+                                history_base_ptr.add(history_start_offset),
+                                concat_len,
+                            )
+                        };
+                        return Some(extend_backwards_shared(
+                            concat,
+                            history_abs_start,
+                            cand_pos,
+                            abs_ip0,
+                            match_len,
+                            lit_len_ip0,
+                        ));
                     }
-                    let concat = unsafe {
-                        core::slice::from_raw_parts(
-                            history_base_ptr.add(history_start_offset),
-                            concat_len,
-                        )
-                    };
-                    return Some(extend_backwards_shared(
-                        concat,
-                        history_abs_start,
-                        cand_pos,
-                        abs_ip0,
-                        match_len,
-                        lit_len_ip0,
-                    ));
+                    // SAFETY: the candidate precedes the cursor in the window and
+                    // `abs_ip0 + 8 + max_fwd` is the committed end.
+                    match_len +=
+                        unsafe { seg.count_forward::<K>(cand_pos + 8, abs_ip0 + 8, max_fwd) };
+                    return Some(seg.extend_back(cand_pos, abs_ip0, match_len, lit_len_ip0));
                 }
             }
         }
@@ -1912,34 +1981,44 @@ impl DfastMatchGenerator {
         if idxs0 != DFAST_EMPTY_SLOT {
             let cand_pos_s = position_base + (idxs0 as usize) - 1;
             if cand_pos_s >= wlow && cand_pos_s < abs_ip0 {
-                let cand_idx_s = cand_pos_s - history_abs_start;
-                let cand4 = unsafe {
-                    (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
-                        .read_unaligned()
+                let cand_ptr_s = if borrowed {
+                    unsafe {
+                        history_base_ptr
+                            .add(history_start_offset + (cand_pos_s - history_abs_start))
+                    }
+                } else {
+                    seg.ptr(cand_pos_s)
                 };
+                let cand4 = unsafe { (cand_ptr_s as *const u32).read_unaligned() };
                 if cand4 == v4_0 as u32 {
                     let mut s_match_len = 4usize;
                     let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
-                    unsafe {
-                        let lhs = history_base_ptr.add(history_start_offset + cand_idx_s + 4);
-                        let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 4);
-                        let ext = K::common_prefix_len_ptr(lhs, rhs, max_fwd);
-                        s_match_len += ext;
-                    }
-                    let concat = unsafe {
-                        core::slice::from_raw_parts(
-                            history_base_ptr.add(history_start_offset),
-                            concat_len,
+                    let short_cand = if borrowed {
+                        unsafe {
+                            let lhs = cand_ptr_s.add(4);
+                            let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                            s_match_len += K::common_prefix_len_ptr(lhs, rhs, max_fwd);
+                        }
+                        let concat = unsafe {
+                            core::slice::from_raw_parts(
+                                history_base_ptr.add(history_start_offset),
+                                concat_len,
+                            )
+                        };
+                        extend_backwards_shared(
+                            concat,
+                            history_abs_start,
+                            cand_pos_s,
+                            abs_ip0,
+                            s_match_len,
+                            lit_len_ip0,
                         )
+                    } else {
+                        // SAFETY: as the long probe's count.
+                        s_match_len +=
+                            unsafe { seg.count_forward::<K>(cand_pos_s + 4, abs_ip0 + 4, max_fwd) };
+                        seg.extend_back(cand_pos_s, abs_ip0, s_match_len, lit_len_ip0)
                     };
-                    let short_cand = extend_backwards_shared(
-                        concat,
-                        history_abs_start,
-                        cand_pos_s,
-                        abs_ip0,
-                        s_match_len,
-                        lit_len_ip0,
-                    );
                     if short_cand.match_len >= short_hit_floor::<MLS>() {
                         return Some(short_cand);
                     }
@@ -2001,6 +2080,17 @@ impl DfastMatchGenerator {
                 core::slice::from_raw_parts(
                     self.history.as_ptr().add(self.history_start),
                     self.dict.region_len(),
+                )
+            }
+        } else if self.ext_len != 0 {
+            // A wrapped window's older part runs right before the prefix the
+            // same way, so a rep reaching past the prefix counts on from it.
+            // SAFETY: the ext segment's bytes are written room nothing writes
+            // while the block is matched.
+            unsafe {
+                core::slice::from_raw_parts(
+                    self.history.room().as_ptr().add(self.ext_off),
+                    self.ext_len,
                 )
             }
         } else {
@@ -2152,7 +2242,7 @@ impl DfastMatchGenerator {
         (
             self.history.as_ptr(),
             start_offset,
-            self.history_abs_start,
+            self.prefix_abs(),
             self.position_base,
             // Committed bytes only, as in `owned_scan_descriptor`: with in-place
             // ingest the next block's bytes already sit past the end, and the
@@ -2184,7 +2274,7 @@ impl DfastMatchGenerator {
         (
             self.history.as_ptr(),
             start_offset,
-            self.history_abs_start,
+            self.prefix_abs(),
             self.position_base,
             // Committed bytes only: the next block's bytes can already sit
             // past the end, and a forward match count must not reach into
@@ -2306,7 +2396,8 @@ impl DfastMatchGenerator {
     }
 
     fn compact_history(&mut self) {
-        if self.history_start == 0 {
+        // A ring wraps at its capacity instead (see `fill_uncommitted`).
+        if self.history_start == 0 || self.ring {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the one-time
@@ -2323,12 +2414,118 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// The prefix segment's committed bytes: the whole window while it is one
+    /// segment, its newer part once the history has wrapped.
     pub(crate) fn live_history(&self) -> &[u8] {
         // Stop at the committed end, not at `history.len()`: the next block's
         // bytes may already be read into the tail, and a scan must not see
         // past the block it is compressing (a forward match count would
         // otherwise run into input the block does not own).
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
+    }
+
+    /// Absolute position of the prefix segment's first live byte.
+    #[inline(always)]
+    pub(crate) fn prefix_abs(&self) -> usize {
+        self.history_abs_start + self.ext_len
+    }
+
+    /// The owned window as its two segments, for the paths that read a
+    /// candidate by its position.
+    fn segments(&self) -> WindowSegments {
+        // Both pointers from the whole written room: an ext key read runs past
+        // the segment into the mirror after it.
+        let room = self.history.room().as_ptr();
+        let committed = self.history.len() - self.uncommitted_len;
+        let prefix_abs = self.prefix_abs();
+        WindowSegments {
+            ext: room.wrapping_add(self.ext_off),
+            ext_abs: self.history_abs_start,
+            prefix: room.wrapping_add(self.history_start),
+            prefix_abs,
+            end_abs: prefix_abs + (committed - self.history_start),
+        }
+    }
+
+    /// History room the window may occupy as a ring: the window, the block
+    /// being matched and the input read ahead of it, with the slack that keeps
+    /// the prefix written after a wrap below the ext segment's live bytes
+    /// until the window has moved past them (see [`Self::wrap_history`]).
+    fn ring_capacity(&self) -> usize {
+        self.max_window_size + 4 * crate::common::MAX_BLOCK_SIZE as usize
+    }
+
+    /// Starts the prefix over at the buffer's front, keeping the committed
+    /// window where it lies as the ext segment and moving only the input read
+    /// but not yet claimed (upstream `ZSTD_window_update` on a non-contiguous
+    /// segment, after the input buffer wrapped).
+    ///
+    /// Taken when a fill would run the prefix past the ring capacity. The
+    /// window is then far shorter than the prefix (the dead part ahead of it
+    /// alone is several blocks), so no older ext segment is live, and the
+    /// slack in [`Self::ring_capacity`] keeps every later fill below the ext
+    /// segment's live start until eviction has moved past it.
+    fn wrap_history(&mut self) {
+        debug_assert_eq!(self.ext_len, 0, "a live ext segment at the next wrap");
+        let committed_end = self.history.len() - self.uncommitted_len;
+        self.ext_off = self.history_start;
+        self.ext_len = committed_end - self.history_start;
+        self.history.wrap_tail(committed_end);
+        self.history_start = 0;
+        // The moved tail's bytes still lie right after the ext segment, where
+        // they were read in.
+        self.ext_mirrored = self.uncommitted_len.min(HASH_READ_SIZE);
+    }
+
+    /// Keeps the prefix's first bytes, up to a key's width, right after the
+    /// ext segment, so a key read at one of the ext segment's last positions
+    /// runs on into the bytes that follow them in the window. The wrap leaves
+    /// the moved read-ahead there; a shorter one is completed as the prefix
+    /// grows. The prefix never reaches that far while the ext segment lives.
+    fn mirror_prefix_head(&mut self) {
+        if self.ext_len == 0 || self.ext_mirrored == HASH_READ_SIZE {
+            return;
+        }
+        let upto = self.history.len().min(HASH_READ_SIZE);
+        if upto <= self.ext_mirrored {
+            return;
+        }
+        let mut head = [0u8; HASH_READ_SIZE];
+        head[..upto - self.ext_mirrored].copy_from_slice(&self.history[self.ext_mirrored..upto]);
+        let at = self.ext_off + self.ext_len + self.ext_mirrored;
+        self.history
+            .write_room(at, &head[..upto - self.ext_mirrored]);
+        self.ext_mirrored = upto;
+    }
+
+    /// Lets the history wrap as a ring, or keeps it in one segment; set per
+    /// frame, before its first byte, while the history holds no ext segment.
+    pub(crate) fn set_ring(&mut self, ring: bool) {
+        debug_assert_eq!(self.ext_len, 0, "the ring mode changes mid-wrap");
+        self.ring = ring;
+    }
+
+    /// Drops the window's oldest `len` bytes: the ext segment's first, then
+    /// the prefix's.
+    #[inline]
+    fn evict_front(&mut self, len: usize) {
+        self.window_size -= len;
+        let from_ext = len.min(self.ext_len);
+        self.ext_off += from_ext;
+        self.ext_len -= from_ext;
+        self.history_start += len - from_ext;
+        self.history_abs_start += len;
+    }
+
+    /// Puts the ext segment back in front of the prefix, making the window one
+    /// segment again, for the paths that hand it out as one slice.
+    fn linearize_history(&mut self) {
+        debug_assert_eq!(
+            self.history_start, 0,
+            "the prefix starts at the front while an ext segment lives"
+        );
+        self.history.prepend_from_room(self.ext_off, self.ext_len);
+        self.ext_len = 0;
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
@@ -2349,6 +2546,15 @@ impl DfastMatchGenerator {
 
     fn insert_range_as<const TAGGED: bool>(&mut self, start: usize, end: usize, step: usize) {
         debug_assert!(step >= 1, "insert_range needs a positive step");
+        // Positions in a wrapped window's older segment come first, in order,
+        // as the walk over one segment would take them.
+        if self.ext_len != 0 && self.borrowed_input.is_none() && start < self.prefix_abs() {
+            debug_assert_eq!(
+                step, 1,
+                "only the dense seam re-seed reaches the ext segment"
+            );
+            self.insert_ext_positions::<TAGGED>(start, end);
+        }
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
         // (owned returns its `history` fields, byte-identical).
@@ -2487,6 +2693,53 @@ impl DfastMatchGenerator {
                     live_slot::<TAGGED>(packed, mixed_short, short_shift);
             }
             pos += step;
+        }
+    }
+
+    /// The dense walk of [`Self::insert_range_as`] over the positions of
+    /// `[start, end)` in the ext segment: both tables where a full key is
+    /// readable, the short one alone where only its `mls` bytes are. A key at
+    /// one of the segment's last positions runs on into the prefix's first
+    /// bytes, which the room holds right after it (`mirror_prefix_head`).
+    /// Cold: only the re-seed of the bytes before a block reaches back here.
+    fn insert_ext_positions<const TAGGED: bool>(&mut self, start: usize, end: usize) {
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        let seg = self.segments();
+        let start = start.max(seg.ext_abs);
+        let end = end.min(seg.prefix_abs);
+        if start >= end {
+            return;
+        }
+        self.ensure_room_for(end - 1);
+        let position_base = self.position_base;
+        let short_shift = 64 - self.short_hash_bits;
+        let long_shift = 64 - self.long_hash_bits;
+        let short_ptr = self.short_mut_ptr();
+        let long_ptr = self.long_mut_ptr();
+        let mls = self.mls;
+        let short_key_shift = 64 - 8 * mls;
+        for pos in start..end {
+            let readable = seg.end_abs - pos;
+            let packed = ((pos - position_base) as u32) + 1;
+            let at = seg.ptr(pos);
+            // SAFETY: `readable` bytes of the window follow `pos`, through the
+            // mirror past the ext segment's end; the slots are below their
+            // tables' lengths by the shifts.
+            unsafe {
+                if readable >= HASH_READ_SIZE {
+                    let v8 = (at as *const u64).read_unaligned();
+                    let mixed_short = (v8 << short_key_shift).wrapping_mul(PRIME);
+                    *short_ptr.add(dfast_slot(mixed_short, short_shift)) =
+                        live_slot::<TAGGED>(packed, mixed_short, short_shift);
+                    let mixed_long = v8.wrapping_mul(PRIME);
+                    *long_ptr.add(dfast_slot(mixed_long, long_shift)) =
+                        live_slot::<TAGGED>(packed, mixed_long, long_shift);
+                } else if readable >= mls {
+                    let mixed_short = short_key_at(at, readable, mls).wrapping_mul(PRIME);
+                    *short_ptr.add(dfast_slot(mixed_short, short_shift)) =
+                        live_slot::<TAGGED>(packed, mixed_short, short_shift);
+                }
+            }
         }
     }
 
@@ -2690,12 +2943,14 @@ impl DfastMatchGenerator {
     }
 
     fn block_looks_incompressible(&self, start: usize, end: usize) -> bool {
+        // The block is always in the prefix segment, which `live_history` is.
         let live = self.live_history();
-        if start >= end || start < self.history_abs_start {
+        let prefix_abs = self.prefix_abs();
+        if start >= end || start < prefix_abs {
             return false;
         }
-        let start_idx = start - self.history_abs_start;
-        let end_idx = end - self.history_abs_start;
+        let start_idx = start - prefix_abs;
+        let end_idx = end - prefix_abs;
         if end_idx > live.len() {
             return false;
         }
@@ -2776,7 +3031,7 @@ unsafe fn catch_up_in_block(
 }
 
 macro_rules! start_matching_fast_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $tier:ty, $borrowed:expr, $tagged:expr, $mls:ident) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $tier:ty, $borrowed:expr, $tagged:expr, $mls:ident, $ext:expr) => {{
         // Behaviour change vs the pre-refactor `start_matching_general`:
         // this fast loop deliberately drops the strict-incompressible
         // early-skip path (the `block_looks_incompressible_strict` short
@@ -2983,12 +3238,28 @@ macro_rules! start_matching_fast_loop_body {
             // above it is within the window of every position in the block. An
             // input shorter than the window has its floor at its start, which is
             // what the clamp says; earlier frames lie below that start.
+            // A wrapped window's floor lies in its older segment, whose slots
+            // are read off a base of their own (upstream `dictBase`): a slot
+            // below `prefix_min_slot` names an ext position.
+            let seg = $self.segments();
             let floor_abs = if $borrowed {
                 history_abs_start + concat_len.saturating_sub(advertised_window)
+            } else if $ext {
+                seg.ext_abs
             } else {
                 history_abs_start
             };
             debug_assert!(floor_abs <= $current_abs_start);
+            let prefix_min_slot = if $ext {
+                ((history_abs_start - position_base) as u32) + 1
+            } else {
+                0
+            };
+            let ext_slot_base = seg
+                .ext
+                .wrapping_offset(position_base as isize - seg.ext_abs as isize - 1);
+            // Window bytes before the prefix, which a repeat may reach into.
+            let ext_reach = if $ext { history_abs_start - floor_abs } else { 0 };
             // The same fold in slot space, so the window floor is one unsigned
             // compare against a slot value rather than a decode plus a compare
             // in position space. The empty sentinel is 0 and this is at least 1,
@@ -3121,7 +3392,11 @@ macro_rules! start_matching_fast_loop_body {
             // reach of the first cursor, which later cursors only exceed, so the
             // read needs no gate either; the hit below re-reads the real rep.
             let rep_floor = if $borrowed { floor_abs - history_abs_start } else { 0 };
-            let rep_reach = ip1 + block_bias - rep_floor;
+            // A wrapped window's repeat may reach into the ext segment too.
+            let rep_reach = ip1 + block_bias + ext_reach - rep_floor;
+            // The clamped repeat, for the per-position read of a wrapped window,
+            // which resolves the candidate's segment as the cursor moves.
+            let rep_clamped = ($self.offset_hist[0] as usize).clamp(1, rep_reach);
             // The candidate behind the cursor, addressed off the cursor the way
             // the block itself is. Wrapping: for a rep reaching before the block
             // this points before `block_ptr`.
@@ -3269,7 +3544,12 @@ macro_rules! start_matching_fast_loop_body {
                         // the candidate at or after the floor of live history
                         // for every later cursor, so the 4 bytes are inside it.
                         let cand4 = unsafe {
-                            (rep_base.wrapping_add(ip1) as *const u32).read_unaligned()
+                            if $ext {
+                                (seg.ptr($current_abs_start + ip1 - rep_clamped) as *const u32)
+                                    .read_unaligned()
+                            } else {
+                                (rep_base.wrapping_add(ip1) as *const u32).read_unaligned()
+                            }
                         };
                         let cur4 = unsafe {
                             (block_ptr.add(ip1) as *const u32)
@@ -3282,7 +3562,29 @@ macro_rules! start_matching_fast_loop_body {
                         // the rep's load into the scan beside the compare.
                         if cand4 == cur4 {
                         let rep = $self.offset_hist[0] as usize;
-                        if rep != 0
+                        if $ext {
+                            let cur_abs = $current_abs_start + ip1;
+                            if rep != 0
+                                && rep <= ip1 + block_bias + ext_reach
+                                && unsafe { (seg.ptr(cur_abs - rep) as *const u32).read_unaligned() }
+                                    == cur4
+                            {
+                                let max_fwd = block_len - (ip1 + 4);
+                                // SAFETY: the candidate precedes the cursor in
+                                // the window and `cur_abs + 4 + max_fwd` is the
+                                // block's end.
+                                let match_len = 4 + unsafe {
+                                    seg.count_forward::<$tier>(cur_abs - rep + 4, cur_abs + 4, max_fwd)
+                                };
+                                if match_len >= DFAST_REP_MIN_MATCH_LEN {
+                                    let c = seg.extend_back(cur_abs - rep, cur_abs, match_len, ip1 - literals_start);
+                                    break 'inner InnerExit::Committed(
+                                        MatchCandidate { start: c.start - $current_abs_start, ..c },
+                                        0,
+                                    );
+                                }
+                            }
+                        } else if rep != 0
                             && rep + rep_floor <= ip1 + block_bias
                             && unsafe {
                                 (block_ptr.wrapping_add(ip1).wrapping_sub(rep) as *const u32)
@@ -3401,19 +3703,35 @@ macro_rules! start_matching_fast_loop_body {
                     // SAFETY: the gates admit only slots naming a position at or
                     // after the window floor and before the cursor, so this
                     // lands inside live history — the same buffer and length
-                    // bounds `v8_0` is read under.
-                    let cand_ptr = slot_base_ptr.wrapping_add(slot_l0);
+                    // bounds `v8_0` is read under. An ext slot reads its own
+                    // segment, through the mirror past its end.
+                    let cand_ptr = if $ext && (slot_l0 as u32) < prefix_min_slot {
+                        ext_slot_base.wrapping_add(slot_l0)
+                    } else {
+                        slot_base_ptr.wrapping_add(slot_l0)
+                    };
                     let cand_v8 = unsafe { (cand_ptr as *const u64).read_unaligned() };
                     if cand_v8 == v8_0 {
                         {
                             debug_assert!(
-                                cand_ptr < block_ptr.wrapping_add(ip0),
+                                $ext || cand_ptr < block_ptr.wrapping_add(ip0),
                                 "long candidate at or past the cursor {ip0}",
                             );
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
                             let max_fwd = block_len - (ip0 + 8);
+                            let cand = if $ext {
+                                let cand_abs = position_base + slot_l0 - 1;
+                                let cur_abs = $current_abs_start + ip0;
+                                // SAFETY: the candidate precedes the cursor in
+                                // the window; `max_fwd` ends at the block's end.
+                                match_len += unsafe {
+                                    seg.count_forward::<$tier>(cand_abs + 8, cur_abs + 8, max_fwd)
+                                };
+                                let c = seg.extend_back(cand_abs, cur_abs, match_len, ip0 - literals_start);
+                                MatchCandidate { start: c.start - $current_abs_start, ..c }
+                            } else {
                             // SAFETY: both ptrs at the same buffer; offsets
                             // verified above. `max_fwd` caps the scan to
                             // the live region.
@@ -3427,7 +3745,7 @@ macro_rules! start_matching_fast_loop_body {
                             }
                             // SAFETY: the gates put the candidate in live
                             // history, before the cursor.
-                            let cand = unsafe {
+                            unsafe {
                                 catch_up_in_block(
                                     cand_ptr,
                                     live_ptr,
@@ -3436,6 +3754,7 @@ macro_rules! start_matching_fast_loop_body {
                                     literals_start,
                                     match_len,
                                 )
+                            }
                             };
                             // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                             // `if (step < 4) hashLong[hl1] = ip1`. Insert the
@@ -3468,18 +3787,32 @@ macro_rules! start_matching_fast_loop_body {
                     // SAFETY: as in the long probe, the gates admit only slots
                     // naming a position at or after the floor and before the
                     // cursor.
-                    let cand_ptr = slot_base_ptr.wrapping_add(slot_s0);
+                    let cand_ptr = if $ext && (slot_s0 as u32) < prefix_min_slot {
+                        ext_slot_base.wrapping_add(slot_s0)
+                    } else {
+                        slot_base_ptr.wrapping_add(slot_s0)
+                    };
                     let cand4 = unsafe { (cand_ptr as *const u32).read_unaligned() };
                     if cand4 == v4_0 as u32 {
                         {
                             debug_assert!(
-                                cand_ptr < block_ptr.wrapping_add(ip0),
+                                $ext || cand_ptr < block_ptr.wrapping_add(ip0),
                                 "short candidate at or past the cursor {ip0}",
                             );
                             {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
                             let max_fwd = block_len - (ip0 + 4);
+                            let short_cand = if $ext {
+                                let cand_abs = position_base + slot_s0 - 1;
+                                let cur_abs = $current_abs_start + ip0;
+                                // SAFETY: as the long probe's count.
+                                s_match_len += unsafe {
+                                    seg.count_forward::<$tier>(cand_abs + 4, cur_abs + 4, max_fwd)
+                                };
+                                let c = seg.extend_back(cand_abs, cur_abs, s_match_len, ip0 - literals_start);
+                                MatchCandidate { start: c.start - $current_abs_start, ..c }
+                            } else {
                             unsafe {
                                 let rhs =
                                     block_ptr.add(ip0 +4);
@@ -3490,7 +3823,7 @@ macro_rules! start_matching_fast_loop_body {
                             }
                             // SAFETY: the gates put the candidate in live
                             // history, before the cursor.
-                            let short_cand = unsafe {
+                            unsafe {
                                 catch_up_in_block(
                                     cand_ptr,
                                     live_ptr,
@@ -3499,6 +3832,7 @@ macro_rules! start_matching_fast_loop_body {
                                     literals_start,
                                     s_match_len,
                                 )
+                            }
                             };
 
                             // Enforce the hash-search floor BEFORE
@@ -3528,10 +3862,15 @@ macro_rules! start_matching_fast_loop_body {
                             let idxl1 = unsafe { *hl1_slot };
                             let slot_l1 = (idxl1 ^ tl1).rotate_right(tag_shift);
                             if slot_l1.wrapping_sub(min_slot) < packed_ip1 - min_slot {
-                                let cand_ptr_l1 = slot_base_ptr.wrapping_add(slot_l1 as usize);
+                                let cand_ptr_l1 = if $ext && slot_l1 < prefix_min_slot {
+                                    ext_slot_base.wrapping_add(slot_l1 as usize)
+                                } else {
+                                    slot_base_ptr.wrapping_add(slot_l1 as usize)
+                                };
                                 debug_assert!(
-                                    cand_ptr_l1 >= live_ptr
-                                        && cand_ptr_l1 < block_ptr.wrapping_add(ip1)
+                                    $ext
+                                        || (cand_ptr_l1 >= live_ptr
+                                            && cand_ptr_l1 < block_ptr.wrapping_add(ip1))
                                 );
                                 {
                                     let cand_v8_l1 =
@@ -3539,6 +3878,18 @@ macro_rules! start_matching_fast_loop_body {
                                     if cand_v8_l1 == v8_1 {
                                         let mut l1_match_len = 8usize;
                                         let max_fwd_l1 = block_len - (ip1 + 8);
+                                        let cand_abs_l1 = position_base + slot_l1 as usize - 1;
+                                        let cur_abs_l1 = $current_abs_start + ip1;
+                                        if $ext {
+                                            // SAFETY: as the long probe's count.
+                                            l1_match_len += unsafe {
+                                                seg.count_forward::<$tier>(
+                                                    cand_abs_l1 + 8,
+                                                    cur_abs_l1 + 8,
+                                                    max_fwd_l1,
+                                                )
+                                            };
+                                        } else {
                                         unsafe {
                                             let rhs = block_ptr.add(ip1 + 8);
                                             let ext = $cpl(
@@ -3546,10 +3897,20 @@ macro_rules! start_matching_fast_loop_body {
                                             );
                                             l1_match_len += ext;
                                         }
+                                        }
                                         if l1_match_len > short_cand.match_len {
                                             // SAFETY: the gate puts the candidate
                                             // in live history, before the cursor.
-                                            chosen = unsafe {
+                                            chosen = if $ext {
+                                                let c = seg.extend_back(
+                                                    cand_abs_l1,
+                                                    cur_abs_l1,
+                                                    l1_match_len,
+                                                    ip1 - literals_start,
+                                                );
+                                                MatchCandidate { start: c.start - $current_abs_start, ..c }
+                                            } else {
+                                                unsafe {
                                                 catch_up_in_block(
                                                     cand_ptr_l1,
                                                     live_ptr,
@@ -3558,6 +3919,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     literals_start,
                                                     l1_match_len,
                                                 )
+                                                }
                                             };
                                             // Long-hash hits start at 8
                                             // bytes (`MEM_read64` gate
@@ -3723,15 +4085,22 @@ macro_rules! start_matching_fast_loop_body {
                     // under the same `ip <= ilimit` as the inserts and each other.
                     while pos + HASH_READ_SIZE <= block_len {
                         let rep = $self.offset_hist[1] as usize;
-                        // Concat index of the cursor: a candidate before the
-                        // live history is out of reach.
-                        let idx = pos + block_bias;
+                        // Distance of the cursor from the window's floor: a
+                        // candidate before the live history is out of reach.
+                        let idx = pos + block_bias + ext_reach;
                         if rep == 0 || rep > idx {
                             break;
                         }
+                        // A wrapped window's candidate may lie in its older
+                        // segment.
+                        let rep_ptr = if $ext {
+                            seg.ptr($current_abs_start + pos - rep)
+                        } else {
+                            block_ptr.wrapping_add(pos).wrapping_sub(rep)
+                        };
                         // SAFETY: `idx - rep < idx` and `pos + 4 <= block_len`,
-                        // both inside the live bytes.
-                        let rep_ptr = block_ptr.wrapping_add(pos).wrapping_sub(rep);
+                        // both inside the live bytes (an ext candidate through
+                        // the mirror past its segment's end).
                         let (c4, p4) = unsafe {
                             (
                                 (rep_ptr as *const u32).read_unaligned(),
@@ -3744,11 +4113,16 @@ macro_rules! start_matching_fast_loop_body {
                         // SAFETY: as above; the length caps the count to the
                         // block.
                         let r_len = 4 + unsafe {
-                            $cpl(
-                                rep_ptr.add(4),
-                                block_ptr.add(pos + 4),
-                                block_len - (pos + 4),
-                            )
+                            if $ext {
+                                let cur_abs = $current_abs_start + pos;
+                                seg.count_forward::<$tier>(cur_abs - rep + 4, cur_abs + 4, block_len - (pos + 4))
+                            } else {
+                                $cpl(
+                                    rep_ptr.add(4),
+                                    block_ptr.add(pos + 4),
+                                    block_len - (pos + 4),
+                                )
+                            }
                         };
                         // Both tables at the rep position (zstd_double_fast.c:314-315),
                         // short first as the single-position insert writes them.
@@ -4591,6 +4965,11 @@ impl DfastMatchGenerator {
         // and picks one with a single `switch` (zstd_double_fast.c:568-605).
         let mls = self.mls;
         debug_assert!((4..=7).contains(&mls), "dfast key width {mls} out of 4..=7");
+        let ext = self.ext_len != 0;
+        debug_assert!(
+            !(ext && (use_dict || borrowed)),
+            "a wrapped window has no dictionary and no borrowed input"
+        );
         macro_rules! dispatch_dict {
             ($kernel:ident, $dict_kernel:ident) => {
                 match mls {
@@ -4608,23 +4987,35 @@ impl DfastMatchGenerator {
                         self.$dict_kernel::<false, $m>(current_abs_start, current_len, handle_sequence)
                     }
                 } else {
-                    match (borrowed, tagged) {
-                        (true, true) => self.$kernel::<true, true, $m>(
+                    // A wrapped window is a fourth axis of the owned loop only:
+                    // an input scanned in place never wraps.
+                    match (borrowed, tagged, ext) {
+                        (true, true, _) => self.$kernel::<true, true, $m, false>(
                             current_abs_start,
                             current_len,
                             handle_sequence,
                         ),
-                        (true, false) => self.$kernel::<true, false, $m>(
+                        (true, false, _) => self.$kernel::<true, false, $m, false>(
                             current_abs_start,
                             current_len,
                             handle_sequence,
                         ),
-                        (false, true) => self.$kernel::<false, true, $m>(
+                        (false, true, false) => self.$kernel::<false, true, $m, false>(
                             current_abs_start,
                             current_len,
                             handle_sequence,
                         ),
-                        (false, false) => self.$kernel::<false, false, $m>(
+                        (false, true, true) => self.$kernel::<false, true, $m, true>(
+                            current_abs_start,
+                            current_len,
+                            handle_sequence,
+                        ),
+                        (false, false, false) => self.$kernel::<false, false, $m, false>(
+                            current_abs_start,
+                            current_len,
+                            handle_sequence,
+                        ),
+                        (false, false, true) => self.$kernel::<false, false, $m, true>(
                             current_abs_start,
                             current_len,
                             handle_sequence,
@@ -4771,6 +5162,7 @@ impl DfastMatchGenerator {
         const BORROWED: bool,
         const TAGGED: bool,
         const MLS: usize,
+        const EXT: bool,
     >(
         &mut self,
         current_abs_start: usize,
@@ -4786,7 +5178,8 @@ impl DfastMatchGenerator {
             crate::encoding::fastpath::NeonTier,
             BORROWED,
             TAGGED,
-            MLS
+            MLS,
+            EXT
         )
     }
 
@@ -4799,6 +5192,7 @@ impl DfastMatchGenerator {
         const BORROWED: bool,
         const TAGGED: bool,
         const MLS: usize,
+        const EXT: bool,
     >(
         &mut self,
         current_abs_start: usize,
@@ -4814,7 +5208,8 @@ impl DfastMatchGenerator {
             crate::encoding::fastpath::Sse2Tier,
             BORROWED,
             TAGGED,
-            MLS
+            MLS,
+            EXT
         )
     }
 
@@ -4827,6 +5222,7 @@ impl DfastMatchGenerator {
         const BORROWED: bool,
         const TAGGED: bool,
         const MLS: usize,
+        const EXT: bool,
     >(
         &mut self,
         current_abs_start: usize,
@@ -4842,7 +5238,8 @@ impl DfastMatchGenerator {
             crate::encoding::fastpath::Avx2Bmi2Tier,
             BORROWED,
             TAGGED,
-            MLS
+            MLS,
+            EXT
         )
     }
 
@@ -4856,6 +5253,7 @@ impl DfastMatchGenerator {
         const BORROWED: bool,
         const TAGGED: bool,
         const MLS: usize,
+        const EXT: bool,
     >(
         &mut self,
         current_abs_start: usize,
@@ -4871,7 +5269,8 @@ impl DfastMatchGenerator {
             crate::encoding::fastpath::Simd128Tier,
             BORROWED,
             TAGGED,
-            MLS
+            MLS,
+            EXT
         )
     }
 
@@ -4892,6 +5291,7 @@ impl DfastMatchGenerator {
         const BORROWED: bool,
         const TAGGED: bool,
         const MLS: usize,
+        const EXT: bool,
     >(
         &mut self,
         current_abs_start: usize,
@@ -4907,7 +5307,8 @@ impl DfastMatchGenerator {
             crate::encoding::fastpath::ScalarTier,
             BORROWED,
             TAGGED,
-            MLS
+            MLS,
+            EXT
         )
     }
 

@@ -251,6 +251,14 @@ impl MatcherStorage {
         }
     }
 
+    /// Whether the backend's history may wrap as a ring once full rather than
+    /// move its window to the front (see `DfastMatchGenerator::wrap_history`).
+    fn set_ring_history(&mut self, ring: bool) {
+        if let Self::Dfast(m) = self {
+            m.set_ring(ring);
+        }
+    }
+
     /// The committed window of the owned history, oldest byte first.
     #[cfg(feature = "ldm")]
     fn committed_window(&self) -> &[u8] {
@@ -2078,6 +2086,13 @@ impl Matcher for MatchGeneratorDriver {
             self.ldm_dict_end = self.ldm_committed_end;
             self.ldm_split_block = None;
         }
+        // Long-distance matching reads the committed window as one slice, so
+        // its frames keep the history in one segment.
+        #[cfg(feature = "ldm")]
+        let one_segment = self.ldm.is_some();
+        #[cfg(not(feature = "ldm"))]
+        let one_segment = false;
+        self.storage.set_ring_history(!one_segment);
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The
