@@ -408,7 +408,7 @@ pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 /// so the largest a workspace estimate can be asked to describe. The estimate
 /// answers for whatever it is given, and shifting by more than the width of a
 /// `usize` is undefined, so a request beyond this is answered with this.
-pub(crate) const MAX_ESTIMATED_WINDOW_LOG: u8 = 30;
+pub(crate) const MAX_ESTIMATED_WINDOW_LOG: u8 = crate::common::MAX_WINDOW_LOG as u8;
 
 /// Translate a verbatim upstream `ZSTD_defaultCParameters[tier][level]` row
 /// (`cparams::CParams`) into our resolved [`LevelParams`], reproducing

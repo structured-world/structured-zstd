@@ -668,11 +668,13 @@ fn frame_history_bytes(
     let ceiling = history_ceiling(layout, max_window_size, dict_len, block);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
-    // The input and the room past it its last read may ask for.
-    let (input, read_slack) = match workspace.ingest() {
+    // The input, the room past it its last read may ask for, and whether the
+    // size is exact: an exact input of the whole window never evicts, where an
+    // advisory hint, capped at the level's window, says only "at least this".
+    let (input, read_slack, exact) = match workspace.ingest() {
         IngestPlan::Raw => return 0,
         IngestPlan::Slice(_) if in_place => return dict_len.min(ceiling),
-        IngestPlan::Slice(len) | IngestPlan::PledgedStream(len) => (Some(len), 0),
+        IngestPlan::Slice(len) | IngestPlan::PledgedStream(len) => (Some(len), 0, true),
         IngestPlan::Stream => (
             bytes.map(|bytes| {
                 let level_window_log =
@@ -680,13 +682,14 @@ fn frame_history_bytes(
                 bytes.min(1usize << level_window_log)
             }),
             block,
+            false,
         ),
     };
     match input {
         // A window stays below 2^31 and a block below 2^17, so
         // `bytes + read_slack` fits; a dictionary large enough to overflow the
         // rest is past the ceiling anyway.
-        Some(bytes) if bytes < max_window_size => dict_len
+        Some(bytes) if bytes < max_window_size || (exact && bytes == max_window_size) => dict_len
             .checked_add(bytes + read_slack)
             .map_or(ceiling, |sum| sum.min(ceiling)),
         _ => ceiling,

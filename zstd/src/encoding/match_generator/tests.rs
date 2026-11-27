@@ -1932,11 +1932,12 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
 
     // The saturated `usize::MAX` size must be clamped to the HC history
     // ceiling, not laid out literally (which would OOM/panic). Level 16 has
-    // window_log 22, so the ceiling is `window + window/4 + one block`. Assert
-    // the history actually reached it — a no-panic-only check would also pass
-    // on an under-sized history.
+    // window_log 22, so the ceiling is the one-segment room of that window.
+    // Assert the history actually reached it — a no-panic-only check would
+    // also pass on an under-sized history.
     let window = 1usize << 22;
-    let expected_history_ceiling = window + (window >> 2) + crate::common::MAX_BLOCK_SIZE as usize;
+    let expected_history_ceiling =
+        crate::encoding::ring::one_segment_room(window, crate::common::MAX_BLOCK_SIZE as usize);
     assert!(
         driver.hc_matcher().table.history.capacity() >= expected_history_ceiling,
         "huge source + dict hint must reserve the clamped HC history ceiling, got {}",
@@ -1983,6 +1984,56 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
         1000 + 1024,
         "a hinted stream adds one 1 KiB block"
     );
+}
+
+/// An input of exactly the window never slides it: no block evicts, so it lays
+/// out its bytes, not the room a sliding window drains or wraps in (three
+/// times the window for a double-fast ring).
+#[test]
+fn an_input_the_size_of_the_window_lays_out_its_bytes() {
+    use super::super::strategy::BackendTag;
+    use super::HistoryLayout;
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let window = 1usize << 18;
+    for backend in [BackendTag::Simple, BackendTag::Dfast, BackendTag::Row] {
+        for ingest in [IngestPlan::Slice(window), IngestPlan::PledgedStream(window)] {
+            let mut workspace = Workspace::new();
+            workspace.begin_layout(crate::common::MAX_BLOCK_SIZE as usize, no_trailing, ingest);
+            let bytes = super::frame_history_bytes(
+                HistoryLayout::of(backend, false),
+                &workspace,
+                false,
+                Some(window as u64),
+                0,
+                window,
+                CompressionLevel::Level(3),
+            );
+            assert_eq!(bytes, window, "{backend:?} laid out {bytes} bytes");
+        }
+        // A stream's hint is advisory and capped at the level's window, so one
+        // that reaches the window may run past it: it keeps the sliding room.
+        let mut workspace = Workspace::new();
+        workspace.begin_layout(
+            crate::common::MAX_BLOCK_SIZE as usize,
+            no_trailing,
+            IngestPlan::Stream,
+        );
+        let layout = HistoryLayout::of(backend, false);
+        let bytes = super::frame_history_bytes(
+            layout,
+            &workspace,
+            false,
+            Some(window as u64),
+            0,
+            window,
+            CompressionLevel::Level(3),
+        );
+        let ceiling = super::history_ceiling(layout, window, 0, workspace.block_for_window(window));
+        assert_eq!(
+            bytes, ceiling,
+            "a {backend:?} stream laid out {bytes} bytes"
+        );
+    }
 }
 
 /// Restoring a primed snapshot copies the block-length queue into the one the

@@ -70,12 +70,6 @@ pub(crate) struct Ring {
     pub(crate) on: bool,
 }
 
-impl Default for Ring {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Ring {
     pub(crate) const fn new() -> Self {
         Self {

@@ -219,6 +219,41 @@ fn a_dictionary_copy_without_a_block_leaves_the_tables_alone() {
     assert_eq!(matcher.position_base, base);
 }
 
+/// Trimming a wrapped history puts the window back in one segment, its older
+/// (ext) part in front of the prefix: a reader handed the window as one slice
+/// then reads the window's bytes in input order, not the prefix alone.
+#[test]
+fn trimming_a_wrapped_window_puts_it_back_in_one_segment() {
+    let mut workspace = Workspace::new();
+    let mut matcher = bound(&mut workspace, false);
+    let mut state = 0x2545_F491_u32;
+    let mut input = alloc::vec::Vec::new();
+    while matcher.ring.len == 0 {
+        let block: alloc::vec::Vec<u8> = (0..32 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        input.extend_from_slice(&block);
+        matcher.commit_input(&block);
+        assert!(input.len() < 8 << 20, "the history never wrapped");
+    }
+    let window = matcher.window_size;
+
+    matcher.trim_to_window();
+
+    assert_eq!(matcher.ring.len, 0, "the ext segment is still apart");
+    let start = matcher.history_start;
+    assert_eq!(
+        &matcher.history[start..start + window],
+        &input[input.len() - window..],
+        "the window is not in input order"
+    );
+}
+
 /// The ring mode is the frame's, not the snapshot's: a frame that keeps its
 /// history in one segment (long-distance matching reads the window as one
 /// slice) still does after restoring a dictionary snapshot that a frame with

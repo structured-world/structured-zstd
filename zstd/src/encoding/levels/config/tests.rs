@@ -296,13 +296,37 @@ fn a_window_log_beyond_the_encoders_own_maximum_is_bounded() {
     let largest = super::estimated_compression_workspace_bytes_for_run(
         CompressionLevel::Level(3),
         None,
-        Some(30),
+        Some(crate::common::MAX_WINDOW_LOG as u8),
         false,
         None,
     );
     assert_eq!(
         huge, largest,
         "a window past the maximum is the maximum, not a shift off the end of the type"
+    );
+}
+
+/// The widest window the encoder accepts is the widest the estimate answers
+/// for: a 31-bit window on a 64-bit target keeps twice the history of a 30-bit
+/// one, so answering it with the 30-bit figure under-counts what the run keeps.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn the_widest_accepted_window_is_estimated_at_its_own_size() {
+    let estimate = |log| {
+        super::estimated_compression_workspace_bytes_for_run(
+            CompressionLevel::Level(3),
+            None,
+            Some(log),
+            false,
+            None,
+        )
+    };
+    assert_eq!(crate::common::MAX_WINDOW_LOG, 31);
+    assert!(
+        estimate(31) >= estimate(30) + (1usize << 30),
+        "a 31-bit window estimated at {} against {} for 30 bits",
+        estimate(31),
+        estimate(30)
     );
 }
 
