@@ -226,6 +226,10 @@ name = "decode_loop_z000033"
 path = "../zstd/examples/decode_loop_z000033.rs"
 
 [[example]]
+name = "decode_frames"
+path = "examples/decode_frames.rs"
+
+[[example]]
 name = "zrip_compare"
 path = "examples/zrip_compare.rs"
 
