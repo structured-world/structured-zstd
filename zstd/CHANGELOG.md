@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/structured-world/structured-zstd/compare/v0.4.4...v0.5.0) - 2026-11-27
+
+### Added
+
+- *(encoding)* 2^31 windows, and long streams without moving the window ([#712](https://github.com/structured-world/structured-zstd/pull/712))
+- [**breaking**] track upstream zstd 1.6.0 ([#706](https://github.com/structured-world/structured-zstd/pull/706))
+
+### Documentation
+
+- *(readme)* ask for an AMD Zen 5 benchmark host ([#701](https://github.com/structured-world/structured-zstd/pull/701))
+
+### Performance
+
+- *(dictionary)* [**breaking**] FastCOVER training and prepared-dictionary tables ([#710](https://github.com/structured-world/structured-zstd/pull/710))
+- *(encoding)* attached dictionary tree at the CDict's hashLog ([#704](https://github.com/structured-world/structured-zstd/pull/704))
+
 ## [0.4.4](https://github.com/structured-world/structured-zstd/compare/v0.4.3...v0.4.4) - 2026-11-24
 
 ### Performance
