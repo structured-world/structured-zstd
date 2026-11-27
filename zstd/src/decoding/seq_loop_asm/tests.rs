@@ -52,6 +52,42 @@ pub(in crate::decoding) fn count_block(n: usize) {
     });
 }
 
+std::thread_local! {
+    /// Experiment: pending exits by first cause: literals past their end,
+    /// write past the overshoot end, offset below 16, match over 255, offset
+    /// past the output (dictionary or invalid), anything else.
+    static PENDING: core::cell::Cell<[u64; 6]> = const { core::cell::Cell::new([0; 6]) };
+}
+
+/// Experiment: classifies one pending exit.
+pub(in crate::decoding) fn count_pending(
+    _ll: usize,
+    ml: usize,
+    offset: usize,
+    lits_past: bool,
+    out_past: bool,
+    beyond_output: bool,
+) {
+    let cause = if lits_past {
+        0
+    } else if out_past {
+        1
+    } else if offset < 16 {
+        2
+    } else if ml > 255 {
+        3
+    } else if beyond_output {
+        4
+    } else {
+        5
+    };
+    PENDING.with(|p| {
+        let mut c = p.get();
+        c[cause] += 1;
+        p.set(c);
+    });
+}
+
 /// Counts one pass by the assembly's status (0 done, 1 boundary, 2 pending).
 pub(super) fn count_exit(status: usize) {
     EXITS.with(|exits| {
@@ -117,6 +153,10 @@ fn exits_over_a_frame_list() {
         blocks[1],
         blocks[2],
         blocks[3]
+    );
+    std::eprintln!(
+        "pending causes [lits_past, out_past, offset<16, ml>255, beyond_output, other] {:?}",
+        PENDING.with(core::cell::Cell::get)
     );
 }
 

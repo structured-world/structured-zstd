@@ -532,6 +532,15 @@ unsafe fn run_short_arm_asm<B: BufferBackend, const WORDS: bool>(
             Exit::Pending { ll, ml, offset } => (ll, ml, offset),
             Exit::Done | Exit::Boundary => break,
         };
+        #[cfg(all(test, feature = "std"))]
+        super::seq_loop_asm::tests::count_pending(
+            seq_ll as usize,
+            seq_ml as usize,
+            resolved_offset as usize,
+            *lit_cur + seq_ll as usize > literals_buffer_len,
+            cur.op + seq_ll as usize + seq_ml as usize > cur.cap_w,
+            resolved_offset as usize > cur.live() + seq_ll as usize,
+        );
         let r = execute_one_body!(
             cur,
             buffer,
