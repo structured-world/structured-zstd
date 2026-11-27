@@ -12,6 +12,52 @@ fn bound(workspace: &mut Workspace, tagged: bool) -> DfastMatchGenerator {
     matcher
 }
 
+/// Inserting a block of one repeated byte stores only its last long and last
+/// short position and leaves both tables exactly as inserting every position
+/// does: the others share those two keys and are overwritten in turn. After
+/// mixed content, in both slot formats and at every short key width.
+#[test]
+fn a_repeated_byte_block_inserts_to_the_dense_tables() {
+    let prefix: alloc::vec::Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    for tagged in [false, true] {
+        for mls in 4..=7u8 {
+            for byte in [0u8, 0x41] {
+                let mut ws_a = Workspace::new();
+                let mut ws_b = Workspace::new();
+                let build = |ws: &mut Workspace| {
+                    // The key width lays the tables out anew, so it is set
+                    // before they are bound.
+                    let mut m = DfastMatchGenerator::new(1 << 20);
+                    m.set_hash_bits(12, 11);
+                    m.set_min_match(mls);
+                    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+                    ws.open(m.tables_workspace_bytes(), usize::MAX);
+                    m.bind_tables(ws, tagged);
+                    m.commit_input(&prefix);
+                    m.insert_positions(m.history_abs_start, m.history_abs_start + prefix.len());
+                    m.commit_input(alloc::vec![byte; 5000]);
+                    m
+                };
+                let mut range = build(&mut ws_a);
+                let mut each = build(&mut ws_b);
+                let start = range.history_abs_start + prefix.len();
+                let end = start + 5000;
+                range.insert_positions(start, end);
+                for pos in start..end {
+                    each.insert_position(pos);
+                }
+                assert_eq!(
+                    range.tables.as_mut_slice().to_vec(),
+                    each.tables.as_mut_slice().to_vec(),
+                    "tagged {tagged}, mls {mls}, byte {byte:#x}"
+                );
+            }
+        }
+    }
+}
+
 /// A tagged rebase moves every position by the reducer and keeps its tag;
 /// a position at or under the reducer empties. The base moves by the
 /// reducer in position units, not in slot units.
@@ -171,4 +217,75 @@ fn a_dictionary_copy_without_a_block_leaves_the_tables_alone() {
     assert!(matcher.dict.table().is_none());
     assert_eq!(matcher.tables[5], 0x77);
     assert_eq!(matcher.position_base, base);
+}
+
+/// Trimming a wrapped history puts the window back in one segment, its older
+/// (ext) part in front of the prefix: a reader handed the window as one slice
+/// then reads the window's bytes in input order, not the prefix alone.
+#[test]
+fn trimming_a_wrapped_window_puts_it_back_in_one_segment() {
+    let mut workspace = Workspace::new();
+    let mut matcher = bound(&mut workspace, false);
+    let mut state = 0x2545_F491_u32;
+    let mut input = alloc::vec::Vec::new();
+    while matcher.ring.len == 0 {
+        let block: alloc::vec::Vec<u8> = (0..32 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        input.extend_from_slice(&block);
+        matcher.commit_input(&block);
+        assert!(input.len() < 8 << 20, "the history never wrapped");
+    }
+    let window = matcher.window_size;
+
+    matcher.trim_to_window();
+
+    assert_eq!(matcher.ring.len, 0, "the ext segment is still apart");
+    let start = matcher.history_start;
+    assert_eq!(
+        &matcher.history[start..start + window],
+        &input[input.len() - window..],
+        "the window is not in input order"
+    );
+}
+
+/// The ring mode is the frame's, not the snapshot's: a frame that keeps its
+/// history in one segment (long-distance matching reads the window as one
+/// slice) still does after restoring a dictionary snapshot that a frame with
+/// a wrapping history captured, and input past the window then drains instead
+/// of wrapping.
+#[test]
+fn a_restored_snapshot_keeps_the_frames_ring_mode() {
+    let mut snapshot_workspace = Workspace::new();
+    let mut live_workspace = Workspace::new();
+    let mut snapshot = bound(&mut snapshot_workspace, false);
+    snapshot.set_ring(true);
+    let mut live = bound(&mut live_workspace, false);
+    live.set_ring(false);
+
+    live.restore_snapshot(&mut snapshot);
+
+    assert!(
+        !live.ring.on,
+        "the restore carried the snapshot's ring mode in"
+    );
+    let mut state = 0x9E37_79B9_u32;
+    let block: alloc::vec::Vec<u8> = (0..32 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    // Three windows of input: a ring would have wrapped twice.
+    for _ in 0..96 {
+        live.commit_input(&block);
+        assert_eq!(live.ring.len, 0, "a one-segment history wrapped");
+    }
 }

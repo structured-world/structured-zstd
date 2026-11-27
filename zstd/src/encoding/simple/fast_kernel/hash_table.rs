@@ -312,11 +312,12 @@ impl FastHashTable {
     /// since it runs once per table entry and both terms are fixed for the
     /// whole slide.
     pub(crate) fn reduce_indices(&mut self, drop_n: u32) {
-        // Plain `+`: [`Self::advance_epoch`] keeps `bias <= u32::MAX - 2^31`,
-        // and `drop_n` is a length inside a history the matcher caps at
-        // `2 * max_window_size <= 2^31`, so the sum lands at `u32::MAX` at the
-        // very most. Asserted rather than assumed, because a wrap here would
-        // not fail — it would quietly resurrect dropped positions.
+        // Plain `+`: [`Self::advance_epoch`] keeps `bias + headroom` within the
+        // slot range, the headroom being the matcher's eviction cap, and
+        // `drop_n` is a length inside a history held under that cap, so the
+        // sum lands at `u32::MAX` at the very most. Asserted rather than
+        // assumed, because a wrap here would not fail — it would quietly
+        // resurrect dropped positions.
         debug_assert!(
             self.bias.checked_add(drop_n).is_some(),
             "epoch bias {} plus a {drop_n}-byte slide overflows a stored position",

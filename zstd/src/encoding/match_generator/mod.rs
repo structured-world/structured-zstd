@@ -90,6 +90,23 @@ pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 /// advance `position_base` so future inserts stay inside the `u32`
 /// window. Same scheme as `encoding/ldm/table.rs`.
 pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
+
+/// What a rebase of `u32` positions takes off every stored position for a
+/// `window`, in the dfast and long-distance tables: the guard band, or less
+/// where the window leaves less of the `u32` range above it. A rebase fires
+/// once a position passes `u32::MAX - reducer`, so the window's oldest byte
+/// then sits above `u32::MAX - reducer - window`, which this keeps above the
+/// reducer by two blocks: the whole window stays addressable through the
+/// rebase, as upstream's correction keeps every index up to `maxDist` in the
+/// past valid (`ZSTD_window_correctOverflow`). Up to a 2^30 window (and a
+/// dictionary under it) that is the guard band.
+pub(crate) fn rebase_reducer(window: usize) -> u32 {
+    // `window <= MAX_PRIMED_WINDOW_SIZE`, which leaves well over two blocks of
+    // the `u32` range above it.
+    debug_assert!(window <= super::match_table::storage::MAX_PRIMED_WINDOW_SIZE);
+    let spare = (u32::MAX as usize - window - 2 * crate::common::MAX_BLOCK_SIZE as usize) / 2;
+    spare.min(DFAST_REBASE_GUARD_BAND as usize) as u32
+}
 // `kSearchStrength` (upstream `zstd_compress_internal.h:32`). The dfast step
 // ramp grows one position every `1 << kSearchStrength` = 256 bytes travelled
 // (upstream `kStepIncr`, zstd_double_fast.c:131). A smaller value accelerates
@@ -231,6 +248,14 @@ impl MatcherStorage {
             Self::Dfast(m) => m.set_dictionary_index_floor(floor),
             Self::Row(m) => m.set_dictionary_index_floor(floor),
             Self::HashChain(m) => m.table.set_dictionary_index_floor(floor),
+        }
+    }
+
+    /// Whether the backend's history may wrap as a ring once full rather than
+    /// move its window to the front (see `DfastMatchGenerator::wrap_history`).
+    fn set_ring_history(&mut self, ring: bool) {
+        if let Self::Dfast(m) = self {
+            m.set_ring(ring);
         }
     }
 
@@ -566,9 +591,9 @@ struct PrimedKey {
 /// the history then grows to the most it ever holds, which is laid out from the
 /// start, as upstream sizes its input buffer from the window: for the Fast
 /// backend twice the window grown by the dictionary (it drains back to one
-/// window when an append would pass two), for the others that window plus the
-/// quarter of it compaction leaves behind; either way plus one pending block of
-/// the frame's size.
+/// window when an append would pass two) and a pending block, for a wrapping
+/// double-fast history its ring, for the one-segment histories the window, the
+/// dead history they drain and two blocks (`ring::one_segment_room`).
 ///
 /// A size known exactly (a slice, or a pledge the context enforces) is taken as
 /// it is, and its reads are held to what remains, so nothing past it is ever
@@ -582,31 +607,55 @@ struct PrimedKey {
 /// reaches is never written, so it is never resident: a one-byte stream through
 /// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
 /// reading, and growing it instead measured no faster.
-/// The most history `backend` keeps for a `window`-byte window with
-/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the
-/// window, the slack it slides in, and the block being read.
+/// How a frame's history slides its window, which decides the most it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HistoryLayout {
+    /// The Fast backend: twice the window, drained back to one.
+    Fast,
+    /// The double-fast backend's ring, which wraps instead of moving.
+    Ring,
+    /// One segment that drains its dead prefix: the row and tree backends,
+    /// and the double-fast backend under long-distance matching, which reads
+    /// the window as one slice.
+    OneSegment,
+}
+
+impl HistoryLayout {
+    /// The layout `backend` keeps, with or without long-distance matching.
+    pub(crate) fn of(backend: super::strategy::BackendTag, long_distance: bool) -> Self {
+        use super::strategy::BackendTag;
+        match backend {
+            BackendTag::Simple => Self::Fast,
+            BackendTag::Dfast if !long_distance => Self::Ring,
+            _ => Self::OneSegment,
+        }
+    }
+}
+
+/// The most history a `layout` keeps for a `window`-byte window with
+/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the room
+/// its commit reserves once the window slides, so a history laid out to this
+/// ceiling never moves to an allocation of its own.
 pub(crate) fn history_ceiling(
-    backend: super::strategy::BackendTag,
+    layout: HistoryLayout,
     window: usize,
     dict_len: usize,
     block: usize,
 ) -> usize {
     use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
-    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so the
-    // ceiling stays inside `usize` on a 32-bit target; a sum past `usize` is
-    // past it too.
+    // A sum past `usize` is past the ceiling too.
     let window = window
         .checked_add(dict_len)
         .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
-    let slack = match backend {
-        super::strategy::BackendTag::Simple => window,
-        _ => window >> 2,
-    };
-    window + slack + block
+    match layout {
+        HistoryLayout::Fast => crate::encoding::simple::fast_matcher::eviction_cap(window) + block,
+        HistoryLayout::Ring => crate::encoding::ring::Ring::room(window),
+        HistoryLayout::OneSegment => crate::encoding::ring::one_segment_room(window, block),
+    }
 }
 
 fn frame_history_bytes(
-    backend: super::strategy::BackendTag,
+    layout: HistoryLayout,
     workspace: &crate::encoding::workspace::Workspace,
     in_place: bool,
     hint: Option<u64>,
@@ -616,14 +665,16 @@ fn frame_history_bytes(
 ) -> usize {
     use crate::encoding::workspace::IngestPlan;
     let block = workspace.block_for_window(max_window_size);
-    let ceiling = history_ceiling(backend, max_window_size, dict_len, block);
+    let ceiling = history_ceiling(layout, max_window_size, dict_len, block);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
-    // The input and the room past it its last read may ask for.
-    let (input, read_slack) = match workspace.ingest() {
+    // The input, the room past it its last read may ask for, and whether the
+    // size is exact: an exact input of the whole window never evicts, where an
+    // advisory hint, capped at the level's window, says only "at least this".
+    let (input, read_slack, exact) = match workspace.ingest() {
         IngestPlan::Raw => return 0,
         IngestPlan::Slice(_) if in_place => return dict_len.min(ceiling),
-        IngestPlan::Slice(len) | IngestPlan::PledgedStream(len) => (Some(len), 0),
+        IngestPlan::Slice(len) | IngestPlan::PledgedStream(len) => (Some(len), 0, true),
         IngestPlan::Stream => (
             bytes.map(|bytes| {
                 let level_window_log =
@@ -631,13 +682,14 @@ fn frame_history_bytes(
                 bytes.min(1usize << level_window_log)
             }),
             block,
+            false,
         ),
     };
     match input {
         // A window stays below 2^31 and a block below 2^17, so
         // `bytes + read_slack` fits; a dictionary large enough to overflow the
         // rest is past the ceiling anyway.
-        Some(bytes) if bytes < max_window_size => dict_len
+        Some(bytes) if bytes < max_window_size || (exact && bytes == max_window_size) => dict_len
             .checked_add(bytes + read_slack)
             .map_or(ceiling, |sum| sum.min(ceiling)),
         _ => ceiling,
@@ -1758,7 +1810,7 @@ impl Matcher for MatchGeneratorDriver {
             0
         };
         let history_bytes = frame_history_bytes(
-            next_backend,
+            HistoryLayout::of(next_backend, long_distance),
             workspace,
             self.frame_in_place,
             hint,
@@ -2061,6 +2113,13 @@ impl Matcher for MatchGeneratorDriver {
             self.ldm_dict_end = self.ldm_committed_end;
             self.ldm_split_block = None;
         }
+        // Long-distance matching reads the committed window as one slice, so
+        // its frames keep the history in one segment.
+        #[cfg(feature = "ldm")]
+        let one_segment = self.ldm.is_some();
+        #[cfg(not(feature = "ldm"))]
+        let one_segment = false;
+        self.storage.set_ring_history(!one_segment);
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The

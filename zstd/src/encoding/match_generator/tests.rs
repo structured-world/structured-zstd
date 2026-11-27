@@ -1932,11 +1932,12 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
 
     // The saturated `usize::MAX` size must be clamped to the HC history
     // ceiling, not laid out literally (which would OOM/panic). Level 16 has
-    // window_log 22, so the ceiling is `window + window/4 + one block`. Assert
-    // the history actually reached it — a no-panic-only check would also pass
-    // on an under-sized history.
+    // window_log 22, so the ceiling is the one-segment room of that window.
+    // Assert the history actually reached it — a no-panic-only check would
+    // also pass on an under-sized history.
     let window = 1usize << 22;
-    let expected_history_ceiling = window + (window >> 2) + crate::common::MAX_BLOCK_SIZE as usize;
+    let expected_history_ceiling =
+        crate::encoding::ring::one_segment_room(window, crate::common::MAX_BLOCK_SIZE as usize);
     assert!(
         driver.hc_matcher().table.history.capacity() >= expected_history_ceiling,
         "huge source + dict hint must reserve the clamped HC history ceiling, got {}",
@@ -1959,7 +1960,7 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
         let mut workspace = Workspace::new();
         workspace.begin_layout(crate::common::MAX_BLOCK_SIZE as usize, no_trailing, ingest);
         super::frame_history_bytes(
-            super::super::strategy::BackendTag::Dfast,
+            super::HistoryLayout::Ring,
             &workspace,
             false,
             Some(1000),
@@ -1983,6 +1984,56 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
         1000 + 1024,
         "a hinted stream adds one 1 KiB block"
     );
+}
+
+/// An input of exactly the window never slides it: no block evicts, so it lays
+/// out its bytes, not the room a sliding window drains or wraps in (three
+/// times the window for a double-fast ring).
+#[test]
+fn an_input_the_size_of_the_window_lays_out_its_bytes() {
+    use super::super::strategy::BackendTag;
+    use super::HistoryLayout;
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let window = 1usize << 18;
+    for backend in [BackendTag::Simple, BackendTag::Dfast, BackendTag::Row] {
+        for ingest in [IngestPlan::Slice(window), IngestPlan::PledgedStream(window)] {
+            let mut workspace = Workspace::new();
+            workspace.begin_layout(crate::common::MAX_BLOCK_SIZE as usize, no_trailing, ingest);
+            let bytes = super::frame_history_bytes(
+                HistoryLayout::of(backend, false),
+                &workspace,
+                false,
+                Some(window as u64),
+                0,
+                window,
+                CompressionLevel::Level(3),
+            );
+            assert_eq!(bytes, window, "{backend:?} laid out {bytes} bytes");
+        }
+        // A stream's hint is advisory and capped at the level's window, so one
+        // that reaches the window may run past it: it keeps the sliding room.
+        let mut workspace = Workspace::new();
+        workspace.begin_layout(
+            crate::common::MAX_BLOCK_SIZE as usize,
+            no_trailing,
+            IngestPlan::Stream,
+        );
+        let layout = HistoryLayout::of(backend, false);
+        let bytes = super::frame_history_bytes(
+            layout,
+            &workspace,
+            false,
+            Some(window as u64),
+            0,
+            window,
+            CompressionLevel::Level(3),
+        );
+        let ceiling = super::history_ceiling(layout, window, 0, workspace.block_for_window(window));
+        assert_eq!(
+            bytes, ceiling,
+            "a {backend:?} stream laid out {bytes} bytes"
+        );
+    }
 }
 
 /// Restoring a primed snapshot copies the block-length queue into the one the
@@ -2030,25 +2081,37 @@ fn restoring_a_snapshot_keeps_the_block_queue_allocation() {
 }
 
 /// A stream that can fill its window lays out the window, what sliding leaves
-/// behind, and one pending block, and that block is the frame's: a target block
-/// size below the format maximum shrinks it, rather than leaving the difference
-/// laid out and never written.
+/// behind, and the pending blocks, and those blocks are the frame's: a target
+/// block size below the format maximum shrinks them, rather than leaving the
+/// difference laid out and never written. A wrapping double-fast history lays
+/// out its ring, and one kept in one segment for long-distance matching the
+/// room a one-segment history drains in.
 #[test]
 fn the_history_ceiling_takes_the_frames_block() {
+    use super::super::strategy::BackendTag;
+    use super::HistoryLayout;
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let window = 1usize << 20;
     let mut workspace = Workspace::new();
     workspace.begin_layout(1024, no_trailing, IngestPlan::Stream);
-    let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
-        &workspace,
-        false,
-        None,
-        0,
-        window,
-        CompressionLevel::Level(3),
+    let bytes = |backend, long_distance| {
+        super::frame_history_bytes(
+            HistoryLayout::of(backend, long_distance),
+            &workspace,
+            false,
+            None,
+            0,
+            window,
+            CompressionLevel::Level(9),
+        )
+    };
+    assert_eq!(bytes(BackendTag::Row, false), 2 * window + 2 * 1024);
+    assert_eq!(bytes(BackendTag::HashChain, false), 2 * window + 2 * 1024);
+    assert_eq!(bytes(BackendTag::Dfast, true), 2 * window + 2 * 1024);
+    assert_eq!(
+        bytes(BackendTag::Dfast, false),
+        crate::encoding::ring::Ring::room(window)
     );
-    assert_eq!(bytes, window + (window >> 2) + 1024);
 }
 
 /// A pledged stream's size is exact, since the context refuses any other
@@ -2073,7 +2136,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
     let mut workspace = Workspace::new();
     workspace.begin_layout(block, no_trailing, IngestPlan::PledgedStream(pledged));
     let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
+        super::HistoryLayout::Ring,
         &workspace,
         false,
         Some(pledged as u64),
@@ -2087,7 +2150,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
     let mut workspace = Workspace::new();
     workspace.begin_layout(block, no_trailing, IngestPlan::Stream);
     let bytes = super::frame_history_bytes(
-        super::super::strategy::BackendTag::Dfast,
+        super::HistoryLayout::Ring,
         &workspace,
         false,
         Some(pledged as u64),
@@ -4464,6 +4527,101 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     );
 }
 
+/// The sequences the double-fast level finds in `data` at a 2^18 window in
+/// 32 KiB blocks, the stream checked to rebuild from them, and whether the
+/// history held an ext segment after any block; `ring` off keeps the history
+/// in one segment.
+fn dfast_ring_sequences(data: &[u8], ring: bool) -> (Vec<(usize, usize, usize)>, bool) {
+    let overrides = crate::encoding::CompressionParameters::builder(CompressionLevel::Level(3))
+        .window_log(18)
+        .build()
+        .unwrap()
+        .overrides();
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
+    driver.set_param_overrides(Some(overrides));
+    driver.reset(CompressionLevel::Level(3));
+    driver.storage.set_ring_history(ring);
+    let mut out = Vec::with_capacity(data.len());
+    let mut sequences = Vec::new();
+    let mut wrapped = false;
+    let mut consumed = 0usize;
+    while consumed < data.len() {
+        // Blocks well under the window, so the ext segment outlives several
+        // of them after a wrap and is searched.
+        let take = (data.len() - consumed).min(32 << 10);
+        let block = &data[consumed..consumed + take];
+        driver.commit_input(block);
+        consumed += take;
+        let mut replay = BlockReplay::new(block);
+        driver.start_matching(|seq| {
+            sequences.push(match seq {
+                Sequence::Triple {
+                    literal_len,
+                    offset,
+                    match_len,
+                } => (literal_len, offset, match_len),
+                Sequence::Literals { len } => (len, 0, 0),
+            });
+            replay.apply(&mut out, seq);
+        });
+        if let MatcherStorage::Dfast(m) = &driver.storage {
+            wrapped |= m.ring.len != 0;
+        }
+    }
+    assert_eq!(out, data, "ring {ring}: the stream does not rebuild");
+    (sequences, wrapped)
+}
+
+/// The double-fast history kept as a ring finds what one kept in a single
+/// segment finds: the window holds the same bytes either way. A stream past
+/// one ring capacity at a 2^18 window, with runs copied from up to a window
+/// back so matches reach into the ext segment and across its end. Catches a
+/// candidate read off the wrong segment, a match counted short or long across
+/// the seam, and a position left in the ext segment hashed from the wrong
+/// bytes.
+#[test]
+fn dfast_ring_history_finds_what_one_segment_finds() {
+    const WORDS: [&[u8]; 12] = [
+        b"lorem ",
+        b"ipsum ",
+        b"dolor ",
+        b"sit ",
+        b"amet, ",
+        b"tempor ",
+        b"magna ",
+        b"aliqua ",
+        b"veniam ",
+        b"nostrud ",
+        b"ullamco ",
+        b"laboris\n",
+    ];
+    let mut data = Vec::with_capacity(1_200_000);
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as usize
+    };
+    while data.len() < 1_100_000 {
+        let r = next();
+        if r % 7 == 0 && data.len() > 260_000 {
+            let back = 1 + next() % 250_000;
+            let len = 16 + next() % 600;
+            let from = data.len() - back;
+            for i in 0..len {
+                data.push(data[from + i]);
+            }
+        } else {
+            data.extend_from_slice(WORDS[r % WORDS.len()]);
+        }
+    }
+    let (ring, wrapped) = dfast_ring_sequences(&data, true);
+    assert!(wrapped, "the history never wrapped");
+    let (one, _) = dfast_ring_sequences(&data, false);
+    assert!(ring == one, "the ring found other sequences");
+}
+
 #[test]
 fn hc_compact_history_drains_when_threshold_crossed() {
     let mut hc = HcMatchGenerator::new(8);
@@ -5348,6 +5506,40 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
         unpacked, trigger_abs,
         "post-rebase pack/unpack must round-trip the absolute position"
     );
+}
+
+/// Under a window wider than the range a full guard band leaves (2^31 and a
+/// quarter of it for a dictionary), the dfast rebase takes off less, so a
+/// position as old as the window survives it in both tables: rebased by the
+/// guard band, the window's oldest byte would have dropped to the empty
+/// sentinel and a match the window allows would be lost.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn dfast_rebase_keeps_a_window_past_2_30() {
+    for window in [1usize << 31, (1usize << 31) + (1 << 29)] {
+        let mut dfast = DfastMatchGenerator::new(window);
+        dfast.set_hash_bits(10, 10);
+        dfast.ensure_hash_tables();
+        // The first position the rebase fires at, and the oldest one a match
+        // from there may still reach.
+        let reducer = super::rebase_reducer(window) as usize;
+        let trigger_abs = (u32::MAX as usize) - reducer + 1;
+        let oldest = trigger_abs - window;
+        let oldest_packed = dfast.pack_slot(oldest);
+        let short0 = dfast.long_len();
+        dfast.tables[short0] = oldest_packed;
+        dfast.tables[0] = oldest_packed;
+        dfast.ensure_room_for(trigger_abs);
+        assert_eq!(dfast.position_base, reducer, "a {window}-byte window");
+        for slot in [dfast.tables[0], dfast.tables[short0]] {
+            assert_ne!(slot, DFAST_EMPTY_SLOT, "a {window}-byte window");
+            assert_eq!(
+                dfast.position_base + slot as usize - 1,
+                oldest,
+                "a {window}-byte window: its oldest position survives the rebase"
+            );
+        }
+    }
 }
 
 #[test]

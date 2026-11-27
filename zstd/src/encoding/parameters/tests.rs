@@ -297,8 +297,10 @@ fn ldm_knob_implies_enable() {
 
 #[test]
 fn out_of_bounds_window_log_rejected() {
+    // One past `ZSTD_WINDOWLOG_MAX` (31 on a 64-bit target, 30 on a 32-bit one).
+    let past = crate::common::MAX_WINDOW_LOG + 1;
     let err = CompressionParameters::builder(CompressionLevel::Default)
-        .window_log(31)
+        .window_log(past)
         .build()
         .unwrap_err();
     match err {
@@ -306,9 +308,42 @@ fn out_of_bounds_window_log_rejected() {
             parameter, value, ..
         } => {
             assert_eq!(parameter, CParameter::WindowLog);
-            assert_eq!(value, 31);
+            assert_eq!(value, i64::from(past));
         }
     }
+    // The widest window itself is taken.
+    assert!(
+        CompressionParameters::builder(CompressionLevel::Default)
+            .window_log(crate::common::MAX_WINDOW_LOG)
+            .build()
+            .is_ok()
+    );
+}
+
+/// The long-distance hash rate reaches `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`
+/// (25 on a 64-bit target, 24 on a 32-bit one), the value the automatic
+/// derivation gives at the widest window and smallest hash, and stops there.
+#[test]
+fn ldm_hash_rate_log_bound_follows_the_widest_window() {
+    let max = crate::common::MAX_WINDOW_LOG - 6;
+    assert_eq!(
+        CParameter::LdmHashRateLog.bounds().upper_bound,
+        i64::from(max)
+    );
+    assert!(
+        CompressionParameters::builder(CompressionLevel::Default)
+            .enable_long_distance_matching(true)
+            .ldm_hash_rate_log(max)
+            .build()
+            .is_ok()
+    );
+    assert!(
+        CompressionParameters::builder(CompressionLevel::Default)
+            .enable_long_distance_matching(true)
+            .ldm_hash_rate_log(max + 1)
+            .build()
+            .is_err()
+    );
 }
 
 #[test]
@@ -346,11 +381,16 @@ fn ldm_bounds_only_checked_when_enabled() {
 
 #[test]
 fn bounds_match_c_reference() {
+    // `ZSTD_WINDOWLOG_MAX`: 31 on a 64-bit target, 30 on a 32-bit one.
     assert_eq!(
         CParameter::WindowLog.bounds(),
         Bounds {
             lower_bound: 10,
-            upper_bound: 30
+            upper_bound: if cfg!(target_pointer_width = "64") {
+                31
+            } else {
+                30
+            }
         }
     );
     assert_eq!(

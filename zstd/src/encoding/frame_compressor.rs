@@ -1327,6 +1327,15 @@ pub(crate) fn optimal_block_size(
     )
 }
 
+/// Span of input over which `savings` accumulates before it starts again
+/// from zero: upstream's multi-threaded job (`ZSTDMT_computeTargetJobLog`,
+/// `2^max(20, windowLog + 2)` held to 2^30), whose fresh context begins its
+/// own `consumedSrcSize - producedCSize`. That is the path the zstd CLI
+/// takes by default, one worker included.
+pub(crate) fn savings_span(window_size: u64) -> u64 {
+    (window_size * 4).clamp(1 << 20, 1 << 30)
+}
+
 /// Size of the next block to cut from `block`, given the pre-split level
 /// already resolved for the frame (`None` = never split, only full blocks).
 ///
@@ -2424,6 +2433,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         }
         let guard = ClearBorrowedOnDrop(&mut self.state);
         let mut start = 0usize;
+        let span = savings_span(guard.0.matcher.window_size());
+        // Input offset and output length where the current savings span began.
+        let (mut span_index, mut span_in, mut span_out) = (0u64, 0usize, blocks_start);
         while start < input.len() {
             reserve_for_next_block(
                 out,
@@ -2439,7 +2451,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // incompressible input keep the full 128 KiB). The borrowed window
             // already spans the whole input, so a smaller block is just a
             // narrower `(block_start, block_end)` range into it.
-            let savings = start as i64 - (out.len() - blocks_start) as i64;
+            if start as u64 / span != span_index {
+                (span_index, span_in, span_out) = (start as u64 / span, start, out.len());
+            }
+            let savings = (start - span_in) as i64 - (out.len() - span_out) as i64;
             let block_len = optimal_block_size_with(
                 pre_split,
                 &input[start..],
@@ -3256,6 +3271,8 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         let mut total_uncompressed: u64 = 0;
         let mut reached_eof = false;
         let mut savings = 0i64;
+        let span = savings_span(self.state.matcher.window_size());
+        let mut span_index = 0u64;
         // The matcher's history was laid out for the whole frame when the
         // context was (`frame_history_bytes`), so the blocks read into it below
         // never reallocate it.
@@ -3286,6 +3303,11 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 reached_eof = eof;
             }
             let available = self.state.matcher.uncommitted_input().len();
+            let block_start = total_uncompressed - available as u64;
+            if block_start / span != span_index {
+                span_index = block_start / span;
+                savings = 0;
+            }
             let mut last_block = reached_eof;
             let remaining_for_split = if reached_eof {
                 available

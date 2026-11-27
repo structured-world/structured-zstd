@@ -19,7 +19,7 @@ use crate::error::{ZSTD_ErrorCode, encode};
 /// "unknown", the default for every new frame.
 pub(crate) const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 
-// `ZSTD_cParameter` discriminants (vendored `zstd.h` v1.5.7). The C enum
+// `ZSTD_cParameter` discriminants (vendored `zstd.h` v1.6.0). The C enum
 // arrives over the ABI as a plain `int`; wrappers match on these constants.
 pub(crate) const ZSTD_C_COMPRESSION_LEVEL: c_int = 100;
 pub(crate) const ZSTD_C_WINDOW_LOG: c_int = 101;

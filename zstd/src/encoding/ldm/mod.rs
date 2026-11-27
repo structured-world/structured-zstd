@@ -29,12 +29,12 @@
 //! (`enable_long_distance_matching`), `ZSTD_c_enableLongDistanceMatching`
 //! through the C ABI, and `zstd --long[=N]`.
 //!
-//! Upstream zstd parity anchors:
-//! * `lib/compress/zstd_ldm.c` v1.5.7
+//! Upstream zstd sources (1.6.0):
+//! * `lib/compress/zstd_ldm.c`
 //! * `lib/compress/zstd_ldm.h`
 //! * `lib/compress/zstd_ldm_geartab.h` — the 256 × `u64` permutation
-//!   table reproduced verbatim in [`gear_hash::GEAR_TAB`] to preserve
-//!   byte-for-byte split-point compatibility.
+//!   table reproduced verbatim in [`gear_hash::GEAR_TAB`], so split points
+//!   land where upstream's do.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -175,7 +175,8 @@ impl LdmProducer {
                 let mut hasher = XxHash64::with_seed(LDM_XXH64_SEED);
                 hasher.write(&live_history[split_idx..split_idx + min_match]);
                 let xxhash = hasher.finish();
-                self.hash_table.ensure_room_for(split_abs);
+                self.hash_table
+                    .ensure_room_for(split_abs, 1usize << self.params.window_log);
                 self.hash_table.insert_absolute(
                     (xxhash as u32) & hash_id_mask,
                     split_abs,
@@ -340,7 +341,8 @@ impl LdmProducer {
                 // rebase scheme — see `table.rs`); ensure room
                 // before every insert so streams beyond
                 // `u32::MAX` rebase transparently.
-                self.hash_table.ensure_room_for(split_abs);
+                self.hash_table
+                    .ensure_room_for(split_abs, 1usize << self.params.window_log);
 
                 // Upstream zstd `zstd_ldm.c:420-426`: if this split would
                 // emit a sequence overlapping the previous one,

@@ -2,14 +2,11 @@
 //! producer.
 //!
 //! Implements the per-split candidate selection from upstream zstd
-//! `ZSTD_ldm_generateSequences_internal` (`zstd_ldm.c:405-466`)
-//! v1.5.7, **prefix-only path**. The two-segment `extDict`
-//! variant (upstream zstd `ZSTD_count_2segments` +
-//! `ZSTD_ldm_countBackwardsMatch_2segments`) is deferred — the
-//! current Rust encoder does not surface a separate `extDict`
-//! buffer, so every byte the producer can reach lives in a
-//! single contiguous `history` slice and the prefix-only path
-//! is bit-for-bit equivalent to upstream zstd on those inputs.
+//! `ZSTD_ldm_generateSequences_internal` (`zstd_ldm.c`, zstd 1.6.0),
+//! **prefix-only path**: every byte the producer can reach lives in one
+//! contiguous `history` slice, so upstream's two-segment `extDict`
+//! variant (`ZSTD_count_2segments` +
+//! `ZSTD_ldm_countBackwardsMatch_2segments`) has no input to run on here.
 //!
 //! Upstream zstd parity anchors:
 //! * `ZSTD_count`                        → [`super::super::match_table::helpers::common_prefix_len`]

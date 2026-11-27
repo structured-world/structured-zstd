@@ -1,8 +1,10 @@
 //! Decoders for the frame formats zstd wrote before 1.0: v0.5, v0.6 and v0.7.
 //!
-//! libzstd 1.5.7 reads these by default (upstream's legacy level 5 in every
-//! build system), so a consumer that holds an archive from 2016 gets its
-//! content back from `ZSTD_decompress`; this module gives the same answer.
+//! libzstd builds before 1.6.0 read these by default (legacy level 5); 1.6.0
+//! turns legacy support off by default and keeps it as a build option, as the
+//! `legacy` feature is here. With it on, a consumer that holds an archive from
+//! 2016 gets its content back from `ZSTD_decompress`, as from a libzstd built
+//! with legacy support.
 //! The formats differ from RFC 8878 and from each other in their headers,
 //! literal and sequence coding, and dictionaries: each has its own module,
 //! and what they share lives here and in [`entropy`].

@@ -1,6 +1,6 @@
 //! `zstd` command-line interface with upstream-compatible flag dispatch.
 //!
-//! The argument model mirrors upstream zstd v1.5.7: mode + level FLAGS (not
+//! The argument model mirrors upstream zstd v1.6.0: mode + level FLAGS (not
 //! subcommands), `argv[0]` dispatch (`unzstd` / `zstdcat` change the default
 //! mode), stdin/stdout streaming, `-r` / `--filelist` / `--output-dir-*` file
 //! selection, the `ZSTD_CLEVEL` / `ZSTD_NBTHREADS` environment, the `-q` /
@@ -5548,7 +5548,7 @@ struct ArchiveSummary {
     /// Whether any data frame carries a content checksum.
     ///
     /// That is the question the reference tool's `Check` column answers, not
-    /// whether every frame carries one: zstd 1.5.7 prints `XXH64` for an
+    /// whether every frame carries one: zstd 1.6.0 prints `XXH64` for an
     /// archive of one checksummed and one unchecked frame — in either order —
     /// and `None` only when no frame has one. Reporting a mixed state here
     /// would say something true about the archive in a column scripts read as
@@ -5601,7 +5601,7 @@ fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
     let mut offset = 0u64;
     // `Frames` counts every frame in the file and `Skips` says how many of them
     // were skippable, which is how the reference tool fills these columns:
-    // zstd 1.5.7 prints `Frames 3, Skips 1` for an archive of two data frames
+    // zstd 1.6.0 prints `Frames 3, Skips 1` for an archive of two data frames
     // around one metadata frame. Reporting 2 and 1 for that file would read as
     // four frames to anyone adding the columns up.
     let mut frames = 0u64;

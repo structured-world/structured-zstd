@@ -115,6 +115,11 @@ pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     /// bytes produced so far in this frame; the block pre-splitter only cuts
     /// full blocks once the frame has saved enough.
     savings: i64,
+    /// Input bytes this frame's blocks have carried out so far, and the
+    /// savings span (`savings_span`) they last reached; `savings` starts
+    /// again from zero in each span.
+    emitted: u64,
+    savings_span_index: u64,
     /// Whether the frame has written a compressed-path block yet: its first
     /// is never rewritten as RLE once searched (upstream `isFirstBlock`).
     block_written: bool,
@@ -469,6 +474,8 @@ impl<M: Matcher> CompressionContext<M> {
             content_size_flag: true,
             bytes_consumed: 0,
             savings: 0,
+            emitted: 0,
+            savings_span_index: 0,
             block_written: false,
             tuning: FrameTuning::default(),
             dict_params: Default::default(),
@@ -1222,6 +1229,8 @@ impl<M: Matcher> CompressionContext<M> {
             self.state.fse_tables.of_previous = None;
         }
         self.savings = 0;
+        self.emitted = 0;
+        self.savings_span_index = 0;
         self.block_written = false;
         #[cfg(feature = "hash")]
         {
@@ -1325,6 +1334,7 @@ impl<M: Matcher> CompressionContext<M> {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             return self.pending_len();
         }
+        self.enter_savings_span();
         let pending = self.state.matcher.uncommitted_input();
         let window = pending.len();
         let cut = crate::encoding::frame_compressor::optimal_block_size_with(
@@ -1344,6 +1354,19 @@ impl<M: Matcher> CompressionContext<M> {
             }
         } else {
             cut
+        }
+    }
+
+    /// Starts the savings over when the next block opens a new savings span
+    /// (`frame_compressor::savings_span`). Run for every block that saves
+    /// anything, flushed ones included, so a block's savings count in the span
+    /// it starts in, and before the pre-split, which reads them.
+    fn enter_savings_span(&mut self) {
+        let span =
+            crate::encoding::frame_compressor::savings_span(self.state.matcher.window_size());
+        if self.emitted / span != self.savings_span_index {
+            self.savings_span_index = self.emitted / span;
+            self.savings = 0;
         }
     }
 
@@ -1428,6 +1451,7 @@ impl<M: Matcher> CompressionContext<M> {
             header.serialize(&mut self.encoded_scratch);
             return drain.write_all(&self.encoded_scratch);
         }
+        self.enter_savings_span();
         let dict_active =
             self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
         compress_block_encoded::<M, K>(
@@ -1453,6 +1477,7 @@ impl<M: Matcher> CompressionContext<M> {
         // `savings` counts the block header too, as upstream's
         // `ZSTD_compress_frameChunk` does (`cSize` includes it).
         self.savings += block_len as i64 - self.encoded_scratch.len() as i64;
+        self.emitted += block_len as u64;
         #[cfg(feature = "hash")]
         if self.content_checksum {
             self.hasher.write(self.state.matcher.get_last_space());

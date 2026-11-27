@@ -1038,7 +1038,7 @@ fn streaming_buffer_abi_sizes() {
 
 #[test]
 fn c_param_bounds_cover_stable_set() {
-    // Every stable v1.5.7 cParameter discriminant must report bounds.
+    // Every stable v1.6.0 cParameter discriminant must report bounds.
     for param in [
         100, 101, 102, 103, 104, 105, 106, 107, 130, 160, 161, 162, 163, 164, 200, 201, 202, 400,
         401, 402,

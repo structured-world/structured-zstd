@@ -207,6 +207,11 @@ struct RowScan<const MLS: u32 = 0> {
     base: *const u8,
     len: usize,
     hist_start: usize,
+    /// The window's base in position space, `base - hist_start`: the byte at
+    /// a position `abs` is `base_v + abs`, one add of the position the search
+    /// already carries (upstream `base + matchIndex`). Points outside the
+    /// history; only ever offset back into it by a window position.
+    base_v: *const u8,
     /// Block-constant search parameters hoisted with the view so the hot
     /// loops never re-read them through `&mut self`: the salt of the live
     /// row hash, the match-distance bound (upstream `maxDist`), the lowest
@@ -763,9 +768,9 @@ macro_rules! row_find_best_match {
     ($m:expr, $ctx:ident, $t:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let hist_start = $ctx.hist_start;
         let cur_idx = $abs_pos - hist_start;
-        // SAFETY: the parse searches only positions >= 16 bytes before the
-        // block end, so `cur_idx + 16 <= $ctx.len`.
-        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
+        // The parse searches only positions >= 16 bytes before the block end,
+        // so `cur_idx + 16 <= $ctx.len`.
+        let cur_ptr = $ctx.base_v.wrapping_add($abs_pos);
         let limit = $ctx.len - cur_idx;
         let row_entries = 1usize << $rl;
         let row_mask = row_entries - 1;
@@ -859,7 +864,7 @@ macro_rules! row_find_best_match {
                     // SAFETY: prefetch is a hint; the candidate lies in the live
                     // history.
                     unsafe {
-                        _mm_prefetch($ctx.base.add(raw as usize - hist_start).cast(), _MM_HINT_T0);
+                        _mm_prefetch($ctx.base_v.wrapping_add(raw as usize).cast(), _MM_HINT_T0);
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
@@ -875,12 +880,12 @@ macro_rules! row_find_best_match {
         for i in 0..n {
             // SAFETY: the first `n` entries were written above.
             let raw = unsafe { buf.get_unchecked(i).assume_init() };
-            let cand_idx = raw as usize - hist_start;
-            // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
-            // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
-            // loop at `ml == limit`), so both reads stay inside `concat`.
+            // SAFETY: the candidate precedes the cursor in the window; the gate
+            // reads 4 bytes at `+ ml - 3` where `ml + 1 <= limit` (the count
+            // breaks out of the loop at `ml == limit`), so both reads stay
+            // inside `concat`.
             unsafe {
-                let cand_ptr = $ctx.base.add(cand_idx);
+                let cand_ptr = $ctx.base_v.wrapping_add(raw as usize);
                 let gate = if (raw as usize) >= prefix_start {
                     rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
@@ -1048,9 +1053,8 @@ macro_rules! hc_find_best_match {
         let hist_start = $ctx.hist_start;
         let chain_mask = $chain.chain_mask;
         let cur_idx = p - hist_start;
-        // SAFETY: the parse searches only positions >= 16 bytes before the
-        // block end.
-        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
+        // The parse searches only positions >= 16 bytes before the block end.
+        let cur_ptr = $ctx.base_v.wrapping_add(p);
         let limit = $ctx.len - cur_idx;
         // The caller keeps at least `ROW_HASH_KEY_LEN` bytes after a chained
         // position, and the hash fits `hash_bits`.
@@ -1109,7 +1113,7 @@ macro_rules! hc_find_best_match {
             // SAFETY: `cand < p`; the gate reads 4 bytes at `+ ml - 3` with
             // `ml + 1 <= limit` (the count breaks out at `ml == limit`).
             unsafe {
-                let cand_ptr = $ctx.base.add(cand - hist_start);
+                let cand_ptr = $ctx.base_v.wrapping_add(cand);
                 let gate = if cand >= prefix_start {
                     rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3))
                 } else {
@@ -1765,11 +1769,11 @@ macro_rules! lazy_parse_body {
                 let mut off = 0usize;
                 let mut start = ip + 1;
                 {
-                    let base = scan.base;
+                    let base = scan.base_v;
                     // SAFETY: `ip + 1 + 4 <= block_end` (`ip < ilimit`), and
                     // `offset_1 <= max_rep` keeps the rep source in history.
                     unsafe {
-                        let cur = base.add(ip + 1 - hist_start);
+                        let cur = base.wrapping_add(ip + 1);
                         if rep_ok(ip + 1, offset_1) && rd32(cur.sub(offset_1)) == rd32(cur) {
                             match_length =
                                 $cpl(cur.add(4).sub(offset_1), cur.add(4), block_end - (ip + 5))
@@ -1818,10 +1822,10 @@ macro_rules! lazy_parse_body {
                         while ip < ilimit {
                             ip += 1;
                             {
-                                let base = scan.base;
+                                let base = scan.base_v;
                                 // SAFETY: `ip + 4 <= block_end`, `offset_1 <= max_rep`.
                                 unsafe {
-                                    let cur = base.add(ip - hist_start);
+                                    let cur = base.wrapping_add(ip);
                                     if rep_ok(ip, offset_1) && rd32(cur) == rd32(cur.sub(offset_1))
                                     {
                                         let ml_rep = $cpl(
@@ -1866,10 +1870,10 @@ macro_rules! lazy_parse_body {
                             if depth == 2 && ip < ilimit {
                                 ip += 1;
                                 {
-                                    let base = scan.base;
+                                    let base = scan.base_v;
                                     // SAFETY: as above.
                                     unsafe {
-                                        let cur = base.add(ip - hist_start);
+                                        let cur = base.wrapping_add(ip);
                                         if rep_ok(ip, offset_1)
                                             && rd32(cur) == rd32(cur.sub(offset_1))
                                         {
@@ -1933,8 +1937,8 @@ macro_rules! lazy_parse_body {
                     while start > anchor
                         && start - off > m_start
                         && unsafe {
-                            *scan.base.add(start - 1 - hist_start)
-                                == *scan.base.add(start - 1 - off - hist_start)
+                            *scan.base_v.wrapping_add(start - 1)
+                                == *scan.base_v.wrapping_add(start - 1 - off)
                         }
                     {
                         start -= 1;
@@ -1984,10 +1988,10 @@ macro_rules! lazy_parse_body {
                 // Immediate repcode: `offset_2` right after the stored match,
                 // swapping the two reps on every hit.
                 while ip <= ilimit && rep_ok(ip, offset_2) {
-                    let base = scan.base;
+                    let base = scan.base_v;
                     // SAFETY: `ip + 4 <= block_end`, `offset_2 <= max_rep`.
                     let rep_len = unsafe {
-                        let cur = base.add(ip - hist_start);
+                        let cur = base.wrapping_add(ip);
                         if rd32(cur) != rd32(cur.sub(offset_2)) {
                             break;
                         }
@@ -3361,14 +3365,14 @@ impl RowMatchGenerator {
             // parked, it serves the next frame, which commits it at the front
             // again.
             self.dict_keep.park(&mut self.dict);
-            // Cap the history near the live window: once eviction starts, grow
-            // it linearly to (window + window/4 + one block) rather than
-            // doubling; `compact_history`'s quarter-window drain keeps the
-            // length under it. Small frames that never fill the window stay
-            // data-sized.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
+            // Cap the history once eviction starts: grow it linearly to the
+            // most it holds rather than doubling past it; `compact_history`'s
+            // drain keeps the length under it. Small frames that never fill the
+            // window stay data-sized.
+            let target = crate::encoding::ring::one_segment_room(
+                self.max_window_size,
+                crate::encoding::ring::largest_block(self.max_window_size),
+            );
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
@@ -3917,17 +3921,17 @@ impl RowMatchGenerator {
         if self.history_start == 0 {
             return;
         }
-        // Drain the (unreachable) dead prefix once it reaches a quarter window
-        // so the buffer stays near `window + window/4` rather than growing to
-        // ~2x window before the old full-window trigger fired. Paired with the
-        // one-time `reserve_exact` in `commit_block`, this keeps the buffer at
-        // a fixed ~1.25x-window capacity on long streams. The drain memmoves
-        // the live window, so a quarter-window trigger bounds the write
-        // amplification (~4x the eviction stride) while closing most of the
-        // peak gap. Compare against the COMMITTED length: `history.len()` also
-        // counts bytes no block has claimed yet, which would delay the trigger
-        // by however much input happens to be read ahead.
-        if self.history_start >= (self.max_window_size >> 2)
+        // Drain the (unreachable) dead prefix once it reaches a whole window
+        // (`one_segment_drain`): the drain memmoves the live window, so this
+        // copies one byte per input byte, in the room `commit_block` reserves.
+        // The window stays one segment, as each of the zstd CLI's job sections
+        // is, so the search reads every candidate off one base with no segment
+        // test; a ring would pay that test on every candidate, which costs a
+        // search this heavy more than the copy.
+        // Compare against the COMMITTED length: `history.len()` also counts
+        // bytes no block has claimed yet, which would delay the trigger by
+        // however much input happens to be read ahead.
+        if self.history_start >= crate::encoding::ring::one_segment_drain(self.max_window_size)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain_front(self.history_start);
@@ -4116,6 +4120,7 @@ impl RowMatchGenerator {
             base: history.as_ptr(),
             len: history.len(),
             hist_start: self.history_abs_start,
+            base_v: history.as_ptr().wrapping_sub(self.history_abs_start),
             salt: self.hash_salt,
             search_window: self.search_window,
             low_limit: self.low_limit,
@@ -4645,9 +4650,52 @@ impl RowMatchGenerator {
     }
 
     fn insert_positions<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
-        for pos in start..end {
+        // A range of one repeated byte to the end of the live bytes (a block
+        // written as RLE unsearched): every position in it with eight bytes
+        // ahead hashes to the same row and tag, so the walk only turns that
+        // row's head round and overwrites its slots, and the last `row_mask`
+        // inserts rewrite every slot the head cycles through. Turning the head
+        // by the inserts skipped and making those last ones leaves the row
+        // exactly as the whole walk does.
+        let row_mask = (1usize << ROW_LOG) - 1;
+        // Up to here every position has eight bytes ahead and hashes them
+        // whole; the last few hash four (`key_hash_raw`), a key of their own,
+        // and are inserted one by one after the shortcut, in their order.
+        let whole_key_end = (self.history_abs_start + self.live_history().len() + 1)
+            .saturating_sub(8)
+            .min(end);
+        let mut pos = start;
+        if whole_key_end > start + row_mask && start >= self.history_abs_start {
+            let from = start - self.history_abs_start;
+            if crate::encoding::repeated_byte(&self.live_history()[from..]).is_some()
+                && let Some((row, tag)) = self.hash_and_row(whole_key_end - 1)
+            {
+                self.turn_row_head::<ROW_LOG>(row, whole_key_end - start - row_mask);
+                for pos in whole_key_end - row_mask..whole_key_end {
+                    self.insert_at::<ROW_LOG>(pos, row, tag);
+                }
+                pos = whole_key_end;
+            }
+        }
+        for pos in pos..end {
             self.insert_position::<ROW_LOG>(pos);
         }
+    }
+
+    /// Turn `row`'s head as `steps` inserts would, writing nothing else: after
+    /// the first step the head cycles through the row's `row_mask` slots.
+    fn turn_row_head<const ROW_LOG: usize>(&mut self, row: usize, steps: usize) {
+        if steps == 0 {
+            return;
+        }
+        let row_mask = (1usize << ROW_LOG) - 1;
+        let row_base = row << ROW_LOG;
+        let mut head = self.row_tags()[row_base] as usize;
+        head = next_row_slot(head, row_mask);
+        for _ in 0..(steps - 1) % row_mask {
+            head = next_row_slot(head, row_mask);
+        }
+        self.row_tags_mut()[row_base] = head as u8;
     }
 
     fn insert_positions_with_step<const ROW_LOG: usize>(
@@ -5398,6 +5446,9 @@ mod rebase_tests;
 
 #[cfg(test)]
 mod layout_tests;
+
+#[cfg(test)]
+mod uniform_tests;
 
 #[cfg(all(
     test,

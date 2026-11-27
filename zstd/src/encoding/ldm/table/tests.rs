@@ -236,7 +236,7 @@ fn ensure_room_for_rebases_above_guard_band() {
     // u32::MAX - REBASE_GUARD_BAND + 1 = the smallest abs
     // that triggers a rebase.
     let trigger_pos = (u32::MAX as usize) - (REBASE_GUARD_BAND as usize) + 1;
-    t.ensure_room_for(trigger_pos);
+    t.ensure_room_for(trigger_pos, 1 << 27);
     assert_eq!(
         t.position_base(),
         REBASE_GUARD_BAND as usize,
@@ -280,7 +280,7 @@ fn ensure_room_for_loops_across_multiple_guard_bands() {
     // A second reduce brings rel = 3 * REBASE_GUARD_BAND ≤
     // max_rel and the loop exits.
     let abs_pos = 5usize * (REBASE_GUARD_BAND as usize);
-    t.ensure_room_for(abs_pos);
+    t.ensure_room_for(abs_pos, 1 << 27);
     let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
     assert!(
         abs_pos - t.position_base() <= max_rel,
@@ -292,6 +292,36 @@ fn ensure_room_for_loops_across_multiple_guard_bands() {
     // The subsequent insert must succeed (no u32 overflow).
     t.insert_absolute(0, abs_pos, 0xFEED);
     assert_eq!(t.resolve(&t.bucket(0)[0]), Some(abs_pos));
+}
+
+/// Under a window wider than the range a full guard band leaves (2^31 and a
+/// quarter of it for a dictionary), the rebase takes off less, so a position
+/// as old as the window survives it: rebased by the guard band, the window's
+/// oldest byte would have fallen to the empty sentinel.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn ensure_room_for_keeps_a_window_past_2_30_through_the_rebase() {
+    for window in [1usize << 31, (1usize << 31) + (1 << 29)] {
+        let mut t = LdmHashTable::new(4, 2);
+        // The first position the rebase fires at.
+        let reducer = crate::encoding::match_generator::rebase_reducer(window) as usize;
+        let trigger_pos = (u32::MAX as usize) - reducer + 1;
+        // The oldest position a match from the trigger may still reach.
+        let oldest = trigger_pos - window;
+        t.insert_absolute(0, oldest, 0xAAAA);
+        t.ensure_room_for(trigger_pos, window);
+        assert!(
+            t.position_base() > 0,
+            "a {window}-byte window: the position must have rebased"
+        );
+        assert_eq!(
+            t.resolve(&t.bucket(0)[0]),
+            Some(oldest),
+            "a {window}-byte window: its oldest position survives the rebase"
+        );
+        t.insert_absolute(2, trigger_pos, 0xCAFE);
+        assert_eq!(t.resolve(&t.bucket(2)[0]), Some(trigger_pos));
+    }
 }
 
 /// `insert_absolute` must panic in BOTH debug and release

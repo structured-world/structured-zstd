@@ -46,8 +46,8 @@ fn parse_skippable_frame_borrows_or_refuses() {
 }
 
 fn build_expected_skippable(magic_variant: u8, payload: &[u8]) -> Vec<u8> {
-    // Upstream zstd `ZSTD_writeSkippableFrame` (zstd v1.5.7
-    // `lib/compress/zstd_compress.c:4751-4763`) emits exactly
+    // Upstream zstd `ZSTD_writeSkippableFrame` (`lib/compress/zstd_compress.c`,
+    // zstd 1.6.0) emits exactly
     // `4-byte LE magic || 4-byte LE size || payload`. Mirror that
     // here as the byte-parity oracle. Re-implementing the upstream zstd
     // layout in the test (rather than calling out to zstd-sys)

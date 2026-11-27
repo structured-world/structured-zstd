@@ -274,14 +274,12 @@ impl Bounds {
 
 impl CParameter {
     /// Inclusive value bounds for this parameter, mirroring
-    /// `ZSTD_cParam_getBounds`. Window/hash/chain logs cap at 30 (the
-    /// encoder's match-finder ceiling) rather than the 31 C allows on
-    /// 64-bit, because the back-reference history is indexed with `u32`
-    /// positions over a `2 * window` eviction band.
+    /// `ZSTD_cParam_getBounds`: the window log reaches 31 on a 64-bit target
+    /// and 30 on a 32-bit one, as upstream's `ZSTD_WINDOWLOG_MAX` does.
     pub const fn bounds(self) -> Bounds {
         let (lower_bound, upper_bound) = match self {
-            // ZSTD_WINDOWLOG_MIN .. encoder ceiling.
-            Self::WindowLog => (10, 30),
+            // ZSTD_WINDOWLOG_MIN .. ZSTD_WINDOWLOG_MAX.
+            Self::WindowLog => (10, crate::common::MAX_WINDOW_LOG as i64),
             // ZSTD_HASHLOG_MIN .. ZSTD_HASHLOG_MAX.
             Self::HashLog => (6, 30),
             // ZSTD_CHAINLOG_MIN .. ZSTD_CHAINLOG_MAX (64-bit).
@@ -303,7 +301,7 @@ impl CParameter {
             // ZSTD_LDM_BUCKETSIZELOG_MIN .. ZSTD_LDM_BUCKETSIZELOG_MAX.
             Self::LdmBucketSizeLog => (1, 8),
             // ZSTD_LDM_HASHRATELOG_MIN .. ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN.
-            Self::LdmHashRateLog => (0, 24),
+            Self::LdmHashRateLog => (0, crate::common::MAX_WINDOW_LOG as i64 - 6),
         };
         Bounds {
             lower_bound,
@@ -951,7 +949,7 @@ impl CompressionParametersBuilder {
         Ok(CompressionParameters {
             level: self.level,
             overrides: ParamOverrides {
-                // `window_log` is bounds-checked at <= 30, so the cast is lossless.
+                // `window_log` is bounds-checked at <= 31, so the cast is lossless.
                 window_log: self.window_log.map(|v| v as u8),
                 hash_log: self.hash_log,
                 chain_log: self.chain_log,

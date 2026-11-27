@@ -80,10 +80,7 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // here is read-only, so the borrow of the matcher's history coexists with
     // the `window_size()` probe.
     let bytes = &state.matcher.uncommitted_input()[..block_len];
-    let uniform_byte = bytes
-        .first()
-        .copied()
-        .filter(|f| bytes.iter().all(|x| x == f));
+    let uniform_byte = crate::encoding::repeated_byte(bytes);
     // With the raw skip on, a block of one repeated byte goes out as RLE
     // unsearched. Off, it is searched like any other and only then written as
     // RLE, as upstream does (`searched_rle_byte`).
@@ -403,7 +400,7 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     // Same order as the owned path, cheapest question first: the whole-block
     // grid is asked last and only about blocks the classifier already called
     // incompressible.
-    let uniform = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
+    let uniform = crate::encoding::repeated_byte(block).is_some();
     // As on the owned path: RLE unsearched with the raw skip on, searched
     // first with it off.
     let is_rle = uniform && raw_skip_enabled;

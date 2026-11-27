@@ -2985,27 +2985,33 @@ fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
     assert_eq!(bench_decode_settings(&free, None).max_window, 1 << 29);
 }
 
-/// Decoding takes the decoder's widest window by `--long=N`, past what the
-/// encoder writes, as the reference command's `-d --long=31` does on a 64-bit
-/// build; compressing still stops at what this build writes.
+/// `--long=N` and `--zstd=wlog=N` take the widest window the format allows
+/// on this target, compressing and decoding alike, as the reference command's
+/// `--long=31` does on a 64-bit build, and refuse one past it either way.
 #[test]
 #[cfg(target_pointer_width = "64")]
-fn decoding_takes_the_decoders_widest_window_log() {
+fn long_takes_the_widest_window_log_both_ways() {
     use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
 
     let widest = MAX_DECODER_WINDOW_SIZE.ilog2();
-    assert!(
-        widest > max_window_log(),
-        "the decoder reaches past the encoder"
+    assert_eq!(widest, 31);
+    assert_eq!(
+        max_window_log(),
+        widest,
+        "the encoder writes the decoder's widest window"
     );
-    let long = format!("--long={widest}");
-    let wlog = format!("--zstd=wlog={widest}");
-    for flag in [&long, &wlog] {
-        let opts = parse(&["-d", flag, "f.zst"]).unwrap();
+    for flag in [format!("--long={widest}"), format!("--zstd=wlog={widest}")] {
+        let opts = parse(&["-d", &flag, "f.zst"]).unwrap();
         assert_eq!(decode_window_ceiling(&opts), MAX_DECODER_WINDOW_SIZE);
-        assert!(parse(&[flag, "f"]).is_err(), "{flag} compressing");
+        assert!(parse(&[&flag, "f"]).is_ok(), "{flag} compressing");
     }
-    assert!(parse(&["-d", &format!("--long={}", widest + 1), "f.zst"]).is_err());
+    for flag in [
+        format!("--long={}", widest + 1),
+        format!("--zstd=wlog={}", widest + 1),
+    ] {
+        assert!(parse(&["-d", &flag, "f.zst"]).is_err(), "{flag} decoding");
+        assert!(parse(&[&flag, "f"]).is_err(), "{flag} compressing");
+    }
 }
 
 /// A frame past the ceiling is refused with the reference command's message,

@@ -3707,9 +3707,7 @@ pub(crate) fn encode_offset(len: u32) -> (u8, u32, usize) {
 }
 
 fn all_bytes_identical(literals: &[u8]) -> bool {
-    literals
-        .first()
-        .is_some_and(|&first| literals.iter().all(|&byte| byte == first))
+    crate::encoding::repeated_byte(literals).is_some()
 }
 
 fn write_uncompressed_literals_header(

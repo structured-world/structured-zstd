@@ -36,8 +36,9 @@
 //!   the buffer is rebased to position 0 and `prefix_start_index`
 //!   resets to 1, making the first retained byte (`history[0]`)
 //!   unmatchable — small ratio cost, accepted for sentinel safety.
-//! - The committed history is bounded by `2 × max_window_size` once a
-//!   block is committed. See [`FastKernelMatcher::commit_block`].
+//! - The committed history is bounded by [`eviction_cap`] (two windows, at
+//!   most the `u32` position range) once a block is committed. See
+//!   [`FastKernelMatcher::commit_block`].
 //! - `rep[0..2]` is the functional repcode state: the kernel's
 //!   two-deep stack, overwritten from `FastBlockResult.rep` after every
 //!   `start_matching`, and what the NEXT block's kernel probes against.
@@ -54,7 +55,7 @@
 
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
-use crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
+use crate::encoding::match_table::storage::{FAST_HISTORY_LIMIT, MAX_PRIMED_WINDOW_SIZE};
 use crate::encoding::workspace::HistoryBuf;
 
 use super::fast_kernel::hash_table::{
@@ -160,9 +161,21 @@ const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 #[cfg(target_arch = "x86")]
 const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
 
-/// Positions a bare table keeps free above its epoch bias: the eviction band,
-/// two windows at the `window_log <= 30` ceiling.
-const MAX_EPOCH_HEADROOM: usize = 1 << 31;
+/// The history the Fast backend keeps for a `max_window_size` window before
+/// it drains: two windows, cut at [`FAST_HISTORY_LIMIT`] so every position
+/// stays a `u32`. Up to a 2^30 window that is the two windows; at 2^31 the
+/// drain comes a block short of the position range. It is also what a bare
+/// table keeps free above its epoch bias for the frame ahead. (Upstream holds
+/// one window and a block in a ring and searches its two segments, so it
+/// never moves the window; the drain here moves one window per window of
+/// input.)
+pub(crate) fn eviction_cap(max_window_size: usize) -> usize {
+    // `max_window_size <= MAX_PRIMED_WINDOW_SIZE`: on a 64-bit target the
+    // double is far inside `usize`, and on a 32-bit one that ceiling is half
+    // the `u32` range less a block, so it fits there too.
+    debug_assert!(max_window_size <= MAX_PRIMED_WINDOW_SIZE);
+    (2 * max_window_size).min(FAST_HISTORY_LIMIT)
+}
 
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
@@ -589,19 +602,13 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
-        // Kernel indices are `u32`. `commit_block` lets history grow
-        // up to `2 * max_window_size` before draining (upstream zstd parity
-        // for the eager-eviction band), so `max_window_size` is
-        // capped at 2^30 to keep that band ≤ 2^31 < `u32::MAX` and
-        // prevent any `history.len()` from tripping the kernel's
-        // `data.len() > u32::MAX` panic. Upstream zstd's
-        // `ZSTD_WINDOWLOG_MAX_64` is 30 for the same reason — we
-        // mirror it.
+        // Kernel indices are `u32`: `commit_block` drains the history at
+        // `eviction_cap`, which holds every position of the widest window
+        // (upstream `ZSTD_WINDOWLOG_MAX`) inside that range.
         assert!(
-            window_log <= 30,
-            "FastKernelMatcher requires window_log <= 30 (got {window_log}); \
-             2 * (1 << 30) is the eviction-band ceiling that keeps history \
-             length below the kernel's u32::MAX input bound"
+            u32::from(window_log) <= crate::common::MAX_WINDOW_LOG,
+            "FastKernelMatcher requires window_log <= {} (got {window_log})",
+            crate::common::MAX_WINDOW_LOG,
         );
         // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         // Sentinel-0 protection comes from prefix_start_index =
@@ -665,11 +672,11 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
-        // Same window_log cap as `with_params` — see there for why
-        // the ceiling is 30, not 31.
+        // Same window_log cap as `with_params`.
         assert!(
-            window_log <= 30,
-            "FastKernelMatcher requires window_log <= 30 (got {window_log})"
+            u32::from(window_log) <= crate::common::MAX_WINDOW_LOG,
+            "FastKernelMatcher requires window_log <= {} (got {window_log})",
+            crate::common::MAX_WINDOW_LOG,
         );
         // Bytes an abandoned frame read but never claimed are not part of the
         // next frame; drop them before anything measures the history.
@@ -740,7 +747,8 @@ impl FastKernelMatcher {
             // its hashes stay valid and the per-frame re-hash is skipped
             // (CDict-equivalent).
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
-            self.hash_table.advance_epoch(span, MAX_EPOCH_HEADROOM);
+            self.hash_table
+                .advance_epoch(span, eviction_cap(primed_window));
             // Re-borrow: the dictionary bytes from the previous frame are still
             // resident at the front of history (`[0, region)`), so keep them in
             // place instead of clearing + re-committing — the per-frame dict
@@ -762,7 +770,7 @@ impl FastKernelMatcher {
                 debug_assert!(primed_window <= MAX_PRIMED_WINDOW_SIZE);
                 2 * primed_window + crate::common::MAX_BLOCK_SIZE as usize
             } else {
-                MAX_EPOCH_HEADROOM
+                eviction_cap(primed_window)
             };
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
             self.hash_table.advance_epoch(span, headroom);
@@ -806,8 +814,9 @@ impl FastKernelMatcher {
             // Bump the eviction window by the dict size (exactly as
             // `prime_with_dictionary`, clamped to MAX_PRIMED_WINDOW_SIZE) so the
             // resident dict + the next input both stay in the window. Base is
-            // `1 << window_log` (<= 2^30 < MAX_PRIMED_WINDOW_SIZE), so headroom
-            // cannot underflow and the sum cannot overflow — no `saturating_*`.
+            // `1 << window_log`, at most the widest window, which
+            // MAX_PRIMED_WINDOW_SIZE holds by a compile-time assertion, so the
+            // headroom cannot underflow and the sum cannot overflow.
             let headroom = crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE
                 - self.max_window_size;
             self.max_window_size += region.min(headroom);
@@ -1072,29 +1081,27 @@ impl FastKernelMatcher {
             self.uncommitted_len,
         );
         // Eager window eviction: drop the oldest window bytes NOW if this
-        // block would push the window past upstream zstd's `2 ×
-        // max_window_size` soft cap. The drain moves the uncommitted tail
-        // down with the window, so the block keeps its place right after it.
+        // block would push the history past `eviction_cap`. The drain moves
+        // the uncommitted tail down with the window, so the block keeps its
+        // place right after it.
         // Eviction operates on REAL data length. Post-M8 there is no dummy
         // prefix at the head of `history`, so `real_len` is just the window
         // length minus the `HISTORY_DRAIN_BASE` sentinel-slot offset.
         let real_len = self.committed_len().saturating_sub(HISTORY_DRAIN_BASE);
-        // Plain `*`: `max_window_size` starts at `1 << window_log` (window_log
-        // <= 30 from `with_params`/`reset`) but dictionary priming widens it,
-        // always capped via `.min(MAX_PRIMED_WINDOW_SIZE)` where
-        // `MAX_PRIMED_WINDOW_SIZE = (u32::MAX - MAX_BLOCK_SIZE) / 2`. So
-        // `cap = max_window_size * 2 <= u32::MAX - MAX_BLOCK_SIZE < u32::MAX`
-        // by construction — fits usize on 32-bit targets. (The `saturating_sub`
-        // above stays: it is a real floor at the sentinel slot.)
-        let cap = self.max_window_size * 2;
+        // `max_window_size` starts at `1 << window_log` and dictionary priming
+        // widens it, always capped at `MAX_PRIMED_WINDOW_SIZE`, so the cap
+        // holds a full window and a block and stays inside the `u32` position
+        // range. (The `saturating_sub` above stays: it is a real floor at the
+        // sentinel slot.)
+        let cap = eviction_cap(self.max_window_size);
         // Hard precondition: caller must split blocks into pieces no
-        // larger than `2 × max_window_size`. Without this, the
-        // eviction math below can't keep post-append history under
-        // the advertised cap (retain_real saturates to 0 but the
-        // full block still appends, violating the invariant).
+        // larger than the cap. Without this, the eviction math below can't
+        // keep post-append history under the advertised cap (retain_real
+        // saturates to 0 but the full block still appends, violating the
+        // invariant).
         assert!(
             len <= cap,
-            "FastKernelMatcher requires block_size <= 2 × max_window_size \
+            "FastKernelMatcher requires block_size <= the eviction cap \
              (block={len}, cap={cap})",
         );
         // Subtraction, not `real_len + len > cap`: the assert above
@@ -1104,18 +1111,13 @@ impl FastKernelMatcher {
         // would overflow usize on 32-bit targets before the comparison.
         let mut evicted = 0;
         if real_len > cap - len {
-            // Compute how many real bytes to KEEP, then drop the
-            // delta. Pre-fix code naively kept `max_window_size`
-            // regardless of incoming block size — for a committed
-            // block larger than `max_window_size` that left
-            // `real_len + space.len() > 2 × max_window_size`,
-            // violating the docstring invariant.
-            //
-            // Post-fix: retained = (cap - space.len()) clamped to
-            // [0, max_window_size]. When the incoming block alone
-            // exceeds cap, retained = 0 (no historical context kept,
-            // but the cap is still as close as we can get without
-            // truncating the caller's block).
+            // Compute how many real bytes to KEEP, then drop the delta:
+            // retained = (cap - len) clamped to [0, max_window_size], so the
+            // history after the append stays within the cap even for a block
+            // larger than the window. When the incoming block alone exceeds
+            // the cap, retained = 0 (no historical context kept, but the cap
+            // is still as close as we can get without truncating the caller's
+            // block).
             let retain_real = cap.saturating_sub(len).min(self.max_window_size);
             let drop_n = real_len.saturating_sub(retain_real);
             if drop_n > 0 {
@@ -1200,9 +1202,8 @@ impl FastKernelMatcher {
         // prefix floor reverts to the windowed value (upstream zstd
         // `ZSTD_window_enforceMaxDist` zeroing `loadedDictEnd`).
         self.loaded_dict_end = 0;
-        // `drop_n` is a length inside `history`, which the window ceiling
-        // (`window_log <= 30`, retained at most `2 * max_window_size`) keeps
-        // under 2^31.
+        // `drop_n` is a length inside `history`, which `eviction_cap` keeps
+        // inside the `u32` range.
         self.hash_table.reduce_indices(drop_n as u32);
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
     }
@@ -1213,11 +1214,11 @@ impl FastKernelMatcher {
     ///
     /// The block is already in place at the end of the window, and the
     /// window was already trimmed for it at commit: when the retained bytes
-    /// would exceed `2 × max_window_size`, the oldest are dropped back down to
-    /// a `max_window_size` tail and the hash table's stored positions slide
+    /// would exceed [`eviction_cap`], the oldest are dropped back down to a
+    /// `max_window_size` tail and the hash table's stored positions slide
     /// down by the same amount ([`Self::drain_real_prefix`], upstream zstd
-    /// `ZSTD_reduceIndex`). One eviction every `max_window_size` of input:
-    /// amortised constant.
+    /// `ZSTD_reduceIndex`). One eviction every `eviction_cap - max_window_size`
+    /// of input: amortised constant.
     fn take_staged_block(&mut self) -> usize {
         let len = self
             .staged_block
@@ -2227,6 +2228,34 @@ impl FastKernelMatcher {
         }
 
         let base = self.history.as_ptr();
+        // A range of one repeated byte (a block written as RLE unsearched):
+        // every position in it whose hash read stays inside it has the same
+        // key, so dense indexing stores to one slot again and again and only
+        // its last position is left there. The seam positions below it read
+        // other bytes and are indexed as ever; then that last position alone,
+        // which leaves the table exactly as the dense walk does.
+        if step == 1
+            && range_start <= last_hashable
+            && crate::encoding::repeated_byte(&self.history[range_start..history_len]).is_some()
+        {
+            if backfill_start < range_start {
+                self.prime_hash_table_stepped_dispatch(
+                    move |pos: usize| base.wrapping_add(pos),
+                    backfill_start,
+                    range_start - 1,
+                    0,
+                    1,
+                );
+            }
+            self.prime_hash_table_stepped_dispatch(
+                move |pos: usize| base.wrapping_add(pos),
+                last_hashable,
+                last_hashable,
+                0,
+                1,
+            );
+            return;
+        }
         // Owned path: history offsets are already the flat `[dict][input]`
         // coordinate (input is appended after the dict in `history`), so no
         // virtual rebase is needed.
