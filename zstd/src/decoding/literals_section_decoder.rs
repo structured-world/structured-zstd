@@ -197,7 +197,20 @@ fn pad_with_slack<L: ByteScratch>(
     needs_slack: bool,
 ) -> Result<LiteralsView<'_>, DecompressLiteralsError> {
     if needs_slack {
-        target.resize(base + n + WILDCOPY_OVERLENGTH, 0);
+        // A fixed-size write, which compiles to a couple of vector stores; a
+        // `resize` to the same length calls libc `memset` for a variable count.
+        let len = base + n;
+        debug_assert_eq!(target.len(), len);
+        target.reserve(WILDCOPY_OVERLENGTH);
+        // SAFETY: `reserve` leaves room for the slack past `len`, and the
+        // write initialises every byte `set_len` exposes.
+        unsafe {
+            target
+                .as_mut_ptr()
+                .add(len)
+                .write_bytes(0, WILDCOPY_OVERLENGTH);
+            target.set_len(len + WILDCOPY_OVERLENGTH);
+        }
     }
     Ok(LiteralsView {
         data: &target.as_slice()[base..],
