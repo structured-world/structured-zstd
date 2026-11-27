@@ -1124,14 +1124,19 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // one value where a counter and the sum were two, so the loop keeps
         // its state in registers. Above 1 while the counter is below the sum.
         let mut remaining = probability_sum as i32 + 1;
-        while remaining > 1 {
-            let max_remaining_value = remaining as u32;
-            let bits_to_read = highest_bit_set(max_remaining_value);
-
+        // The field width and its half, upstream's `nbBits` and `threshold`:
+        // `threshold <= remaining < 2 * threshold` throughout, so both change
+        // only when a nonzero probability takes `remaining` below
+        // `threshold`, which keeps the width off the per-symbol dependency
+        // chain (a `lzcnt` and two shifts a symbol otherwise).
+        let mut bits_to_read = u32::from(self.accuracy_log) + 1;
+        let mut threshold = probability_sum as i32;
+        loop {
+            debug_assert!(threshold <= remaining && remaining < 2 * threshold);
             let unchecked_value = read_field!(bits_to_read as usize) as u32;
 
-            let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
-            let mask = (1 << (bits_to_read - 1)) - 1;
+            let low_threshold = (2 * threshold - 1 - remaining) as u32;
+            let mask = (threshold - 1) as u32;
             let small_value = unchecked_value & mask;
 
             let value = if small_value < low_threshold {
@@ -1160,6 +1165,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                     // probability -1 counts as 1; `value >= 0`, so it is -1.
                     debug_assert!(prob == -1);
                     remaining -= 1;
+                }
+                if remaining < threshold {
+                    // `threshold >= 2` while `remaining > 1`, so the end of
+                    // the table always lands here.
+                    if remaining <= 1 {
+                        break;
+                    }
+                    bits_to_read = highest_bit_set(remaining as u32);
+                    threshold = 1 << (bits_to_read - 1);
                 }
             } else {
                 // SAFETY: `probs` has room for `max_symbols + ZERO_CHUNK`
