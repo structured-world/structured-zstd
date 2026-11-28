@@ -39,6 +39,11 @@ const _: () = assert!(
 /// below that the history fits in L2/L3 and the hardware prefetcher
 /// handles short/medium offsets; engaging the ring is pure overhead.
 ///
+/// `offsets_long_share` is asked only when the history is long enough for it
+/// to matter, as upstream asks for it only past the same window
+/// (`ZSTD_decompressBlock_internal`): the caller passes a walk of the table
+/// the block decodes with, which a small frame then never runs.
+///
 /// Single source of truth for both the K-generic dispatcher and the
 /// per-tier x86 monoliths so the two paths can't diverge.
 #[inline]
@@ -46,7 +51,7 @@ pub(crate) fn compute_use_long_pipeline(
     num_sequences: usize,
     ddict_is_cold: bool,
     total_history: usize,
-    offsets_long_share: u32,
+    offsets_long_share: impl FnOnce() -> u32,
 ) -> bool {
     #[cfg(target_pointer_width = "64")]
     const MIN_LONG_OFFSET_SHARE: u32 = 7;
@@ -56,7 +61,7 @@ pub(crate) fn compute_use_long_pipeline(
     num_sequences >= ADVANCE * 2
         && (ddict_is_cold
             || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
-                && offsets_long_share >= MIN_LONG_OFFSET_SHARE))
+                && offsets_long_share() >= MIN_LONG_OFFSET_SHARE))
 }
 
 /// Cold per-block sequence-stream setup, returned by [`init_sequence_stream`].
@@ -181,12 +186,10 @@ where
         Some(sum) => sum,
         None => usize::MAX,
     };
-    let use_long_pipeline = compute_use_long_pipeline(
-        num_sequences,
-        ddict_is_cold,
-        total_history,
-        fse.offsets_long_share,
-    );
+    let use_long_pipeline =
+        compute_use_long_pipeline(num_sequences, ddict_is_cold, total_history, || {
+            compute_offsets_long_share(of_src)
+        });
 
     Ok(SeqStreamSetup {
         br,
@@ -775,9 +778,7 @@ pub const OF_MAX_LOG: u8 = 8;
 /// `MIN_LONG_OFFSET_SHARE` (7 on 64-bit, 20 on 32-bit) in the
 /// pipeline-gate decision.
 ///
-/// Called only when the offsets table is actually rebuilt (FSE /
-/// Predefined modes in `maybe_update_fse_tables`). Repeat-mode
-/// blocks reuse the cached value in `FSEScratch::offsets_long_share`.
+/// Called by the pipeline gate only past its history threshold.
 pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u32 {
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
@@ -882,7 +883,6 @@ pub(crate) fn maybe_update_fse_tables(
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::RLE => {
             vprintln!("Use RLE of table");
@@ -900,19 +900,13 @@ pub(crate) fn maybe_update_fse_tables(
             // handles this axis uniformly (no separate RLE fallback).
             scratch.offsets.build_rle(of_source[0]);
             scratch.offsets.enrich_for_offsets();
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            // Default OF distribution → cached table read in place. The share
-            // is taken from the constant rather than from the cache: reading it
-            // there would probe the `OnceLock` on a path that otherwise never
-            // touches the table, and the pipeline gate would then pay two
-            // probes per block for this one axis.
+            // Default OF distribution → cached table read in place.
             #[cfg(feature = "std")]
             {
-                scratch.mark_of_predefined(predefined_of_table().0);
-                scratch.offsets_long_share = PREDEFINED_OF_LONG_SHARE;
+                scratch.mark_of_predefined(predefined_of_table());
             }
             #[cfg(not(feature = "std"))]
             {
@@ -920,7 +914,6 @@ pub(crate) fn maybe_update_fse_tables(
                     .offsets
                     .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
                 scratch.offsets.enrich_for_offsets();
-                scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
                 scratch.mark_of_local();
             }
         }
@@ -1075,27 +1068,18 @@ pub(crate) fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
 }
 
 #[cfg(feature = "std")]
-pub(crate) fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
+pub(crate) fn predefined_of_table() -> &'static crate::fse::SeqFSETable {
     use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<(AlignedFSETable, u32)> = OnceLock::new();
-    let cache = CACHED.get_or_init(|| {
+    static CACHED: OnceLock<AlignedFSETable> = OnceLock::new();
+    CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
             .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
-        let share = compute_offsets_long_share(&t);
-        (t.into(), share)
-    });
-    (&cache.0, cache.1)
+        t.into()
+    })
 }
-
-/// Long-offset share of the predefined offsets table. That table is built from
-/// a distribution fixed by the format, so the share it yields is fixed too, and
-/// naming it here keeps the Predefined arm from resolving the cached table just
-/// to read one number. A test pins it against the builder.
-#[cfg(feature = "std")]
-const PREDEFINED_OF_LONG_SHARE: u32 = 48;
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
 const ML_DEFAULT_ACC_LOG: u8 = 6;

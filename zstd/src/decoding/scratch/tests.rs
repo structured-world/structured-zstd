@@ -6,7 +6,7 @@ fn init_from_dict_marks_fse_ddict_is_cold() {
     // The first dictionary a scratch attaches is cold: upstream's
     // `ZSTD_decompressBegin_usingDDict` finds no dictionary end in its context,
     // and the first sequence-section decode of the frame engages the prefetch
-    // pipeline regardless of `offsets_long_share`.
+    // pipeline regardless of the long-offset share.
     extern crate std;
     let dict_raw =
         std::fs::read("./dict_tests/dictionary").expect("dictionary fixture should load");
@@ -142,8 +142,8 @@ fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
     );
 }
 
-/// Every frame reset writes the table sources, the long-offset share, the
-/// frame count and the cold flag. Spread over two cache lines they cost small
+/// Every frame reset writes the table sources, the frame count and the cold
+/// flag. Spread over two cache lines they cost small
 /// frames a line per frame in a decoder whose scratch falls out of cache
 /// between frames (small random frames decoded 2-3% slower that way).
 #[test]
@@ -153,7 +153,6 @@ fn the_fields_a_frame_reset_touches_share_one_cache_line() {
     let ends = [
         offset_of!(FSEScratch, of_source) + core::mem::size_of::<SeqTableSource>(),
         offset_of!(FSEScratch, ml_source) + core::mem::size_of::<SeqTableSource>(),
-        offset_of!(FSEScratch, offsets_long_share) + core::mem::size_of::<u32>(),
         offset_of!(FSEScratch, ddict_is_cold) + core::mem::size_of::<bool>(),
         offset_of!(FSEScratch, frame) + core::mem::size_of::<u32>(),
     ];

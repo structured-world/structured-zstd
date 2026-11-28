@@ -7,7 +7,7 @@ mod long_pipeline;
 /// table must be byte-identical to the table the rebuild path would
 /// produce on the next call. If the cache ever drifts from the
 /// rebuild output (different `decode` entries, different
-/// `accuracy_log`, different `offsets_long_share` for OF) the
+/// `accuracy_log`, a different long-offset share for OF) the
 /// dispatch in `maybe_update_fse_tables` would silently decode
 /// against a stale table — the bench delta would still look fine
 /// but cross-validation against the upstream zstd would diverge on the
@@ -84,12 +84,13 @@ fn predefined_fse_caches_match_rebuild_output() {
         .unwrap();
     of_rebuild.enrich_for_offsets();
     let of_rebuild_share = compute_offsets_long_share(&of_rebuild);
-    let (of_cached, of_cached_share) = predefined_of_table();
+    let of_cached = predefined_of_table();
     assert_eq!(of_rebuild.accuracy_log, of_cached.accuracy_log);
     assert_eq!(of_rebuild.decode().len(), of_cached.decode().len());
     assert_eq!(
-        of_rebuild_share, of_cached_share,
-        "OF offsets_long_share mismatch"
+        of_rebuild_share,
+        compute_offsets_long_share(of_cached),
+        "OF long-offset share mismatch"
     );
     for (i, (a, b)) in of_rebuild
         .decode()
@@ -253,7 +254,7 @@ mod compute_use_long_pipeline_tests {
             ADVANCE * 2 - 1,
             true,
             HISTORY_THRESHOLD + 1,
-            u32::MAX
+            || u32::MAX
         ));
     }
 
@@ -261,7 +262,7 @@ mod compute_use_long_pipeline_tests {
     fn cold_dict_forces_long_pipeline_at_min_seq_count() {
         // At the `ADVANCE * 2` boundary, `ddict_is_cold == true` is a
         // sufficient override — history / share are not read.
-        assert!(compute_use_long_pipeline(ADVANCE * 2, true, 0, 0));
+        assert!(compute_use_long_pipeline(ADVANCE * 2, true, 0, || 0));
     }
 
     #[test]
@@ -271,7 +272,7 @@ mod compute_use_long_pipeline_tests {
             ADVANCE * 2,
             false,
             HISTORY_THRESHOLD,
-            MIN_SHARE,
+            || MIN_SHARE,
         ));
     }
 
@@ -282,7 +283,7 @@ mod compute_use_long_pipeline_tests {
             ADVANCE * 2,
             false,
             HISTORY_THRESHOLD + 1,
-            MIN_SHARE,
+            || MIN_SHARE,
         ));
     }
 
@@ -294,7 +295,7 @@ mod compute_use_long_pipeline_tests {
             ADVANCE * 2,
             false,
             HISTORY_THRESHOLD + 1,
-            MIN_SHARE - 1,
+            || MIN_SHARE - 1,
         ));
     }
 
@@ -306,7 +307,7 @@ mod compute_use_long_pipeline_tests {
             ADVANCE * 2,
             false,
             usize::MAX,
-            MIN_SHARE,
+            || MIN_SHARE,
         ));
     }
 }
@@ -577,19 +578,9 @@ mod init_sequence_stream_tests {
 mod predefined_table_source_tests {
     use super::super::super::scratch::FSEScratch;
     use super::super::{
-        PREDEFINED_OF_LONG_SHARE, maybe_update_fse_tables, predefined_ll_table,
-        predefined_ml_table, predefined_of_table,
+        maybe_update_fse_tables, predefined_ll_table, predefined_ml_table, predefined_of_table,
     };
     use crate::blocks::sequence_section::SequencesHeader;
-
-    /// The Predefined arm reads the long-offset share from a constant so it
-    /// does not have to resolve the cached table for one number. That constant
-    /// is only safe while it equals what the builder produces from the
-    /// format's own distribution, which is what this pins.
-    #[test]
-    fn the_named_long_share_matches_the_table_the_builder_produces() {
-        assert_eq!(PREDEFINED_OF_LONG_SHARE, predefined_of_table().1);
-    }
 
     /// A Predefined-mode axis must READ the process-wide cached default table,
     /// not copy it into the per-frame scratch: the table is immutable and the
@@ -608,11 +599,8 @@ mod predefined_table_source_tests {
         assert_eq!(bytes_read, 0);
 
         assert!(core::ptr::eq(fse.ll_table(None), predefined_ll_table()));
-        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table().0));
+        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table()));
         assert!(core::ptr::eq(fse.ml_table(None), predefined_ml_table()));
-        // The cache also supplies the long-offset share, so the gate does not
-        // re-walk the table.
-        assert_eq!(fse.offsets_long_share, predefined_of_table().1);
     }
 
     /// Repeat mode means "keep the previous block's table", which for an axis
@@ -631,7 +619,7 @@ mod predefined_table_source_tests {
         maybe_update_fse_tables(&repeat, &[], &mut fse).unwrap();
 
         assert!(core::ptr::eq(fse.ll_table(None), predefined_ll_table()));
-        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table().0));
+        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table()));
         assert!(core::ptr::eq(fse.ml_table(None), predefined_ml_table()));
     }
 }
