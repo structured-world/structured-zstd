@@ -778,7 +778,12 @@ pub const OF_MAX_LOG: u8 = 8;
 /// `MIN_LONG_OFFSET_SHARE` (7 on 64-bit, 20 on 32-bit) in the
 /// pipeline-gate decision.
 ///
-/// Called by the pipeline gate only past its history threshold.
+/// Called by the pipeline gate only past its history threshold. Cold and out
+/// of line: the gate sits in the per-tier sequence monoliths, and a table walk
+/// inlined there shares the hot loop's register allocation for a path a small
+/// window never runs.
+#[cold]
+#[inline(never)]
 pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u32 {
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
