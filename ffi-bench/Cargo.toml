@@ -222,6 +222,10 @@ name = "decode_loop_dict"
 path = "../zstd/examples/decode_loop_dict.rs"
 
 [[example]]
+name = "raw_copy_variants"
+path = "../zstd/examples/raw_copy_variants.rs"
+
+[[example]]
 name = "dict_decode_offsets"
 path = "../zstd/examples/dict_decode_offsets.rs"
 

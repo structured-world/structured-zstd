@@ -13,7 +13,11 @@ STRUCTURED_ZSTD_DUMP_DICT_DIR="$dumps" STRUCTURED_ZSTD_BENCH_LEVEL_FILTER=level_
   cargo bench -q -p ffi-bench --bench compare_ffi --target "$target" -- '^nomatch$' > dump.txt 2>&1 || { cat dump.txt; exit 1; }
 cargo build -q --profile bench -p ffi-bench --target "$target" --example dict_decode_offsets
 bin="target/$target/release/examples/dict_decode_offsets"
+cargo build -q --profile bench -p ffi-bench --target "$target" --example raw_copy_variants
+copies="target/$target/release/examples/raw_copy_variants"
 for level in level_11_lazy level_12_lazy level_13_lazy; do
   echo "=== $level"
   "$bin" "$dumps/small-10k-random.dict" 10240 20000 "$dumps/small-10k-random.$level" 64
+  echo "=== copies $level"
+  "$copies" 10240 20000 "$dumps/small-10k-random.$level" 64
 done
