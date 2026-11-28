@@ -643,13 +643,21 @@ impl CpuKernel for Avx2Kernel {
 
     // 32-bit glibc's `memcpy` runs in SSE2/SSSE3 bodies: a 10 KiB copy took
     // 1.2-1.5x this loop's time on Intel and Zen 3 hosts, and on Zen 4 2-3x,
-    // depending on where its buffers sat (hosted EPYC 9V74 runners).
+    // depending on where its buffers sat (hosted EPYC 9V74 runners). Longer
+    // copies stay with libc, whose large-copy path beat this loop on z000033
+    // (Broadwell, +2.6% decode time with every bulk copy here).
     #[cfg(target_arch = "x86")]
     #[inline(always)]
     unsafe fn copy_bulk(src: *const u8, dst: *mut u8, len: usize) {
-        // SAFETY: this kernel is selected only after detect confirmed AVX2;
-        // `len >= 33` is the method's contract.
-        unsafe { crate::decoding::simd_copy::copy_exact_avx2(src, dst, len) }
+        const AVX2_BULK_MAX: usize = 16 * 1024;
+        if len <= AVX2_BULK_MAX {
+            // SAFETY: this kernel is selected only after detect confirmed
+            // AVX2; `len >= 33` is the method's contract.
+            unsafe { crate::decoding::simd_copy::copy_exact_avx2(src, dst, len) }
+        } else {
+            // SAFETY: the method's contract.
+            unsafe { dst.copy_from_nonoverlapping(src, len) }
+        }
     }
 }
 
