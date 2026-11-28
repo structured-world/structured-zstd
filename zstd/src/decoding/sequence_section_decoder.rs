@@ -797,6 +797,32 @@ pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u
     raw << OFFSET_FSE_LOG.saturating_sub(table_log)
 }
 
+/// [`compute_offsets_long_share`] for a table just built from a description,
+/// read from its normalized counts: a symbol with count `c > 0` owns `c`
+/// states and a less-than-one (`-1`) symbol owns one, so the long codes'
+/// states are the sum over at most nine counts instead of a walk over every
+/// state.
+fn offsets_long_share_from_counts(offsets: &crate::fse::SeqFSETable) -> u32 {
+    const OFFSET_FSE_LOG: u32 = 8;
+    const FIRST_LONG_OFFSET_CODE: usize = 23;
+    let counts = offsets.symbol_probabilities.as_slice();
+    let mut raw = 0u32;
+    for &count in counts.get(FIRST_LONG_OFFSET_CODE..).unwrap_or(&[]) {
+        // Counts are validated by the build: each is -1 or in 0..=2^log.
+        raw += if count < 0 { 1 } else { count as u32 };
+    }
+    // `table_log <= OF_MAX_LOG = 8`, enforced by the description parse.
+    let share = raw << (OFFSET_FSE_LOG - offsets.accuracy_log as u32);
+    debug_assert_eq!(share, compute_offsets_long_share(offsets));
+    share
+}
+
+/// Long-offset share of an RLE offsets table: its one state is the whole
+/// table, scaled to the 256-state reference.
+const fn rle_offsets_long_share(code: u8) -> u32 {
+    if code > 22 { 1 << 8 } else { 0 }
+}
+
 /// Out of line, as upstream zstd keeps `ZSTD_decodeSeqHeaders`: inlined into
 /// the per-tier sequence monoliths it reshapes their hot loop.
 #[inline(never)]
@@ -885,7 +911,7 @@ pub(crate) fn maybe_update_fse_tables(
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+            scratch.offsets_long_share = offsets_long_share_from_counts(&scratch.offsets);
         }
         ModeType::RLE => {
             vprintln!("Use RLE of table");
@@ -903,7 +929,11 @@ pub(crate) fn maybe_update_fse_tables(
             // handles this axis uniformly (no separate RLE fallback).
             scratch.offsets.build_rle(of_source[0]);
             scratch.offsets.enrich_for_offsets();
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+            scratch.offsets_long_share = rle_offsets_long_share(of_source[0]);
+            debug_assert_eq!(
+                scratch.offsets_long_share,
+                compute_offsets_long_share(&scratch.offsets)
+            );
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
@@ -923,7 +953,7 @@ pub(crate) fn maybe_update_fse_tables(
                     .offsets
                     .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
                 scratch.offsets.enrich_for_offsets();
-                scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+                scratch.offsets_long_share = offsets_long_share_from_counts(&scratch.offsets);
                 scratch.mark_of_local();
             }
         }
