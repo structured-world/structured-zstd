@@ -798,6 +798,9 @@ pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u
     raw << OFFSET_FSE_LOG.saturating_sub(table_log)
 }
 
+/// Out of line, as upstream zstd keeps `ZSTD_decodeSeqHeaders`: inlined into
+/// the per-tier sequence monoliths it reshapes their hot loop.
+#[inline(never)]
 pub(crate) fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
