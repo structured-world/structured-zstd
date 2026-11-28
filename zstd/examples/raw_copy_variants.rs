@@ -23,8 +23,10 @@ unsafe fn by_memmove(dst: *mut u8, src: *const u8, n: usize) {
 #[cfg(target_arch = "x86")]
 unsafe fn by_rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
     unsafe {
-        core::arch::asm!("rep movsb", inout("ecx") n => _, inout("esi") src => _,
-            inout("edi") dst => _, options(nostack, preserves_flags));
+        // LLVM reserves esi on 32-bit x86, so the source goes through it by hand.
+        core::arch::asm!("push esi", "mov esi, {src}", "rep movsb", "pop esi",
+            src = in(reg) src, inout("ecx") n => _, inout("edi") dst => _,
+            options(preserves_flags));
     }
 }
 
