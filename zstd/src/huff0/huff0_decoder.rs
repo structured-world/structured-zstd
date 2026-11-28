@@ -1,7 +1,6 @@
 //! Utilities for decoding Huff0 encoded huffman data.
 
 use crate::bit_io::BitReaderReversed;
-use crate::common::scalar_loop;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
@@ -923,15 +922,9 @@ impl HuffmanTable {
             // padding-free bytes, so each unaligned u64 store writes exactly four
             // entries. `run_len` is a power of two, so the `>= 16` arm's 16-step
             // covers the run exactly.
-            // A group holds a few dozen symbols at most, once per literals
-            // block: every loop below stays scalar (`scalar_loop!`), since the
-            // vector bodies, remainders and alias checks LLVM would emit for
-            // them only grow the code each block pulls back into the
-            // instruction cache.
             match run_len {
                 1 => {
                     for s in 0..count {
-                        scalar_loop!();
                         let (packed, _) = packed64!(s);
                         unsafe { slots_ptr.add(u).write(packed) };
                         u += 1;
@@ -939,7 +932,6 @@ impl HuffmanTable {
                 }
                 2 => {
                     for s in 0..count {
-                        scalar_loop!();
                         let (packed, _) = packed64!(s);
                         unsafe {
                             slots_ptr.add(u).write(packed);
@@ -950,7 +942,6 @@ impl HuffmanTable {
                 }
                 4 => {
                     for s in 0..count {
-                        scalar_loop!();
                         let (_, p64) = packed64!(s);
                         unsafe { slots_ptr.add(u).cast::<u64>().write_unaligned(p64) };
                         u += 4;
@@ -958,7 +949,6 @@ impl HuffmanTable {
                 }
                 8 => {
                     for s in 0..count {
-                        scalar_loop!();
                         let (_, p64) = packed64!(s);
                         unsafe {
                             slots_ptr.add(u).cast::<u64>().write_unaligned(p64);
@@ -977,7 +967,6 @@ impl HuffmanTable {
                         "fallback arm expects run_len >= 16 and divisible by 16, got {run_len}"
                     );
                     for s in 0..count {
-                        scalar_loop!();
                         let (_, p64) = packed64!(s);
                         let mut off = 0usize;
                         while off < run_len {

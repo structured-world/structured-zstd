@@ -53,20 +53,3 @@ pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 30;
 pub(crate) const MAX_WINDOW_LOG: u32 = MAX_DECODER_WINDOW_SIZE.trailing_zeros();
 
 pub(crate) mod inline_vec;
-
-/// Keeps the loop it sits in scalar: an empty assembly block emits no
-/// instruction and touches no memory, but LLVM neither vectorizes nor unrolls a
-/// loop that holds one. For loops run once per block over a few dozen items,
-/// where vector bodies, remainders and alias checks would only enlarge the code
-/// the instruction cache has to hold. Expands to nothing where `asm!` is not
-/// available.
-macro_rules! scalar_loop {
-    () => {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-        // SAFETY: an empty block with `nomem, nostack, preserves_flags` has no effect.
-        unsafe {
-            core::arch::asm!("", options(nomem, nostack, preserves_flags))
-        };
-    };
-}
-pub(crate) use scalar_loop;
