@@ -148,6 +148,25 @@ where
     let ml_src = fse.ml_table(dict);
     let of_src = fse.of_table(dict);
 
+    // The gate is decided while the offsets table is in hand, before the
+    // decoder states take the registers the hot loop inherits.
+    let num_sequences = section.num_sequences as usize;
+    // Overflow is only reachable on 32-bit `usize` (a 4 GiB-class
+    // window_size plus a dict). The gate below asks "does history exceed
+    // the prefetch threshold", so on the overflow path the clamped maximum
+    // is the correct answer, not a wrapped small value.
+    let total_history = match buffer
+        .window_size
+        .checked_add(buffer.dict_content(dict).len())
+    {
+        Some(sum) => sum,
+        None => usize::MAX,
+    };
+    let use_long_pipeline =
+        compute_use_long_pipeline(num_sequences, ddict_is_cold, total_history, || {
+            compute_offsets_long_share(of_src)
+        });
+
     let mut ll_dec = SeqFSEDecoder::new(ll_src);
     let mut ml_dec = SeqFSEDecoder::new(ml_src);
     let mut of_dec = SeqFSEDecoder::new(of_src);
@@ -173,23 +192,6 @@ where
     // known, and keeping the arithmetic out of this body keeps it out of the
     // per-kernel monomorphs this function is inlined into.
     let old_buffer_size = buffer.len();
-    let num_sequences = section.num_sequences as usize;
-
-    // Overflow is only reachable on 32-bit `usize` (a 4 GiB-class
-    // window_size plus a dict). The gate below asks "does history exceed
-    // the prefetch threshold", so on the overflow path the clamped maximum
-    // is the correct answer, not a wrapped small value.
-    let total_history = match buffer
-        .window_size
-        .checked_add(buffer.dict_content(dict).len())
-    {
-        Some(sum) => sum,
-        None => usize::MAX,
-    };
-    let use_long_pipeline =
-        compute_use_long_pipeline(num_sequences, ddict_is_cold, total_history, || {
-            compute_offsets_long_share(of_src)
-        });
 
     Ok(SeqStreamSetup {
         br,
