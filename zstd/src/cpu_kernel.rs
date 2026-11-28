@@ -649,7 +649,7 @@ impl CpuKernel for Avx2Kernel {
     #[cfg(target_arch = "x86")]
     #[inline(always)]
     unsafe fn copy_bulk(src: *const u8, dst: *mut u8, len: usize) {
-        const AVX2_BULK_MAX: usize = 16 * 1024;
+        const AVX2_BULK_MAX: usize = 64 * 1024;
         if len <= AVX2_BULK_MAX {
             // SAFETY: this kernel is selected only after detect confirmed
             // AVX2; `len >= 33` is the method's contract.
