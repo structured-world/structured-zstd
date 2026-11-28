@@ -1600,6 +1600,13 @@ fn bench_dictionary(c: &mut Criterion) {
                 if let Err(err) = std::fs::write(&path, with_dict_bytes) {
                     eprintln!("BENCH_WARN failed to dump dict payload {path}: {err}");
                 }
+                // Every frame the decompress-dict arms cycle through, in order.
+                for (index, frame) in with_dict_frames.iter().enumerate() {
+                    let path = format!("{dir}/{}.{}.{index}.zst", scenario.id, level.name);
+                    if let Err(err) = std::fs::write(&path, frame) {
+                        eprintln!("BENCH_WARN failed to dump dict payload {path}: {err}");
+                    }
+                }
             }
 
             // Rust dict-compressed output, per configuration of ours, for the
