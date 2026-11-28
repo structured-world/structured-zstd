@@ -245,6 +245,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
+                offsets_long_share: 0,
                 ddict_is_cold: false,
                 dict_identity: 0,
                 dict_frame: 0,
@@ -373,6 +374,13 @@ pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
     if fse.offsets.is_populated() {
         fse.offsets.reset();
     }
+    // Reset the cached pipeline-gate signal alongside the FSE
+    // table reset; otherwise scratch reuse across frames could
+    // engage the long pipeline on a new frame's Repeat-mode
+    // header based on the previous frame's offset distribution
+    // (or vice versa: skip the pipeline when the new frame
+    // actually has long offsets).
+    fse.offsets_long_share = 0;
     // Revert any dictionary copy-on-write attachment: a scratch
     // reused from a dict-attached frame must not read the previous
     // dictionary's tables on the next (possibly dict-less) frame.
@@ -381,7 +389,9 @@ pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
     // reused from a dictionary-attached frame whose blocks never
     // entered sequence decoding (raw-/RLE-only blocks, zero-seq
     // compressed blocks) would otherwise carry the flag into the
-    // next frame and mis-apply the cold-dict gate there.
+    // next frame and mis-apply the cold-dict gate there. Cleared
+    // alongside `offsets_long_share` so the no-dict path keeps
+    // the documented "no behaviour change" property.
     fse.ddict_is_cold = false;
     // A new frame: a dictionary attached to it is warm only if the previous
     // frame attached the same one.
@@ -538,7 +548,7 @@ fn expect_dict(dict: Option<&Dictionary>) -> &Dictionary {
 }
 
 /// The fields every frame reset touches (the table sources through
-/// `ddict_is_cold` and `frame`) are laid out together
+/// `offsets_long_share`, `frame` and `ddict_is_cold`) are laid out together
 /// right after the tables, whose size is a multiple of their alignment, so
 /// they share one cache line; the fields only a dictionary frame touches
 /// follow them.
@@ -568,13 +578,23 @@ pub struct FSEScratch {
     ll_source: SeqTableSource,
     of_source: SeqTableSource,
     ml_source: SeqTableSource,
+    /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
+    /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to upstream zstd's
+    /// `OffFSELog = 8` (256-entry reference).
+    /// Updated by [`crate::decoding::sequence_section_decoder`] when
+    /// the offsets FSE table is rebuilt (FSE / Predefined modes);
+    /// stale-but-correct on Repeat-mode blocks where the table was
+    /// not touched — the share is identical to the previous block's.
+    /// The sequence-section pipeline gate reads this directly instead
+    /// of re-walking `offsets.decode` per block.
+    pub offsets_long_share: u32,
     /// Mirrors upstream zstd `ZSTD_DCtx::ddictIsCold`. Set to `true` when a
     /// frame attaches a dictionary the previous frame did not decode with
     /// (its FSE / HUF tables are not yet in cache); the first
     /// sequence-section decode of the resulting frame engages the
     /// pipelined prefetch decoder regardless of long-offset share, then
-    /// clears the flag so subsequent blocks fall back to the long-offset
-    /// share heuristic. The `num_sequences >= ADVANCE * 2`
+    /// clears the flag so subsequent blocks fall back to the
+    /// `offsets_long_share` heuristic. The `num_sequences >= ADVANCE * 2`
     /// guard still applies: blocks too small to fill the lookahead
     /// pipeline take the short-block fallback in both the cold-dict and
     /// warm cases. Without a dictionary the flag stays `false` (cache state
@@ -620,6 +640,7 @@ impl FSEScratch {
             offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
             literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
+            offsets_long_share: 0,
             ddict_is_cold: false,
             dict_identity: 0,
             dict_frame: 0,
@@ -650,6 +671,7 @@ impl FSEScratch {
                 addr_of_mut!((*this).match_lengths.0),
                 MAX_MATCH_LENGTH_CODE,
             );
+            addr_of_mut!((*this).offsets_long_share).write(0);
             addr_of_mut!((*this).ddict_is_cold).write(false);
             addr_of_mut!((*this).dict_identity).write(0);
             addr_of_mut!((*this).dict_frame).write(0);
@@ -670,6 +692,10 @@ impl FSEScratch {
         self.literal_lengths.reinit_from(other.ll_table(dict));
         self.offsets.reinit_from(other.of_table(dict));
         self.match_lengths.reinit_from(other.ml_table(dict));
+        // Copy the precomputed long-offset share instead of re-walking
+        // the offsets table; the dict computes it once at build time and
+        // it is stale-but-correct across Repeat-mode blocks.
+        self.offsets_long_share = other.offsets_long_share;
         // Clear the cold-dict pipeline gate: a local-only snapshot has no
         // dictionary attached, so carrying a stale `true` here would mis-arm
         // the prefetch pipeline on the restored frame.
@@ -716,9 +742,11 @@ impl FSEScratch {
 
     /// Point every sequence FSE axis at the dictionary's tables (no table bytes
     /// copied — the eager per-frame entropy-table memcpy is elided). Only the
-    /// COW source flags are set; the dictionary itself is read later through the threaded `dict` borrow, never
+    /// COW source flags + the precomputed long-offset share are set; the
+    /// dictionary itself is read later through the threaded `dict` borrow, never
     /// stored — so this costs NO refcount bump.
     pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
+        self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
         let identity = core::ptr::from_ref(dict.as_dict()).addr();
         // `frame` counts resets, one per frame, and wraps (see the field).
         self.ddict_is_cold =
