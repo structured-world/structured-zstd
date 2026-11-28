@@ -806,7 +806,25 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // The two passes below write every one of the `table_size` slots (the
         // probabilities sum to `table_size`, -1 counting as one), so the
         // persistent scratch is only resized, never cleared first.
-        spread.resize(table_size, 0);
+        if spread.len() < table_size {
+            // Growing: zeros in whole 32-byte stores, where a `resize` calls
+            // libc `memset` for the variable count. The old content is
+            // rewritten as well, which costs nothing: both passes below write
+            // every slot anyway.
+            let zero_len = table_size.next_multiple_of(32);
+            spread.reserve(zero_len - spread.len());
+            let base = spread.as_mut_ptr();
+            let mut at = 0;
+            while at < zero_len {
+                // SAFETY: `reserve` leaves room for `zero_len` bytes.
+                unsafe { base.add(at).cast::<[u8; 32]>().write_unaligned([0; 32]) };
+                at += 32;
+            }
+            // SAFETY: every byte below `table_size <= zero_len` was written.
+            unsafe { spread.set_len(table_size) };
+        } else {
+            spread.truncate(table_size);
+        }
 
         // Upstream zstd `ZSTD_buildFSETable_body`-shape per-symbol counter
         // (upstream zstd `symbolNext[]`). Indexed by symbol byte; initialised
@@ -833,16 +851,18 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // with a counter of 1. A zero-probability counter is set but never
         // read, since the spread holds no such symbol.
         let probs = symbol_probabilities.as_slice();
+        // `nb_symbols <= max_symbol + 1 <= 256` (checked above), so one bound
+        // covers every counter below instead of a check per symbol.
+        let symbol_next_live = &mut symbol_next[..nb_symbols];
         let mut negative_idx = table_size;
-        for symbol in 0..nb_symbols {
-            let prob = probs[symbol];
+        for (symbol, (&prob, next)) in probs.iter().zip(symbol_next_live.iter_mut()).enumerate() {
             if prob == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
-                symbol_next[symbol].write(1);
+                next.write(1);
             } else {
                 debug_assert!(prob >= 0);
-                symbol_next[symbol].write(prob as u16);
+                next.write(prob as u16);
             }
         }
 
