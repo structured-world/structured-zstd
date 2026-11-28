@@ -634,14 +634,30 @@ pub(crate) mod x86 {
             // of an output whose memory reaches its write limit, and below the
             // offset, so its exact copy reads no byte it writes.
             if offset < 32 || match_at > cap_w || match_at + match_length - cap_w >= 32 {
-                return super::exec_sequence_bounded_copy(
-                    base,
-                    tail,
-                    lit_src,
-                    lit_length,
-                    offset,
-                    match_length,
-                );
+                // The exact copy, in sixteen-byte moves with the last ending
+                // at the sequence's end, as upstream's `ZSTD_safecopy` copies
+                // inline (zstd_decompress_block.c, ZSTD_execSequenceEnd): the
+                // portable `exec_sequence_bounded_copy` calls libc memmove for
+                // every piece, a couple of calls a small frame.
+                let op_lit = base.add(tail);
+                copy_forward_exact(op_lit, lit_src, lit_length);
+                let op_match = base.add(match_at);
+                if offset >= 16 || offset >= match_length {
+                    // Every move reads bytes at least sixteen behind it, or
+                    // none of its own output: written before they are read.
+                    copy_forward_exact(op_match, op_match.sub(offset), match_length);
+                } else {
+                    // The period once, then the output doubled: each piece
+                    // reads only bytes already in place.
+                    copy_forward_exact(op_match, op_match.sub(offset), offset);
+                    let mut filled = offset;
+                    while filled < match_length {
+                        let chunk = filled.min(match_length - filled);
+                        copy_forward_exact(op_match.add(filled), op_match, chunk);
+                        filled += chunk;
+                    }
+                }
+                return;
             }
             let op_lit = base.add(tail);
             copy16(op_lit, lit_src);
@@ -658,6 +674,34 @@ pub(crate) mod x86 {
             }
             let at = op_match.add(head);
             copy_short_exact(at, at.sub(offset), rest);
+        }
+    }
+
+    /// Exactly `n` bytes from `src` to `dst`, writing nothing past `dst + n`:
+    /// sixteen-byte moves front to back, the last one ending at `dst + n`.
+    /// Correct when the ranges do not overlap, and when `src` lies at least
+    /// sixteen bytes before `dst`, since each move then reads only bytes an
+    /// earlier one wrote.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for `n` bytes, and one of the two
+    /// conditions above.
+    #[cfg(feature = "kernel-avx2")]
+    #[inline(always)]
+    unsafe fn copy_forward_exact(dst: *mut u8, src: *const u8, n: usize) {
+        unsafe {
+            if n < 32 {
+                copy_short_exact(dst, src, n);
+                return;
+            }
+            let mut at = 0;
+            while at + 16 <= n {
+                copy16(dst.add(at), src.add(at));
+                at += 16;
+            }
+            if at < n {
+                copy16(dst.add(n - 16), src.add(n - 16));
+            }
         }
     }
 

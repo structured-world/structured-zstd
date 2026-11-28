@@ -539,7 +539,9 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Empty the table and clear all internal state.
     pub fn reset(&mut self) {
         self.symbol_probabilities.clear();
-        self.symbol_spread_buffer.clear();
+        // The spread scratch is kept: every build writes the slots it reads,
+        // and clearing it would have the next build grow it again with a
+        // libc `memset`, on every table of every frame.
         self.decode_len = 0;
         self.accuracy_log = 0;
     }
@@ -806,24 +808,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // The two passes below write every one of the `table_size` slots (the
         // probabilities sum to `table_size`, -1 counting as one), so the
         // persistent scratch is only resized, never cleared first.
+        // Grown once to the largest table this type holds and kept there, so
+        // the zeroing (a libc `memset` for any variable count) runs on the
+        // first build rather than whenever a table outgrows the previous one;
+        // the passes below use its first `table_size` bytes, writing every one.
         if spread.len() < table_size {
-            // Growing: zeros in whole 32-byte stores, where a `resize` calls
-            // libc `memset` for the variable count. The old content is
-            // rewritten as well, which costs nothing: both passes below write
-            // every slot anyway.
-            let zero_len = table_size.next_multiple_of(32);
-            spread.reserve(zero_len - spread.len());
-            let base = spread.as_mut_ptr();
-            let mut at = 0;
-            while at < zero_len {
-                // SAFETY: `reserve` leaves room for `zero_len` bytes.
-                unsafe { base.add(at).cast::<[u8; 32]>().write_unaligned([0; 32]) };
-                at += 32;
-            }
-            // SAFETY: every byte below `table_size <= zero_len` was written.
-            unsafe { spread.set_len(table_size) };
-        } else {
-            spread.truncate(table_size);
+            spread.resize(CAP, 0);
         }
 
         // Upstream zstd `ZSTD_buildFSETable_body`-shape per-symbol counter
@@ -1329,7 +1319,9 @@ impl FSETableImpl<SeqSymbol, 512> {
     /// `build_decoding_table` finishes). Mirrors upstream zstd
     /// `ZSTD_buildSeqTable` post-build enrich for LL / ML.
     pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
-        debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
+        // The spread holds the table's symbols in its first `decode_len`
+        // bytes; it is kept at its grown length between builds.
+        debug_assert!(self.decode_len <= self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let sym = self.symbol_spread_buffer[i] as usize;
             // SAFETY: `i < decode_len`, and the build initialised every entry in
@@ -1349,7 +1341,7 @@ impl FSETableImpl<SeqSymbol, 512> {
     /// Closed-form offset-code enrich: `base = 1 << code`, `num_add = code`
     /// for `code < 32`. Source byte read from spread buffer.
     pub(crate) fn enrich_for_offsets(&mut self) {
-        debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
+        debug_assert!(self.decode_len <= self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let code = self.symbol_spread_buffer[i];
             // SAFETY: `i < decode_len`, entry initialised by the build above.
@@ -1380,8 +1372,14 @@ impl FSETableImpl<SeqSymbol, 512> {
         // Setting it to the single RLE symbol would reject any subsequent
         // table with more symbols (`TooManySymbols`). `reset` leaves
         // `max_symbol` at the axis maximum, which is correct here.
-        // Spread buffer drives the enrich pass (symbol per slot); one slot.
-        self.symbol_spread_buffer.push(symbol);
+        // Spread buffer drives the enrich pass (symbol per slot); one slot,
+        // the first. `reset` keeps the buffer's length, so the symbol goes
+        // over what slot 0 held rather than after it.
+        if self.symbol_spread_buffer.is_empty() {
+            self.symbol_spread_buffer.push(symbol);
+        } else {
+            self.symbol_spread_buffer[0] = symbol;
+        }
         // Single RLE entry at slot 0 (upstream zstd RLE DTable: one state).
         self.decode[0] = core::mem::MaybeUninit::new(SeqSymbol {
             new_state: 0,
