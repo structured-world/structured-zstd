@@ -165,8 +165,9 @@ pub mod shape_stats {
     }
 }
 
-/// Copy length at or above which [`copy_bytes_overshooting`] hands off to
-/// `memcpy` (ERMS `rep movsb` on x86) instead of its chunked SIMD loop.
+/// Copy length at or above which [`copy_bytes_overshooting`] hands off to the
+/// tier's bulk copy (`memcpy`, ERMS `rep movsb` on x86, unless the tier
+/// overrides [`CpuKernel::copy_bulk`]) instead of its chunked SIMD loop.
 /// Below this the inline SIMD / overlapping-u64 paths win; above it the
 /// copy is bandwidth-bound and `memcpy`'s microcoded bulk store is faster.
 /// Picked to sit well above hot literal pushes (1..=32 B) and typical
@@ -453,8 +454,9 @@ pub(crate) unsafe fn copy_bytes_overshooting<K: CpuKernel>(
     if copy_at_least >= BULK_MEMCPY_THRESHOLD {
         // SAFETY: by contract `copy_at_least <= min(src.1, dst.1)`, and
         // the regions do not overlap, so this reads/writes exactly
-        // `copy_at_least` bytes within both reported spans (no overshoot).
-        unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
+        // `copy_at_least` bytes within both reported spans (no overshoot);
+        // the tier is the caller's contract.
+        unsafe { K::copy_bulk(src.0, dst.0, copy_at_least) };
         debug_assert_eq_copy(src, dst, copy_at_least);
         return;
     }

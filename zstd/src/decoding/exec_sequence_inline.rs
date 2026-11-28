@@ -127,7 +127,7 @@ macro_rules! exec_sequence_avx2_inline_at {
     ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr, $far_copy_by_string_moves:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
-            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+            overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;

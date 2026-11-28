@@ -300,6 +300,31 @@ impl FrameKey {
     }
 }
 
+/// A raw block's payload into `output`, of the same length: upstream's one
+/// `memmove` (`ZSTD_copyRawBlock`), except on 32-bit x86 under the AVX2 tier,
+/// which copies a block faster itself (`CpuKernel::copy_bulk`).
+#[inline(always)]
+fn copy_raw_block(output: &mut [u8], payload: &[u8], kernel: crate::cpu_kernel::CpuKernelTag) {
+    #[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
+    if kernel == crate::cpu_kernel::CpuKernelTag::Avx2 && payload.len() >= 33 {
+        use crate::cpu_kernel::CpuKernel;
+        debug_assert_eq!(output.len(), payload.len());
+        // SAFETY: the tier was confirmed by detection; both slices hold
+        // `payload.len() >= 33` bytes and are distinct borrows.
+        unsafe {
+            crate::cpu_kernel::Avx2Kernel::copy_bulk(
+                payload.as_ptr(),
+                output.as_mut_ptr(),
+                payload.len(),
+            )
+        };
+        return;
+    }
+    #[cfg(not(all(target_arch = "x86", feature = "kernel-avx2")))]
+    let _ = kernel;
+    output.copy_from_slice(payload);
+}
+
 /// XXH64 of a contiguous byte slice — the resume-side counterpart to
 /// [`DecoderScratchKind::window_tail_hash`]. Streaming XXH64 is chunk-boundary
 /// independent, so this single-slice hash equals the emit-side two-slice hash
@@ -4957,7 +4982,7 @@ impl FrameDecoder {
                     && probe.len() >= n + trailer
                     && output.len() >= n
                 {
-                    output[..n].copy_from_slice(&probe[..n]);
+                    copy_raw_block(&mut output[..n], &probe[..n], kernel);
                     *input = &probe[n..];
                     state.bytes_read_counter += u64::from(hsize) + n as u64;
                     state.block_counter += 1;

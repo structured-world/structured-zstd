@@ -419,6 +419,17 @@ pub trait CpuKernel: Copy + 'static {
     unsafe fn copy16(src: *const u8, dst: *mut u8) {
         unsafe { crate::decoding::simd_copy::copy16_portable(src, dst) }
     }
+
+    /// Copy exactly `len` bytes, at least a raw block's worth (2 KiB and up),
+    /// with no overshoot: libc's `memcpy` unless a tier copies faster itself.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for `len` bytes, `len >= 33`; the
+    /// regions do not overlap; the running CPU supports this kernel's tier.
+    #[inline(always)]
+    unsafe fn copy_bulk(src: *const u8, dst: *mut u8, len: usize) {
+        unsafe { dst.copy_from_nonoverlapping(src, len) }
+    }
 }
 
 /// Copies at the build's baseline vector (SSE2 where the target guarantees it,
@@ -628,6 +639,17 @@ impl CpuKernel for Avx2Kernel {
     unsafe fn copy16(src: *const u8, dst: *mut u8) {
         // SAFETY: as above.
         unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, 16) }
+    }
+
+    // 32-bit glibc's `memcpy` runs in SSE2/SSSE3 bodies: a 10 KiB copy took
+    // 1.2-1.5x this loop's time on Intel and Zen 3 hosts, and on Zen 4 2-3x,
+    // depending on where its buffers sat (hosted EPYC 9V74 runners).
+    #[cfg(target_arch = "x86")]
+    #[inline(always)]
+    unsafe fn copy_bulk(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: this kernel is selected only after detect confirmed AVX2;
+        // `len >= 33` is the method's contract.
+        unsafe { crate::decoding::simd_copy::copy_exact_avx2(src, dst, len) }
     }
 }
 
