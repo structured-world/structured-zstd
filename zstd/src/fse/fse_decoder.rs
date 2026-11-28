@@ -9,8 +9,10 @@ use alloc::vec::Vec;
 const MAX_PROBABILITIES: usize = 256 + ZERO_CHUNK;
 
 /// Probabilities a zero run writes at once: one fixed-size store compiles to
-/// vector moves, where a run of its own length is a libc `memset` call.
-const ZERO_CHUNK: usize = 16;
+/// a vector move, where a run of its own length is a libc `memset` call.
+/// Sixteen bytes, one store on x86_64 and on i686 with SSE2: runs are mostly a
+/// few zeros, and sixty-four bytes a chunk cost i686 more than the call did.
+const ZERO_CHUNK: usize = 4;
 /// Most states a table spreads: the largest table, `1 << 9`.
 const MAX_SPREAD: usize = 1 << 9;
 
