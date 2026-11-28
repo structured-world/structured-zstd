@@ -1,9 +1,10 @@
-//! Dictionary decode of one frame, ours beside libzstd, with the output placed
-//! at every 64-byte offset of a 4 KiB page: whether a decode's time depends on
-//! where its output sits relative to its inputs. Prints the frame's block and
-//! literal layout first, then one line per offset.
+//! Dictionary decode of a scenario's frames, ours beside libzstd: each frame's
+//! block and literal layout, each frame's time alone, then the frames in turn
+//! (as the bench's decompress-dict arms take them) with the output at several
+//! offsets of a page.
 //!
-//! Run: `dict_decode_offsets <payload.zst> <dict> <expected_len> [iters]`
+//! Run: `dict_decode_offsets <dict> <expected_len> <iters> <prefix> <count>`,
+//! reading the frames `<prefix>.<i>.zst` for `i` in `0..count`.
 
 use std::env;
 use std::time::Instant;
@@ -118,11 +119,18 @@ fn time<F: FnMut()>(iters: u32, mut f: F) -> f64 {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let payload = std::fs::read(&args[1]).expect("read payload");
-    let dict = std::fs::read(&args[2]).expect("read dict");
-    let len: usize = args[3].parse().expect("expected_len");
-    let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    describe(&payload);
+    let dict = std::fs::read(&args[1]).expect("read dict");
+    let len: usize = args[2].parse().expect("expected_len");
+    let iters: u32 = args[3].parse().expect("iters");
+    let prefix = &args[4];
+    let count: usize = args[5].parse().expect("frame count");
+    let frames: Vec<Vec<u8>> = (0..count)
+        .map(|i| std::fs::read(format!("{prefix}.{i}.zst")).expect("read frame"))
+        .collect();
+    for (i, frame) in frames.iter().enumerate() {
+        print!("#{i} ");
+        describe(frame);
+    }
 
     let handle = DictionaryHandle::decode_dict(dict.as_slice()).expect("parse dictionary");
     let mut decoder = FrameDecoder::new();
@@ -131,32 +139,55 @@ fn main() {
     let mut arena = vec![0u8; len + 2 * 4096];
     let base = arena.as_ptr() as usize;
     let page = (4096 - base % 4096) % 4096;
-    println!(
-        "payload at {:#x} (mod 4096 {:#x}), dict file at {:#x}",
-        payload.as_ptr() as usize,
-        payload.as_ptr() as usize % 4096,
-        dict.as_ptr() as usize
-    );
-    println!("offset  ours_ns  ffi_ns  ffi/ours");
-    for step in 0..64 {
-        let off = page + step * 64;
-        let out = &mut arena[off..off + len];
+
+    // Each frame alone, output at the page start.
+    println!("frame  ours_ns  ffi_ns  ffi/ours");
+    for (i, frame) in frames.iter().enumerate() {
+        let out = &mut arena[page..page + len];
         let ours = time(iters, || {
             let n = decoder
-                .decode_all_with_dict_handle(core::hint::black_box(&payload), out, &handle)
+                .decode_all_with_dict_handle(core::hint::black_box(frame), out, &handle)
+                .expect("ours decode");
+            core::hint::black_box(n);
+        });
+        let out = &mut arena[page..page + len];
+        let theirs = time(iters, || {
+            let n = ffi
+                .decompress_to_buffer(core::hint::black_box(&frame[..]), out)
+                .expect("ffi decode");
+            core::hint::black_box(n);
+        });
+        println!("{i:5}  {ours:7.1}  {theirs:6.1}  {:.3}", theirs / ours);
+    }
+
+    // The frames in turn, as the bench's arms take them, output at every
+    // 256-byte offset of a page.
+    println!("cycle offset  ours_ns  ffi_ns  ffi/ours");
+    for step in 0..16 {
+        let off = page + step * 256;
+        let out = &mut arena[off..off + len];
+        let mut call = 0usize;
+        let ours = time(iters, || {
+            let frame = &frames[call % frames.len()];
+            call += 1;
+            let n = decoder
+                .decode_all_with_dict_handle(core::hint::black_box(frame), out, &handle)
                 .expect("ours decode");
             core::hint::black_box(n);
         });
         let out = &mut arena[off..off + len];
+        let mut call = 0usize;
         let theirs = time(iters, || {
+            let frame = &frames[call % frames.len()];
+            call += 1;
             let n = ffi
-                .decompress_to_buffer(core::hint::black_box(&payload[..]), out)
+                .decompress_to_buffer(core::hint::black_box(&frame[..]), out)
                 .expect("ffi decode");
             core::hint::black_box(n);
         });
         println!(
-            "{:6}  {ours:7.1}  {theirs:6.1}  {:.3}",
-            step * 64,
+            "{:12}  {ours:7.1}  {theirs:6.1}  {:.3}",
+            step * 256,
             theirs / ours
         );
     }

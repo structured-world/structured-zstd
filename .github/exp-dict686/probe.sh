@@ -1,7 +1,8 @@
 #!/bin/sh
-# The decompress-dict small-10k-random frames of the bench (dumped by the
-# bench's own setup), decoded by ours and by libzstd with the output at every
-# 64-byte offset of a page, i686 build. Usage: probe.sh
+# The decompress-dict small-10k-random frames of the bench (all 64 the arms
+# cycle through, dumped by the bench's own setup), decoded by ours and by
+# libzstd: each frame alone, then in turn with the output at several offsets
+# of a page, i686 build. Usage: probe.sh
 set -eu
 echo "cpu $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
 echo "family $(grep -m1 'cpu family' /proc/cpuinfo | cut -d: -f2-) model $(grep -m1 '^model[[:space:]]*:' /proc/cpuinfo | cut -d: -f2-)"
@@ -14,5 +15,5 @@ cargo build -q --profile bench -p ffi-bench --target "$target" --example dict_de
 bin="target/$target/release/examples/dict_decode_offsets"
 for level in level_11_lazy level_12_lazy level_13_lazy; do
   echo "=== $level"
-  "$bin" "$dumps/small-10k-random.$level.zst" "$dumps/small-10k-random.dict" 10240 20000
+  "$bin" "$dumps/small-10k-random.dict" 10240 20000 "$dumps/small-10k-random.$level" 64
 done
