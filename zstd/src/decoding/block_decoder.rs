@@ -234,12 +234,12 @@ impl BlockDecoder {
                 // One copy per block, under the kernel a literals-only block
                 // takes: the scalar tier stays portable. On 32-bit x86 the
                 // AVX2 tier copies a block itself rather than through libc
-                // (`CpuKernel::copy_bulk`).
+                // (`RawBlockAvx2Kernel`).
                 #[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
                 let pushed = if self.kernel == CpuKernelTag::Avx2 {
                     parts
                         .buffer
-                        .try_push::<crate::cpu_kernel::Avx2Kernel>(payload)
+                        .try_push::<crate::cpu_kernel::RawBlockAvx2Kernel>(payload)
                 } else if self.kernel == CpuKernelTag::Scalar {
                     parts.buffer.try_push::<ScalarKernel>(payload)
                 } else {

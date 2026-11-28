@@ -312,7 +312,7 @@ fn copy_raw_block(output: &mut [u8], payload: &[u8], kernel: crate::cpu_kernel::
         // SAFETY: the tier was confirmed by detection; both slices hold
         // `payload.len() >= 33` bytes and are distinct borrows.
         unsafe {
-            crate::cpu_kernel::Avx2Kernel::copy_bulk(
+            crate::cpu_kernel::RawBlockAvx2Kernel::copy_bulk(
                 payload.as_ptr(),
                 output.as_mut_ptr(),
                 payload.len(),

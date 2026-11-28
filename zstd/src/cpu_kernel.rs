@@ -640,19 +640,55 @@ impl CpuKernel for Avx2Kernel {
         // SAFETY: as above.
         unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, 16) }
     }
+}
 
-    // 32-bit glibc's `memcpy` runs in SSE2/SSSE3 bodies: a 10 KiB copy took
-    // 1.2-1.5x this loop's time on Intel and Zen 3 hosts, and on Zen 4 2-3x,
-    // depending on where its buffers sat (hosted EPYC 9V74 runners). Longer
-    // copies stay with libc, whose large-copy path beat this loop on z000033
-    // (Broadwell, +2.6% decode time with every bulk copy here).
-    #[cfg(target_arch = "x86")]
+/// The AVX2 tier as a raw block's copy takes it on 32-bit x86: every method
+/// is [`Avx2Kernel`]'s except [`CpuKernel::copy_bulk`], which copies up to
+/// 16 KiB itself. 32-bit glibc's `memcpy` runs in SSE2/SSSE3 bodies: a 10 KiB
+/// copy took 1.2-1.5x this loop's time on Intel and Zen 3 hosts, and 2-3x on
+/// Zen 4 depending on where its buffers sat (hosted EPYC 9V74 runners). Only
+/// raw blocks take it: the other bulk copies of a compressed frame stay with
+/// libc, whose path beat the loop there (z000033 on Broadwell, +1.0% decode
+/// time with the loop up to 16 KiB, +2.6% at every length).
+#[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct RawBlockAvx2Kernel;
+
+#[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
+impl CpuKernel for RawBlockAvx2Kernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        Avx2Kernel::mask_lower_bits(value, n)
+    }
+
+    const COPY_CHUNK: usize = Avx2Kernel::COPY_CHUNK;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: selected only where the AVX2 tier is.
+        unsafe { Avx2Kernel::copy_chunks(src, dst, len) }
+    }
+
+    const STEP_CHUNK: usize = Avx2Kernel::STEP_CHUNK;
+
+    #[inline(always)]
+    unsafe fn copy_step(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: as above.
+        unsafe { Avx2Kernel::copy_step(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { Avx2Kernel::copy16(src, dst) }
+    }
+
     #[inline(always)]
     unsafe fn copy_bulk(src: *const u8, dst: *mut u8, len: usize) {
-        const AVX2_BULK_MAX: usize = 64 * 1024;
+        const AVX2_BULK_MAX: usize = 16 * 1024;
         if len <= AVX2_BULK_MAX {
-            // SAFETY: this kernel is selected only after detect confirmed
-            // AVX2; `len >= 33` is the method's contract.
+            // SAFETY: selected only where the AVX2 tier is; `len >= 33` is
+            // the method's contract.
             unsafe { crate::decoding::simd_copy::copy_exact_avx2(src, dst, len) }
         } else {
             // SAFETY: the method's contract.
