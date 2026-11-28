@@ -1,0 +1,33 @@
+name: exp i686 dictionary decode on hosted runners
+
+# Experiment: the i686 decompress-dict small-10k-random cells that read far
+# below libzstd on the dashboard but ahead of it on our own hosts, run on the
+# hosted runners the dashboard uses, through run-benchmarks.sh exactly as the
+# bench shards run it. Lives only on its experiment branch.
+on:
+  push:
+    branches: ['exp/dict686-*']
+
+permissions:
+  contents: read
+
+jobs:
+  shard:
+    name: i686 (${{ matrix.draw }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        draw: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install i686 target and toolchain
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386
+      - name: Build
+        run: cargo bench -q -p ffi-bench --bench compare_ffi --target i686-unknown-linux-gnu --no-run
+      - name: Shard
+        run: sh .github/exp-dict686/shard.sh level_3_dfast,level_11_lazy,level_12_lazy,level_13_lazy
